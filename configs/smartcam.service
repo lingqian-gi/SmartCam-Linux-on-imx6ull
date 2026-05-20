@@ -1,0 +1,34 @@
+# SmartCam Linux — systemd 服务
+# 安装路径: /etc/systemd/system/smartcam.service
+#
+# 安装命令:
+#   sudo cp smartcam.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable smartcam
+#   sudo systemctl start smartcam
+#
+# 状态查看:
+#   systemctl status smartcam
+#   journalctl -u smartcam -f
+
+[Unit]
+Description=SmartCam Linux - 基于iMX6ULL的智能相机流媒体系统
+Documentation=https://github.com/yourname/smartcam-linux
+After=network.target multi-user.target
+Wants=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/smartcam --device /dev/video0 --http-port 8080
+ExecStop=/usr/local/bin/smartcam stop
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# 安全加固 (可选)
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
