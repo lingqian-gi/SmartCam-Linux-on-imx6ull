@@ -220,7 +220,12 @@ void CameraGUI::refreshFrame() {
 
     // 在模拟模式下，叠加文本信息
     if (m_mockMode) {
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
         QPixmap pix = m_videoDisplay->pixmap(Qt::ReturnByValue);
+#else
+        const QPixmap* pp = m_videoDisplay->pixmap();
+        QPixmap pix = pp ? *pp : QPixmap();
+#endif
         if (!pix.isNull()) {
             QPainter p(&pix);
             p.setPen(QColor(255, 255, 255, 180));
