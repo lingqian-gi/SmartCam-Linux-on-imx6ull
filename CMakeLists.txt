@@ -36,6 +36,13 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets)
 # 源文件 (按模块组织)
 # ============================================================
 
+set(CAMERA_SOURCES
+    src/camera/capture.cpp
+    src/camera/processor.cpp
+    include/camera/capture.h
+    include/camera/processor.h
+)
+
 set(DISPLAY_SOURCES
     src/display/gui.cpp
     include/display/gui.h    # 需要 MOC 处理 (含 Q_OBJECT)
@@ -46,6 +53,7 @@ set(MAIN_SOURCES
 )
 
 set(ALL_SOURCES
+    ${CAMERA_SOURCES}
     ${DISPLAY_SOURCES}
     ${MAIN_SOURCES}
 )
@@ -66,7 +74,16 @@ target_include_directories(smartcam PRIVATE
 
 target_link_libraries(smartcam PRIVATE
     Qt5::Widgets
+    pthread
 )
+
+# 可选: libjpeg-turbo (用于 YUV→JPEG 编码)
+# find_package(JPEG QUIET)
+# if(JPEG_FOUND)
+#     target_compile_definitions(smartcam PRIVATE HAS_LIBJPEG)
+#     target_link_libraries(smartcam PRIVATE JPEG::JPEG)
+#     message(STATUS "✓ libjpeg-turbo 已启用")
+# endif()
 
 # ============================================================
 # 安装 (部署到开发板)
@@ -104,6 +121,7 @@ message(STATUS "  源文件数:    ${CMAKE_PROJECT_NAME}")
 message(STATUS "")
 message(STATUS "使用方法:")
 message(STATUS "  cd build && cmake .. && make -j\$(nproc)")
-message(STATUS "  ./smartcam                  # Mock 模式 (PC 测试)")
-message(STATUS "  ./smartcam --device /dev/video0  # 真实相机")
+message(STATUS "  ./smartcam                         # Mock 模式 (PC 测试)")
+message(STATUS "  ./smartcam --device /dev/video0     # 真实相机 (需 V4L2)")
+message(STATUS "  ./smartcam --device /dev/video0 --fmt yuyv  # YUYV 模式")
 message(STATUS "")

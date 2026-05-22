@@ -1,8 +1,0 @@
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/smartcam.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/edit_cache.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/rebuild_cache.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/list_install_components.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/install.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/install/local.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/install/strip.dir
-/workspace/SmartCam-Linux-on-imx6ull/build/CMakeFiles/smartcam_autogen.dir
