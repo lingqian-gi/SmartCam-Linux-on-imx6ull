@@ -211,6 +211,7 @@ void CameraGUI::refreshFrame() {
 
     // 转换为 QImage 并渲染
     QImage img = frameToQImage(m_currentFrame.data,
+                                m_currentFrame.length,
                                 m_currentFrame.width,
                                 m_currentFrame.height,
                                 m_currentFrame.format);
@@ -422,7 +423,7 @@ void CameraGUI::enterMockMode() {
 // 辅助：FrameBuffer → QImage
 // ============================================================
 
-QImage CameraGUI::frameToQImage(const uint8_t* data, int w, int h, PixelFormat fmt) {
+QImage CameraGUI::frameToQImage(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
     if (!data || w <= 0 || h <= 0) return {};
 
     switch (fmt) {
@@ -438,6 +439,18 @@ QImage CameraGUI::frameToQImage(const uint8_t* data, int w, int h, PixelFormat f
         std::vector<uint8_t> rgb(w * h * 3);
         yuyv_to_rgb24(data, rgb.data(), w, h);
         return QImage(rgb.data(), w, h, w * 3, QImage::Format_RGB888).copy();
+    }
+    case PixelFormat::FMT_MJPEG: {
+        // MJPEG → JPEG 解码 → QImage
+        // 使用 Qt 内置 JPEG 解码器（如果 Qt 编译时启用了 JPEG 支持）
+        QImage img;
+        if (img.loadFromData(data, len, "JPEG")) {
+            // 确保缩放到期望尺寸
+            return img.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        }
+        // 若 Qt 无 JPEG 支持，尝试 libjpeg-turbo（CMakeLists.txt 中已预留）
+        qWarning() << "[GUI] MJPEG 解码失败，请确保 Qt 编译了 JPEG 支持或启用 libjpeg-turbo";
+        return {};
     }
     default:
         qWarning() << "[GUI] 不支持的像素格式:" << static_cast<int>(fmt);

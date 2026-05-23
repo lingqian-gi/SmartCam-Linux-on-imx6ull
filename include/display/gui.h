@@ -81,7 +81,7 @@ private:
     void buildUI();
     void connectSignals();
     void enterMockMode();        // 无摄像头时使用模拟帧
-    QImage frameToQImage(const uint8_t* data, int w, int h, PixelFormat fmt);
+    QImage frameToQImage(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
 
     // ====== UI 控件 ======
     QLabel*      m_videoDisplay   = nullptr;   // 视频预览区
