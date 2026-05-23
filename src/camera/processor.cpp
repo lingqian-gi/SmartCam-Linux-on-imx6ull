@@ -14,6 +14,11 @@
 #include <cstring>
 #include <cstdlib>
 
+// libjpeg-turbo — 必须在文件作用域包含（含 extern "C" 包裹）
+#ifdef HAS_LIBJPEG
+#include <jpeglib.h>
+#endif
+
 // ============================================================
 // MJPEG 帧解析
 // ============================================================
@@ -149,7 +154,6 @@ int VideoProcessor::encodeRGBtoJPEG(const uint8_t* rgb, int width, int height,
                                     int quality, uint8_t** jpeg_out,
                                     unsigned long* jpeg_len) {
 #ifdef HAS_LIBJPEG
-#include <jpeglib.h>
 
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
