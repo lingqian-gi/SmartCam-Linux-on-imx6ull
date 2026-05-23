@@ -26,11 +26,8 @@ endif()
 # Qt5 (Widgets)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 
-# libjpeg-turbo (可选, 用于 YUV→JPEG 编码)
-# find_package(JPEG QUIET)
-# if(JPEG_FOUND)
-#     add_definitions(-DHAS_LIBJPEG)
-# endif()
+# libjpeg-turbo (MJPEG 解码, 自定义错误处理器抑制坏帧警告)
+find_package(JPEG REQUIRED)
 
 # ============================================================
 # 源文件 (按模块组织)
@@ -83,13 +80,10 @@ target_link_libraries(smartcam PRIVATE
     pthread
 )
 
-# 可选: libjpeg-turbo (用于 YUV→JPEG 编码)
-# find_package(JPEG QUIET)
-# if(JPEG_FOUND)
-#     target_compile_definitions(smartcam PRIVATE HAS_LIBJPEG)
-#     target_link_libraries(smartcam PRIVATE JPEG::JPEG)
-#     message(STATUS "✓ libjpeg-turbo 已启用")
-# endif()
+# libjpeg-turbo (MJPEG 解码)
+target_compile_definitions(smartcam PRIVATE HAS_LIBJPEG)
+target_link_libraries(smartcam PRIVATE JPEG::JPEG)
+message(STATUS "✓ libjpeg-turbo 已启用")
 
 # ============================================================
 # 安装 (部署到开发板)
