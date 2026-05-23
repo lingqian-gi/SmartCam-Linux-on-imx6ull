@@ -79,8 +79,9 @@ CameraGUI::CameraGUI(QWidget* parent)
     setWindowTitle(QStringLiteral("SmartCam Linux — 智能相机流媒体系统"));
 
     // 适配 7 寸屏 (800x480)，同时也兼容 PC 调试
+    // 适配 7寸屏 800x480
     setMinimumSize(800, 480);
-    resize(800, 520);
+    resize(800, 480);
 
     buildUI();
     connectSignals();
@@ -95,10 +96,10 @@ CameraGUI::CameraGUI(QWidget* parent)
     enterMockMode();
 
     // 初始状态
-    m_labelStreaming->setText(QStringLiteral("⚫ 就绪"));
+    m_labelStreaming->setText(QStringLiteral("[待机]"));
     m_labelStreaming->setStyleSheet("color: gray;");
     m_labelClients->setText(QStringLiteral("客户端: 0"));
-    m_labelRecording->setText(QStringLiteral("● REC"));
+    m_labelRecording->setText(QStringLiteral("REC"));
     m_labelRecording->setStyleSheet("color: gray;");
 }
 
@@ -134,9 +135,9 @@ void CameraGUI::buildUI() {
     statusLayout->setSpacing(12);
 
     m_labelFPS = new QLabel(QStringLiteral("FPS: 0.0"), this);
-    m_labelStreaming = new QLabel(QStringLiteral("⚫ 就绪"), this);
+    m_labelStreaming = new QLabel(QStringLiteral("[待机]"), this);
     m_labelClients = new QLabel(QStringLiteral("客户端: 0"), this);
-    m_labelRecording = new QLabel(QStringLiteral("● REC"), this);
+    m_labelRecording = new QLabel(QStringLiteral("REC"), this);
 
     QString statusStyle = "font-size: 13px; font-weight: bold; padding: 2px 6px;"
                           "background: #16213e; border-radius: 3px; color: #e0e0e0;";
@@ -165,9 +166,9 @@ void CameraGUI::buildUI() {
         "QPushButton:hover  { opacity: 0.9; }"
         "QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }";
 
-    m_btnCapture = new QPushButton(QStringLiteral("📷 拍照"), this);
-    m_btnRecord  = new QPushButton(QStringLiteral("⏺ 录像"), this);
-    m_btnSettings = new QPushButton(QStringLiteral("⚙ 设置"), this);
+    m_btnCapture = new QPushButton(QStringLiteral("[拍照]"), this);
+    m_btnRecord  = new QPushButton(QStringLiteral("[录像]"), this);
+    m_btnSettings = new QPushButton(QStringLiteral("[设置]"), this);
 
     m_btnCapture->setStyleSheet(btnStyle +
         "background-color: #0f3460; color: white;");
@@ -328,7 +329,7 @@ void CameraGUI::onRecord() {
     m_isRecording = shouldRecord;
 
     if (m_isRecording) {
-        m_btnRecord->setText(QStringLiteral("⏹ 停止"));
+        m_btnRecord->setText(QStringLiteral("[停止]"));
         m_btnRecord->setStyleSheet(
             "background-color: #c0392b; color: white;"
             "font-size: 14px; font-weight: bold; padding: 8px 16px;"
@@ -337,7 +338,7 @@ void CameraGUI::onRecord() {
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #e74c3c;");
     } else {
-        m_btnRecord->setText(QStringLiteral("⏺ 录像"));
+        m_btnRecord->setText(QStringLiteral("[录像]"));
         m_btnRecord->setStyleSheet(
             "background-color: #533483; color: white;"
             "font-size: 14px; font-weight: bold; padding: 8px 16px;"
@@ -420,12 +421,12 @@ void CameraGUI::setRecordingStatus(bool recording) {
 
 void CameraGUI::setStreamingStatus(bool streaming) {
     if (streaming) {
-        m_labelStreaming->setText(QStringLiteral("🟢 推流中"));
+        m_labelStreaming->setText(QStringLiteral("[推流]"));
         m_labelStreaming->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #2ecc71;");
     } else {
-        m_labelStreaming->setText(QStringLiteral("⚫ 就绪"));
+        m_labelStreaming->setText(QStringLiteral("[待机]"));
         m_labelStreaming->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #e0e0e0;");
@@ -492,7 +493,7 @@ void CameraGUI::enterMockMode() {
     m_currentFrame.data = m_mockBuffer.data();
 
     m_labelFPS->setText(QStringLiteral("FPS: 30.0"));
-    m_labelStreaming->setText(QStringLiteral("🟡 模拟中"));
+    m_labelStreaming->setText(QStringLiteral("[模拟]"));
     m_labelStreaming->setStyleSheet(
         "font-size: 13px; font-weight: bold; padding: 2px 6px;"
         "background: #16213e; border-radius: 3px; color: #f39c12;");
