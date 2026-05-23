@@ -221,6 +221,9 @@ deploy_to_board() {
     echo -e "${GREEN}✓ 部署完成!${NC}"
     echo ""
     echo -e "${CYAN}在开发板上执行:${NC}"
+    echo "  # 方式一：命令行参数"
+    echo "  smartcam --device /dev/video0 --http-port 8080 -platform linuxfb"
+    echo "  # 方式二：环境变量（与 systemd 服务兼容）"
     echo "  export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0"
     echo "  smartcam --device /dev/video0 --http-port 8080"
 

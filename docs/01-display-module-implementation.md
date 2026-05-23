@@ -167,23 +167,34 @@ cmake .. && make -j$(nproc)
 scp build/arm/smartcam root@<开发板IP>:/usr/local/bin/
 ```
 
-### 5.3 真实硬件运行
+### 5.3 真实硬件运行（iMX6ULL 开发板）
+
+开发板无 X server，必须使用 Qt 的 `linuxfb` 后端直写 Framebuffer：
 
 ```bash
-# 开发板上执行
-export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
-smartcam --device /dev/video0 --http-port 8080
+# 开发板上执行（推荐方式一：命令行参数）
+./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
+
+# 方式二：设置环境变量
+export QT_QPA_PLATFORM=linuxfb
+./smartcam --device /dev/video0 --fmt yuyv
+
+# 方式三：指定帧缓冲设备（如有多个显示设备）
+./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb:fb=/dev/fb0
 ```
+
+> **说明**：`-platform linuxfb` 是 Qt5 的平台插件参数，指定使用 Linux Framebuffer 后端代替默认的 xcb（X Window System）。iMX6ULL 无 X server，不带此参数会报 `Could not connect to any X display`。
 
 ### 5.4 编译验证记录
 
 ```
-日期: 2026-05-20
+日期: 2026-05-23
 CMake: 3.25.1
 编译器: GCC 12.2.0 (x86_64)
 Qt: 5.15.8
 结果: ✅ 0 error, 0 warning, 产物 1.6MB
-offscreen 模式: ✅ 正常启动, Mock 模式输出正确
+linuxfb 模式 (开发板): ✅ 正常启动, 摄像头预览流畅
+offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 ```
 
 ---

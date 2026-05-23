@@ -48,6 +48,11 @@ set(DISPLAY_SOURCES
     include/display/gui.h    # 需要 MOC 处理 (含 Q_OBJECT)
 )
 
+set(NETWORK_SOURCES
+    src/network/mjpeg_server.cpp
+    include/network/mjpeg_server.h
+)
+
 set(MAIN_SOURCES
     src/main.cpp
 )
@@ -55,6 +60,7 @@ set(MAIN_SOURCES
 set(ALL_SOURCES
     ${CAMERA_SOURCES}
     ${DISPLAY_SOURCES}
+    ${NETWORK_SOURCES}
     ${MAIN_SOURCES}
 )
 
@@ -121,7 +127,9 @@ message(STATUS "  源文件数:    ${CMAKE_PROJECT_NAME}")
 message(STATUS "")
 message(STATUS "使用方法:")
 message(STATUS "  cd build && cmake .. && make -j\$(nproc)")
-message(STATUS "  ./smartcam                         # Mock 模式 (PC 测试)")
-message(STATUS "  ./smartcam --device /dev/video0     # 真实相机 (需 V4L2)")
-message(STATUS "  ./smartcam --device /dev/video0 --fmt yuyv  # YUYV 模式")
+message(STATUS "  ./smartcam                                    # Mock 模式 (PC 测试)")
+message(STATUS "  ./smartcam --device /dev/video0                # 真实相机 (需 V4L2)")
+message(STATUS "  ./smartcam --device /dev/video0 --fmt yuyv     # YUYV 模式")
+message(STATUS "  # 开发板无 X server, 必须加 -platform linuxfb:")
+message(STATUS "  ./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb")
 message(STATUS "")

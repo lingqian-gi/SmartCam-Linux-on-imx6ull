@@ -19,7 +19,7 @@ Wants=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/local/bin/smartcam --device /dev/video0 --http-port 8080
+ExecStart=/usr/local/bin/smartcam --device /dev/video0 --http-port 8080 -platform linuxfb
 ExecStop=/usr/local/bin/smartcam stop
 Restart=on-failure
 RestartSec=5

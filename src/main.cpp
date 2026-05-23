@@ -17,6 +17,8 @@
  *   ./smartcam                    # Mock 模式
  *   ./smartcam --device /dev/video0       # 真实相机 (MJPEG)
  *   ./smartcam --device /dev/video0 --fmt yuyv  # 真实相机 (YUYV)
+ *   # 开发板无 X server, 必须加 -platform linuxfb:
+ *   ./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
  */
 
 #include <QApplication>
@@ -33,6 +35,8 @@
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
+#include "include/camera/processor.h"
+#include "include/network/mjpeg_server.h"
 #include "include/common/logger.h"
 
 // ============================================================
@@ -98,6 +102,7 @@ int main(int argc, char* argv[]) {
     CameraCapture*    capture      = nullptr;
     std::thread*      captureThread = nullptr;
     QTimer*           displayTimer = nullptr;
+    MJPEGStreamServer* mjpegServer = nullptr;
 
     if (!device.isEmpty()) {
         // ============================================================
@@ -166,9 +171,24 @@ int main(int argc, char* argv[]) {
         g_state.running = true;
 
         // ============================================================
-        // 启动采集线程（连续拉帧 → 拷贝到共享缓冲区）
+        // 启动 MJPEG-over-HTTP 流媒体服务器
         // ============================================================
-        captureThread = new std::thread([capture]() {
+        mjpegServer = new MJPEGStreamServer();
+        bool mjpegServerOk = false;
+        if (curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG) {
+            if (mjpegServer->start(httpPort) == 0) {
+                mjpegServerOk = true;
+                LOG_INF("MJPEG stream server ready on port %d", httpPort);
+            }
+        } else {
+            LOG_WRN("Current format is YUYV — MJPEG stream requires "
+                     "--fmt mjpeg or libjpeg-turbo encoding");
+        }
+
+        // ============================================================
+        // 启动采集线程（连续拉帧 → 拷贝到共享缓冲区 + 推流）
+        // ============================================================
+        captureThread = new std::thread([capture, mjpegServer, mjpegServerOk]() {
             FrameBuffer fb;
 
             while (g_state.running) {
@@ -188,6 +208,12 @@ int main(int argc, char* argv[]) {
                     g_state.fps    = capture->getCurrentFPS();
                 }
 
+                // 如果格式是 MJPEG，推送帧到 HTTP 流服务器（零拷贝）
+                if (mjpegServerOk && fb.format == PixelFormat::FMT_MJPEG) {
+                    mjpegServer->updateFrame(fb.data,
+                        static_cast<size_t>(fb.length));
+                }
+
                 // 归还缓冲区到 V4L2 队列
                 capture->putFrame(&fb);
             }
@@ -198,7 +224,7 @@ int main(int argc, char* argv[]) {
         // ============================================================
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
-        QObject::connect(displayTimer, &QTimer::timeout, [&gui]() {
+        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
             std::lock_guard<std::mutex> lock(g_state.mtx);
             if (g_state.frameData.empty()) return;
 
@@ -210,6 +236,7 @@ int main(int argc, char* argv[]) {
                          g_state.format);
 
             gui.setFPS(g_state.fps);
+            gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
 
@@ -254,6 +281,8 @@ int main(int argc, char* argv[]) {
         qInfo() << "设备:" << device;
         qInfo() << "格式:" << fmtStr;
         qInfo() << "HTTP 端口:" << httpPort;
+        qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "⏸ 未启动 (MJPEG 模式需要 --fmt mjpeg)");
+        qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
         qInfo() << "==============================================";
 
     } else {
@@ -291,6 +320,11 @@ int main(int argc, char* argv[]) {
     if (captureThread && captureThread->joinable()) {
         captureThread->join();
         delete captureThread;
+    }
+
+    if (mjpegServer) {
+        mjpegServer->stop();
+        delete mjpegServer;
     }
 
     if (capture) {

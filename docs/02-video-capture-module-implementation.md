@@ -679,13 +679,19 @@ scp build/arm/smartcam root@192.168.1.100:/usr/local/bin/
 
 ### 9.3 硬件运行（连摄像头）
 
+开发板上无 X server，必须使用 `-platform linuxfb` 指定 Framebuffer 后端：
+
 ```bash
 # 开发板上执行
 # YUYV 模式（本地预览）
-smartcam --device /dev/video0 --fmt yuyv
+./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
 
 # MJPEG 模式（零 CPU 采集，用于网络传输）
-smartcam --device /dev/video0 --fmt mjpeg
+./smartcam --device /dev/video0 --fmt mjpeg -platform linuxfb
+
+# 或设置环境变量
+export QT_QPA_PLATFORM=linuxfb
+./smartcam --device /dev/video0 --fmt yuyv
 ```
 
 ### 9.4 编译验证记录
