@@ -124,18 +124,13 @@ void MJPEGStreamServer::stop() {
         m_acceptThread = nullptr;
     }
 
-    // 4. 关闭所有客户端连接
+    // 4. 关闭所有客户端连接（线程已 detached，自动退出）
     {
         std::lock_guard<std::mutex> lock(m_clientsMtx);
         for (auto& c : m_clients) {
             if (c.fd >= 0) {
                 ::close(c.fd);
                 c.fd = -1;
-            }
-            if (c.thread && c.thread->joinable()) {
-                c.thread->join();
-                delete c.thread;
-                c.thread = nullptr;
             }
         }
         m_clients.clear();
@@ -214,7 +209,6 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
     if (!readHttpRequest(client_fd, reqBuf, sizeof(reqBuf))) {
         LOG_DBG("Client disconnected before sending request");
         removeClient(client_fd);
-        ::close(client_fd);
         return;
     }
 
@@ -243,7 +237,6 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
         if (!sendHttpHeader(client_fd)) {
             LOG_DBG("Failed to send HTTP header to client");
             removeClient(client_fd);
-            ::close(client_fd);
             return;
         }
 
@@ -301,9 +294,8 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
         }
     }
 
-    // ---- 4. 清理 ----
+    // ---- 4. 清理（removeClient 已包含 close） ----
     removeClient(client_fd);
-    ::close(client_fd);
     LOG_INF("Client disconnected (total=%d)", clientCount());
 }
 
@@ -493,14 +485,13 @@ void MJPEGStreamServer::addClient(int client_fd) {
     int flags = fcntl(client_fd, F_GETFL, 0);
     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
-    // 启动处理线程
-    std::thread* t = new std::thread(&MJPEGStreamServer::clientHandler,
-                                      this, client_fd);
+    // 启动处理线程（detach，由客户端自行退出）
+    std::thread t(&MJPEGStreamServer::clientHandler, this, client_fd);
+    t.detach();
 
     std::lock_guard<std::mutex> lock(m_clientsMtx);
     ClientInfo info;
     info.fd     = client_fd;
-    info.thread = t;
     info.active = true;
     info.lastSentIndex = m_frameIndex.load();
     m_clients.push_back(info);
@@ -510,10 +501,7 @@ void MJPEGStreamServer::removeClient(int fd) {
     std::lock_guard<std::mutex> lock(m_clientsMtx);
     for (auto it = m_clients.begin(); it != m_clients.end(); ++it) {
         if (it->fd == fd) {
-            if (it->thread && it->thread->joinable()) {
-                it->thread->join();
-                delete it->thread;
-            }
+            if (it->fd >= 0) ::close(it->fd);
             m_clients.erase(it);
             break;
         }

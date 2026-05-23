@@ -76,7 +76,6 @@ private:
     /** @brief 客户端连接信息 */
     struct ClientInfo {
         int          fd;               // socket 文件描述符
-        std::thread* thread;           // 客户端处理线程
         bool         active;           // 是否活跃
         uint64_t     lastSentIndex;    // 已发送的最新帧序号
     };
