@@ -54,12 +54,12 @@ public:
 
     // ---- 回调注册（供主程序注入业务逻辑） ----
     using CallbackVoid   = std::function<void()>;
-    using CallbackBool   = std::function<void(bool)>;
+    using CallbackBool   = std::function<bool(bool)>;
     using CallbackIntInt = std::function<void(int, int)>;
     using CallbackFormat = std::function<void(PixelFormat)>;
 
     void onCaptureRequest(CallbackVoid cb);
-    void onRecordToggle(CallbackBool cb);       // true=开始, false=停止
+    void onRecordToggle(std::function<bool(bool)> cb);  // 回调返回 true=成功, false=拒绝
     void onResolutionChanged(CallbackIntInt cb);  // (w, h)
     void onFormatChanged(CallbackFormat cb);
 
@@ -74,6 +74,7 @@ private slots:
     void refreshFrame();
     void onCapture();
     void onRecord();
+    void onSettings();
     void onResolutionComboChanged(int index);
     void onFormatComboChanged(int index);
 
@@ -90,6 +91,7 @@ private:
     QPushButton* m_btnSettings    = nullptr;   // 设置
     QComboBox*   m_resolutionCombo = nullptr;  // 分辨率选择
     QComboBox*   m_formatCombo    = nullptr;   // 格式选择 (YUV/MJPEG)
+    QWidget*     m_settingsPanel  = nullptr;   // 设置面板容器（可展开/收起）
 
     // 状态栏
     QLabel*      m_labelFPS       = nullptr;

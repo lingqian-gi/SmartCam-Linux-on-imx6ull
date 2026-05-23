@@ -37,10 +37,11 @@
 #include "include/camera/capture.h"
 #include "include/camera/processor.h"
 #include "include/network/mjpeg_server.h"
+#include "include/storage/manager.h"
 #include "include/common/logger.h"
 
 // ============================================================
-// 全局共享状态（采集线程 → GUI 线程）
+// 全局共享状态（采集线程 → GUI 线程 / 存储线程）
 // ============================================================
 struct CaptureState {
     std::mutex              mtx;
@@ -52,6 +53,12 @@ struct CaptureState {
     std::atomic<bool>       running{false};
 };
 static CaptureState g_state;
+
+// 录像状态（由 main 线程设置，采集线程读取）
+static std::atomic<bool> g_recording{false};
+
+// 存储管理器（全局单例指针，线程安全）
+static StorageManager* g_storage = nullptr;
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
@@ -97,6 +104,10 @@ int main(int argc, char* argv[]) {
 
     // ---- 创建 & 显示 GUI ----
     CameraGUI gui;
+
+    // ---- 初始化存储管理器 ----
+    StorageManager storage("/tmp/smartcam/photos", "/tmp/smartcam/videos");
+    g_storage = &storage;
 
     // ---- 真实相机模式 ----
     CameraCapture*    capture      = nullptr;
@@ -214,6 +225,11 @@ int main(int argc, char* argv[]) {
                         static_cast<size_t>(fb.length));
                 }
 
+                // 如果正在录像且格式为 MJPEG，写入帧到 AVI 文件
+                if (g_recording && fb.format == PixelFormat::FMT_MJPEG && g_storage) {
+                    g_storage->writeRecordFrame(fb.data, fb.length);
+                }
+
                 // 归还缓冲区到 V4L2 队列
                 capture->putFrame(&fb);
             }
@@ -266,14 +282,74 @@ int main(int argc, char* argv[]) {
         });
 
         gui.onCaptureRequest([capture]() {
-            LOG_INF("Capture request — will be handled by StorageManager later");
-            // TODO: 集成 StorageManager::savePhoto()
+            // 从共享状态获取最新一帧并保存为 JPEG 照片
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            if (g_state.frameData.empty() || !g_storage) {
+                LOG_WRN("Capture: no frame data available");
+                return;
+            }
+
+            if (g_state.format == PixelFormat::FMT_MJPEG) {
+                // MJPEG 模式：帧数据已经是 JPEG，直接保存
+                std::string path = g_storage->savePhoto(
+                    g_state.frameData.data(),
+                    static_cast<int>(g_state.frameData.size()));
+                LOG_INF("Photo captured (MJPEG): %s",
+                         path.empty() ? "FAILED" : path.c_str());
+            }
+#ifdef HAS_LIBJPEG
+            else if (g_state.format == PixelFormat::FMT_YUYV) {
+                // YUV 模式：需要先编码为 JPEG
+                uint8_t* jpeg_out = nullptr;
+                unsigned long jpeg_len = 0;
+                if (VideoProcessor::encodeYUYVtoJPEG(
+                        g_state.frameData.data(),
+                        g_state.width, g_state.height,
+                        85, &jpeg_out, &jpeg_len) == 0) {
+                    std::string path = g_storage->savePhoto(
+                        jpeg_out, static_cast<int>(jpeg_len));
+                    LOG_INF("Photo captured (YUV→JPEG): %s",
+                             path.empty() ? "FAILED" : path.c_str());
+                    free(jpeg_out);
+                } else {
+                    LOG_ERR_("Capture: YUYV→JPEG encoding failed");
+                }
+            }
+#endif
+            else {
+                LOG_WRN("Capture: unsupported format for photo save");
+            }
         });
 
-        gui.onRecordToggle([capture](bool start) {
-            LOG_INF("Record %s — will be handled by StorageManager later",
-                     start ? "start" : "stop");
-            // TODO: 集成 StorageManager::startRecord() / stopRecord()
+        gui.onRecordToggle([capture, &gui](bool start) -> bool {
+            if (!g_storage) return false;
+
+            if (start) {
+                // 开始录像：检查当前格式必须是 MJPEG
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                if (g_state.format != PixelFormat::FMT_MJPEG) {
+                    LOG_WRN("Recording requires MJPEG mode (current format is YUYV)");
+                    return false;  // 拒绝录制，GUI 按钮状态保持不变
+                }
+                int w = g_state.width;
+                int h = g_state.height;
+                int fps = static_cast<int>(g_state.fps > 0 ? g_state.fps : 30.0);
+
+                if (g_storage->startRecord(w, h, fps) == 0) {
+                    g_recording = true;
+                    gui.setRecordingStatus(true);
+                    LOG_INF("Recording started: %dx%d @ %dfps", w, h, fps);
+                    return true;
+                }
+                LOG_ERR_("Recording start failed");
+                return false;
+            } else {
+                g_recording = false;
+                g_storage->stopRecord();
+                gui.setRecordingStatus(false);
+                LOG_INF("Recording stopped");
+                return true;
+            }
         });
 
         qInfo() << "==============================================";
@@ -292,8 +368,9 @@ int main(int argc, char* argv[]) {
         gui.onCaptureRequest([]() {
             qDebug() << "[Main] 拍照请求 (Mock)";
         });
-        gui.onRecordToggle([](bool start) {
+        gui.onRecordToggle([](bool start) -> bool {
             qDebug() << "[Main] 录像切换:" << (start ? "开始" : "停止");
+            return true;
         });
         gui.onResolutionChanged([](int w, int h) {
             qDebug() << "[Main] 分辨率变更:" << w << "x" << h;

@@ -50,6 +50,11 @@ set(NETWORK_SOURCES
     include/network/mjpeg_server.h
 )
 
+set(STORAGE_SOURCES
+    src/storage/manager.cpp
+    include/storage/manager.h
+)
+
 set(MAIN_SOURCES
     src/main.cpp
 )
@@ -58,6 +63,7 @@ set(ALL_SOURCES
     ${CAMERA_SOURCES}
     ${DISPLAY_SOURCES}
     ${NETWORK_SOURCES}
+    ${STORAGE_SOURCES}
     ${MAIN_SOURCES}
 )
 
@@ -82,8 +88,9 @@ target_link_libraries(smartcam PRIVATE
 
 # libjpeg-turbo (MJPEG 解码)
 target_compile_definitions(smartcam PRIVATE HAS_LIBJPEG)
-target_link_libraries(smartcam PRIVATE JPEG::JPEG)
-message(STATUS "✓ libjpeg-turbo 已启用")
+target_include_directories(smartcam PRIVATE ${JPEG_INCLUDE_DIRS})
+target_link_libraries(smartcam PRIVATE ${JPEG_LIBRARIES})
+message(STATUS "✓ libjpeg-turbo 已启用 (libs=${JPEG_LIBRARIES})")
 
 # ============================================================
 # 安装 (部署到开发板)

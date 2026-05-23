@@ -182,8 +182,10 @@ void CameraGUI::buildUI() {
     btnLayout->addStretch();
     mainLayout->addLayout(btnLayout);
 
-    // --- (4) 设置栏 ---
-    auto* settingsLayout = new QHBoxLayout();
+    // --- (4) 设置栏（可展开/收起） ---
+    m_settingsPanel = new QWidget(this);
+    auto* settingsLayout = new QHBoxLayout(m_settingsPanel);
+    settingsLayout->setContentsMargins(0, 0, 0, 0);
     settingsLayout->setSpacing(12);
 
     auto* resLabel = new QLabel(QStringLiteral("分辨率:"), this);
@@ -219,7 +221,10 @@ void CameraGUI::buildUI() {
     settingsLayout->addWidget(fmtLabel);
     settingsLayout->addWidget(m_formatCombo);
     settingsLayout->addStretch();
-    mainLayout->addLayout(settingsLayout);
+    mainLayout->addWidget(m_settingsPanel);
+
+    // 默认隐藏设置面板
+    m_settingsPanel->hide();
 
     // --- 整体配色 ---
     setStyleSheet("background-color: #0a0a1a;");
@@ -233,6 +238,7 @@ void CameraGUI::connectSignals() {
     // 按钮 → 内部 slot → 回调/信号
     connect(m_btnCapture, &QPushButton::clicked, this, &CameraGUI::onCapture);
     connect(m_btnRecord,  &QPushButton::clicked, this, &CameraGUI::onRecord);
+    connect(m_btnSettings, &QPushButton::clicked, this, &CameraGUI::onSettings);
     connect(m_resolutionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &CameraGUI::onResolutionComboChanged);
     connect(m_formatCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -308,8 +314,18 @@ void CameraGUI::onCapture() {
 }
 
 void CameraGUI::onRecord() {
-    m_isRecording = !m_isRecording;
-    qDebug() << "[GUI] 录像切换:" << (m_isRecording ? "开始" : "停止");
+    bool shouldRecord = !m_isRecording;
+    qDebug() << "[GUI] 录像请求:" << (shouldRecord ? "开始" : "停止");
+
+    // 先询问回调，回调返回 true 才允许切换状态
+    if (m_onRecordToggle) {
+        if (!m_onRecordToggle(shouldRecord)) {
+            qDebug() << "[GUI] 录像被拒绝（格式不支持等）";
+            return;  // 回调拒绝，不切换 UI
+        }
+    }
+
+    m_isRecording = shouldRecord;
 
     if (m_isRecording) {
         m_btnRecord->setText(QStringLiteral("⏹ 停止"));
@@ -332,7 +348,12 @@ void CameraGUI::onRecord() {
     }
 
     emit recordToggled(m_isRecording);
-    if (m_onRecordToggle) m_onRecordToggle(m_isRecording);
+}
+
+void CameraGUI::onSettings() {
+    bool visible = m_settingsPanel->isVisible();
+    m_settingsPanel->setVisible(!visible);
+    qDebug() << "[GUI] 设置面板" << (visible ? "隐藏" : "显示");
 }
 
 void CameraGUI::onResolutionComboChanged(int index) {
@@ -416,7 +437,7 @@ void CameraGUI::setStreamingStatus(bool streaming) {
 // ============================================================
 
 void CameraGUI::onCaptureRequest(CallbackVoid cb)       { m_onCapture = std::move(cb); }
-void CameraGUI::onRecordToggle(CallbackBool cb)         { m_onRecordToggle = std::move(cb); }
+void CameraGUI::onRecordToggle(std::function<bool(bool)> cb) { m_onRecordToggle = std::move(cb); }
 void CameraGUI::onResolutionChanged(CallbackIntInt cb)  { m_onResolutionChanged = std::move(cb); }
 void CameraGUI::onFormatChanged(CallbackFormat cb)      { m_onFormatChanged = std::move(cb); }
 
