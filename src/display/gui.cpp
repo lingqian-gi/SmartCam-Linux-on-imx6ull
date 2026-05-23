@@ -364,9 +364,10 @@ void CameraGUI::onFormatComboChanged(int index) {
 void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
     if (!data || len <= 0) return;
 
-    // 更新当前帧信息（此处仅存引用，实际数据由调用者管理生命周期）
-    // 真实集成时需配合 FrameQueue 做数据拷贝或共享
-    m_currentFrame.data   = const_cast<uint8_t*>(data);
+    // 深拷贝帧数据到内部缓冲区，避免指针悬垂
+    // （采集线程的 g_state.frameData 随时可能被下一帧覆盖或 realloc）
+    m_frameBuffer.assign(data, data + len);
+    m_currentFrame.data   = m_frameBuffer.data();
     m_currentFrame.length = len;
     m_currentFrame.width  = w;
     m_currentFrame.height = h;

@@ -102,6 +102,7 @@ private:
 
     // ====== 数据 ======
     FrameBuffer  m_currentFrame;
+    std::vector<uint8_t> m_frameBuffer;  // 内部帧数据拷贝（避免指针悬垂）
     bool         m_isRecording    = false;
     bool         m_mockMode       = false;
 

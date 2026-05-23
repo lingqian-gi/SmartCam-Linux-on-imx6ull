@@ -3,7 +3,10 @@
 # ============================================================
 
 # ---- 构建产物 ----
-build/
+build/*
+!build/arm/
+build/arm/*
+!build/arm/smartcam
 cmake-build-*/
 
 # ---- IDE / 编辑器 ----
