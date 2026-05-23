@@ -157,25 +157,35 @@ void CameraGUI::buildUI() {
     auto* btnLayout = new QHBoxLayout();
     btnLayout->setSpacing(8);
 
-    QString btnStyle =
+    QString btnBaseStyle =
         "QPushButton {"
         "  font-size: 14px; font-weight: bold; padding: 8px 16px;"
-        "  border-radius: 6px; border: none;"
         "  min-width: 80px;"
-        "}"
-        "QPushButton:hover  { opacity: 0.9; }"
-        "QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }";
+        "}";
 
     m_btnCapture = new QPushButton(QStringLiteral("Capture"), this);
     m_btnRecord  = new QPushButton(QStringLiteral("Record"), this);
     m_btnSettings = new QPushButton(QStringLiteral("Settings"), this);
 
-    m_btnCapture->setStyleSheet(btnStyle +
-        "background-color: #0f3460; color: white;");
-    m_btnRecord->setStyleSheet(btnStyle +
-        "background-color: #533483; color: white;");
-    m_btnSettings->setStyleSheet(btnStyle +
-        "background-color: #1a1a2e; color: #a0a0c0;");
+    // 使用亮色 + 实线边框，确保 linuxfb 下按钮清晰可见
+    m_btnCapture->setStyleSheet(btnBaseStyle +
+        "QPushButton {"
+        "  background-color: #1a6fb5; color: white;"
+        "  border: 2px solid #5aa9e6; border-radius: 4px;"
+        "}"
+        "QPushButton:pressed { background-color: #0d4a7a; }");
+    m_btnRecord->setStyleSheet(btnBaseStyle +
+        "QPushButton {"
+        "  background-color: #8e44ad; color: white;"
+        "  border: 2px solid #c084d6; border-radius: 4px;"
+        "}"
+        "QPushButton:pressed { background-color: #5e3370; }");
+    m_btnSettings->setStyleSheet(btnBaseStyle +
+        "QPushButton {"
+        "  background-color: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #7f8c8d; border-radius: 4px;"
+        "}"
+        "QPushButton:pressed { background-color: #1a252f; }");
 
     btnLayout->addWidget(m_btnCapture);
     btnLayout->addWidget(m_btnRecord);
@@ -331,18 +341,22 @@ void CameraGUI::onRecord() {
     if (m_isRecording) {
         m_btnRecord->setText(QStringLiteral("Stop"));
         m_btnRecord->setStyleSheet(
-            "background-color: #c0392b; color: white;"
-            "font-size: 14px; font-weight: bold; padding: 8px 16px;"
-            "border-radius: 6px; border: none; min-width: 80px;");
+            "QPushButton {"
+            "  background-color: #c0392b; color: white;"
+            "  border: 2px solid #e74c3c; border-radius: 4px;"
+            "  font-size: 14px; font-weight: bold; padding: 8px 16px; min-width: 80px;"
+            "}");
         m_labelRecording->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #e74c3c;");
     } else {
         m_btnRecord->setText(QStringLiteral("Record"));
         m_btnRecord->setStyleSheet(
-            "background-color: #533483; color: white;"
-            "font-size: 14px; font-weight: bold; padding: 8px 16px;"
-            "border-radius: 6px; border: none; min-width: 80px;");
+            "QPushButton {"
+            "  background-color: #8e44ad; color: white;"
+            "  border: 2px solid #c084d6; border-radius: 4px;"
+            "  font-size: 14px; font-weight: bold; padding: 8px 16px; min-width: 80px;"
+            "}");
         m_labelRecording->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: gray;");
