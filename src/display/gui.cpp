@@ -76,7 +76,7 @@ static bool decodeMjpegToRgb(const uint8_t* jpeg_data, size_t jpeg_len,
 CameraGUI::CameraGUI(QWidget* parent)
     : QWidget(parent)
 {
-    setWindowTitle(QStringLiteral("SmartCam Linux — 智能相机流媒体系统"));
+    setWindowTitle(QStringLiteral("SmartCam Linux"));
 
     // 适配 7 寸屏 (800x480)，同时也兼容 PC 调试
     // 适配 7寸屏 800x480
@@ -96,9 +96,9 @@ CameraGUI::CameraGUI(QWidget* parent)
     enterMockMode();
 
     // 初始状态
-    m_labelStreaming->setText(QStringLiteral("[待机]"));
+    m_labelStreaming->setText(QStringLiteral("IDLE"));
     m_labelStreaming->setStyleSheet("color: gray;");
-    m_labelClients->setText(QStringLiteral("客户端: 0"));
+    m_labelClients->setText(QStringLiteral("Clients: 0"));
     m_labelRecording->setText(QStringLiteral("REC"));
     m_labelRecording->setStyleSheet("color: gray;");
 }
@@ -125,7 +125,7 @@ void CameraGUI::buildUI() {
         "border-radius: 4px;"
         "color: #4a4a6a;"
     );
-    m_videoDisplay->setText(QStringLiteral("等待摄像头…"));
+    m_videoDisplay->setText(QStringLiteral("Waiting camera..."));
     m_videoDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     m_videoDisplay->setScaledContents(true);
     mainLayout->addWidget(m_videoDisplay, 1);
@@ -135,8 +135,8 @@ void CameraGUI::buildUI() {
     statusLayout->setSpacing(12);
 
     m_labelFPS = new QLabel(QStringLiteral("FPS: 0.0"), this);
-    m_labelStreaming = new QLabel(QStringLiteral("[待机]"), this);
-    m_labelClients = new QLabel(QStringLiteral("客户端: 0"), this);
+    m_labelStreaming = new QLabel(QStringLiteral("IDLE"), this);
+    m_labelClients = new QLabel(QStringLiteral("Clients: 0"), this);
     m_labelRecording = new QLabel(QStringLiteral("REC"), this);
 
     QString statusStyle = "font-size: 13px; font-weight: bold; padding: 2px 6px;"
@@ -166,9 +166,9 @@ void CameraGUI::buildUI() {
         "QPushButton:hover  { opacity: 0.9; }"
         "QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }";
 
-    m_btnCapture = new QPushButton(QStringLiteral("[拍照]"), this);
-    m_btnRecord  = new QPushButton(QStringLiteral("[录像]"), this);
-    m_btnSettings = new QPushButton(QStringLiteral("[设置]"), this);
+    m_btnCapture = new QPushButton(QStringLiteral("Capture"), this);
+    m_btnRecord  = new QPushButton(QStringLiteral("Record"), this);
+    m_btnSettings = new QPushButton(QStringLiteral("Settings"), this);
 
     m_btnCapture->setStyleSheet(btnStyle +
         "background-color: #0f3460; color: white;");
@@ -189,16 +189,16 @@ void CameraGUI::buildUI() {
     settingsLayout->setContentsMargins(0, 0, 0, 0);
     settingsLayout->setSpacing(12);
 
-    auto* resLabel = new QLabel(QStringLiteral("分辨率:"), this);
+    auto* resLabel = new QLabel(QStringLiteral("Res:"), this);
     m_resolutionCombo = new QComboBox(this);
     m_resolutionCombo->addItem(QStringLiteral("640x480"),  QVariant::fromValue(RES_640x480));
     m_resolutionCombo->addItem(QStringLiteral("320x240"),  QVariant::fromValue(RES_320x240));
     m_resolutionCombo->addItem(QStringLiteral("1280x720"), QVariant::fromValue(RES_1280x720));
 
-    auto* fmtLabel = new QLabel(QStringLiteral("格式:"), this);
+    auto* fmtLabel = new QLabel(QStringLiteral("Fmt:"), this);
     m_formatCombo = new QComboBox(this);
-    m_formatCombo->addItem(QStringLiteral("YUV (本地预览)"),  static_cast<int>(PixelFormat::FMT_YUYV));
-    m_formatCombo->addItem(QStringLiteral("MJPEG (硬件直出)"), static_cast<int>(PixelFormat::FMT_MJPEG));
+    m_formatCombo->addItem(QStringLiteral("YUV"),       static_cast<int>(PixelFormat::FMT_YUYV));
+    m_formatCombo->addItem(QStringLiteral("MJPEG"),     static_cast<int>(PixelFormat::FMT_MJPEG));
 
     QString labelStyle = "font-size: 13px; color: #c0c0d0;";
     resLabel->setStyleSheet(labelStyle);
@@ -309,19 +309,19 @@ void CameraGUI::refreshFrame() {
 }
 
 void CameraGUI::onCapture() {
-    qDebug() << "[GUI] 拍照按钮点击";
+    qDebug() << "[GUI] Capture button clicked";
     emit captureClicked();
     if (m_onCapture) m_onCapture();
 }
 
 void CameraGUI::onRecord() {
     bool shouldRecord = !m_isRecording;
-    qDebug() << "[GUI] 录像请求:" << (shouldRecord ? "开始" : "停止");
+    qDebug() << "[GUI] Record request:" << (shouldRecord ? "Start" : "Stop");
 
     // 先询问回调，回调返回 true 才允许切换状态
     if (m_onRecordToggle) {
         if (!m_onRecordToggle(shouldRecord)) {
-            qDebug() << "[GUI] 录像被拒绝（格式不支持等）";
+            qDebug() << "[GUI] Record denied (format not supported)";
             return;  // 回调拒绝，不切换 UI
         }
     }
@@ -329,7 +329,7 @@ void CameraGUI::onRecord() {
     m_isRecording = shouldRecord;
 
     if (m_isRecording) {
-        m_btnRecord->setText(QStringLiteral("[停止]"));
+        m_btnRecord->setText(QStringLiteral("Stop"));
         m_btnRecord->setStyleSheet(
             "background-color: #c0392b; color: white;"
             "font-size: 14px; font-weight: bold; padding: 8px 16px;"
@@ -338,7 +338,7 @@ void CameraGUI::onRecord() {
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #e74c3c;");
     } else {
-        m_btnRecord->setText(QStringLiteral("[录像]"));
+        m_btnRecord->setText(QStringLiteral("Record"));
         m_btnRecord->setStyleSheet(
             "background-color: #533483; color: white;"
             "font-size: 14px; font-weight: bold; padding: 8px 16px;"
@@ -354,7 +354,7 @@ void CameraGUI::onRecord() {
 void CameraGUI::onSettings() {
     bool visible = m_settingsPanel->isVisible();
     m_settingsPanel->setVisible(!visible);
-    qDebug() << "[GUI] 设置面板" << (visible ? "隐藏" : "显示");
+    qDebug() << "[GUI] Settings panel" << (visible ? "Hide" : "Show");
 }
 
 void CameraGUI::onResolutionComboChanged(int index) {
@@ -363,7 +363,7 @@ void CameraGUI::onResolutionComboChanged(int index) {
 
     Resolution res = data.value<Resolution>();
     if (res != Resolution{m_currentFrame.width, m_currentFrame.height}) {
-        qDebug() << "[GUI] 分辨率切换:" << res.width << "x" << res.height;
+        qDebug() << "[GUI] Resolution changed:" << res.width << "x" << res.height;
         if (m_mockMode) {
             enterMockMode();   // 重新生成模拟帧
         }
@@ -374,7 +374,7 @@ void CameraGUI::onResolutionComboChanged(int index) {
 
 void CameraGUI::onFormatComboChanged(int index) {
     PixelFormat fmt = static_cast<PixelFormat>(m_formatCombo->itemData(index).toInt());
-    qDebug() << "[GUI] 格式切换:" << static_cast<int>(fmt);
+    qDebug() << "[GUI] Format changed:" << static_cast<int>(fmt);
     emit formatChanged(fmt);
     if (m_onFormatChanged) m_onFormatChanged(fmt);
 }
@@ -404,7 +404,7 @@ void CameraGUI::setFPS(double fps) {
 }
 
 void CameraGUI::setClientCount(int count) {
-    m_labelClients->setText(QString("客户端: %1").arg(count));
+    m_labelClients->setText(QString("Clients: %1").arg(count));
 }
 
 void CameraGUI::setRecordingStatus(bool recording) {
@@ -421,12 +421,12 @@ void CameraGUI::setRecordingStatus(bool recording) {
 
 void CameraGUI::setStreamingStatus(bool streaming) {
     if (streaming) {
-        m_labelStreaming->setText(QStringLiteral("[推流]"));
+        m_labelStreaming->setText(QStringLiteral("LIVE"));
         m_labelStreaming->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #2ecc71;");
     } else {
-        m_labelStreaming->setText(QStringLiteral("[待机]"));
+        m_labelStreaming->setText(QStringLiteral("IDLE"));
         m_labelStreaming->setStyleSheet(
             "font-size: 13px; font-weight: bold; padding: 2px 6px;"
             "background: #16213e; border-radius: 3px; color: #e0e0e0;");
@@ -493,12 +493,12 @@ void CameraGUI::enterMockMode() {
     m_currentFrame.data = m_mockBuffer.data();
 
     m_labelFPS->setText(QStringLiteral("FPS: 30.0"));
-    m_labelStreaming->setText(QStringLiteral("[模拟]"));
+    m_labelStreaming->setText(QStringLiteral("MOCK"));
     m_labelStreaming->setStyleSheet(
         "font-size: 13px; font-weight: bold; padding: 2px 6px;"
         "background: #16213e; border-radius: 3px; color: #f39c12;");
 
-    qDebug() << "[GUI] 进入 Mock 模式:" << w << "x" << h;
+    qDebug() << "[GUI] Entering Mock mode:" << w << "x" << h;
 }
 
 // ============================================================
@@ -542,7 +542,7 @@ QImage CameraGUI::frameToQImage(const uint8_t* data, int len, int w, int h, Pixe
         return {};
     }
     default:
-        qWarning() << "[GUI] 不支持的像素格式:" << static_cast<int>(fmt);
+        qWarning() << "[GUI] Unsupported pixel format:" << static_cast<int>(fmt);
         return {};
     }
 }
