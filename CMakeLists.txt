@@ -43,6 +43,8 @@ set(CAMERA_SOURCES
 set(DISPLAY_SOURCES
     src/display/gui.cpp
     include/display/gui.h    # 需要 MOC 处理 (含 Q_OBJECT)
+    src/display/gallery.cpp
+    include/display/gallery.h  # 需要 MOC 处理 (含 Q_OBJECT)
 )
 
 set(NETWORK_SOURCES

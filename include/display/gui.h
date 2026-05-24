@@ -8,11 +8,13 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QStackedWidget>
 #include <QGroupBox>
 #include <QStatusBar>
 #include <cstdint>
 
 #include "include/common/types.h"
+#include "include/display/gallery.h"
 
 /**
  * @brief 智能相机主GUI界面
@@ -63,6 +65,11 @@ public:
     void onResolutionChanged(CallbackIntInt cb);  // (w, h)
     void onFormatChanged(CallbackFormat cb);
 
+    // ---- 相册集成 ----
+    void setGalleryStorage(StorageManager* storage);
+    void showGallery();
+    void showLivePreview();
+
 signals:
     /// 外部可通过信号感知 GUI 事件
     void captureClicked();
@@ -75,8 +82,10 @@ private slots:
     void onCapture();
     void onRecord();
     void onSettings();
+    void onGallery();          // 新增
     void onResolutionComboChanged(int index);
     void onFormatComboChanged(int index);
+    void onBackFromGallery();  // 新增：从相册返回
 
 private:
     void buildUI();
@@ -85,13 +94,17 @@ private:
     QImage frameToQImage(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
 
     // ====== UI 控件 ======
-    QLabel*      m_videoDisplay   = nullptr;   // 视频预览区
-    QPushButton* m_btnCapture     = nullptr;   // 拍照
-    QPushButton* m_btnRecord      = nullptr;   // 录像（toggle）
-    QPushButton* m_btnSettings    = nullptr;   // 设置
-    QComboBox*   m_resolutionCombo = nullptr;  // 分辨率选择
-    QComboBox*   m_formatCombo    = nullptr;   // 格式选择 (YUV/MJPEG)
-    QWidget*     m_settingsPanel  = nullptr;   // 设置面板容器（可展开/收起）
+    QStackedWidget* m_mainStack     = nullptr;   // [0]=实时预览, [1]=相册
+    QWidget*        m_liveViewContainer = nullptr;
+    QLabel*         m_videoDisplay   = nullptr;   // 视频预览区
+    QPushButton*    m_btnCapture     = nullptr;   // 拍照
+    QPushButton*    m_btnRecord      = nullptr;   // 录像（toggle）
+    QPushButton*    m_btnSettings    = nullptr;   // 设置
+    QPushButton*    m_btnGallery     = nullptr;   // 相册
+    QComboBox*      m_resolutionCombo = nullptr;  // 分辨率选择
+    QComboBox*      m_formatCombo    = nullptr;   // 格式选择 (YUV/MJPEG)
+    QWidget*        m_settingsPanel  = nullptr;   // 设置面板容器（可展开/收起）
+    PhotoGallery*   m_gallery        = nullptr;   // 相册组件
 
     // 状态栏
     QLabel*      m_labelFPS       = nullptr;

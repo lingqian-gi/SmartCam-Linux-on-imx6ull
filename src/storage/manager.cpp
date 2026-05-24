@@ -13,6 +13,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 #include <algorithm>
+#include <map>
 #include <sstream>
 #include <iomanip>
 #include <dirent.h>
@@ -565,4 +566,213 @@ int StorageManager::autoCleanup(int keep_mb) {
     currentFree = getFreeSpaceMB();
     LOG_INF("autoCleanup: done, free=%d MB", currentFree);
     return currentFree;
+}
+
+// ============================================================
+// 相册浏览 (v0.2)
+// ============================================================
+
+bool StorageManager::readJpegSize(const std::string& path, int& w, int& h) {
+    w = 0; h = 0;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return false;
+
+    uint8_t buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf), fp);
+    fclose(fp);
+
+    // 检查 JPEG SOI 标记
+    if (n < 100 || buf[0] != 0xFF || buf[1] != 0xD8) return false;
+
+    // 扫描标记段，查找 SOF0 (0xFF 0xC0) 标记
+    for (size_t i = 2; i < n - 8; i++) {
+        if (buf[i] == 0xFF) {
+            uint8_t marker = buf[i + 1];
+            // 跳过填充字节 (0xFF 0xFF)
+            if (marker == 0xFF) continue;
+            // 跳过无数据标记 (D0-D7, D8=SOI, D9=EOI, DA=SOS)
+            if (marker >= 0xD0 && marker <= 0xD7) continue;
+
+            // SOF0 (Baseline DCT) 或 SOF1 (Extended): 0xC0-0xC2
+            if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+                if (i + 8 >= n) return false;
+                h = (buf[i + 5] << 8) | buf[i + 6];
+                w = (buf[i + 7] << 8) | buf[i + 8];
+                return (w > 0 && h > 0);
+            }
+
+            // 跳过变长段: 读取长度
+            if (i + 3 < n) {
+                uint16_t segLen = (buf[i + 2] << 8) | buf[i + 3];
+                if (segLen >= 2) i += segLen + 1;  // +1 because loop does i++
+            }
+        }
+    }
+
+    return false;
+}
+
+int StorageManager::listPhotos(std::vector<PhotoDayGroup>& out,
+                               bool includeInfo) {
+    out.clear();
+    int totalCount = 0;
+
+    DIR* dp = opendir(m_photoDir.c_str());
+    if (!dp) {
+        if (errno != ENOENT) {
+            LOG_WRN("listPhotos: opendir(%s) failed: %s",
+                    m_photoDir.c_str(), strerror(errno));
+        }
+        return 0;
+    }
+
+    // 收集所有文件 (path → mtime)
+    struct RawEntry {
+        std::string path;
+        time_t      mtime;
+    };
+    std::vector<RawEntry> rawEntries;
+
+    struct dirent* entry;
+    while ((entry = readdir(dp)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        if (entry->d_type == DT_REG) {
+            // 根目录直接文件（兼容旧格式）
+            if (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".JPG")) {
+                std::string fp = m_photoDir + "/" + entry->d_name;
+                struct stat st;
+                if (stat(fp.c_str(), &st) == 0) {
+                    rawEntries.push_back({fp, st.st_mtime});
+                }
+            }
+        } else if (entry->d_type == DT_DIR) {
+            // 日期子目录
+            std::string dateDir = m_photoDir + "/" + entry->d_name;
+            DIR* dp2 = opendir(dateDir.c_str());
+            if (!dp2) continue;
+
+            struct dirent* file;
+            while ((file = readdir(dp2)) != nullptr) {
+                if (file->d_type != DT_REG) continue;
+                if (!strstr(file->d_name, ".jpg") && !strstr(file->d_name, ".JPG"))
+                    continue;
+
+                std::string fp = dateDir + "/" + file->d_name;
+                struct stat st;
+                if (stat(fp.c_str(), &st) == 0) {
+                    rawEntries.push_back({fp, st.st_mtime});
+                }
+            }
+            closedir(dp2);
+        }
+    }
+    closedir(dp);
+
+    if (rawEntries.empty()) return 0;
+
+    // 按时间倒序排序
+    std::sort(rawEntries.begin(), rawEntries.end(),
+              [](const RawEntry& a, const RawEntry& b) {
+                  return a.mtime > b.mtime;
+              });
+
+    // 解析信息 & 按日期分组
+    std::map<std::string, PhotoDayGroup> groupMap;
+
+    for (const auto& re : rawEntries) {
+        PhotoInfo info;
+        info.path = re.path;
+        info.timestamp = re.mtime;
+
+        // 提取文件名
+        size_t slash = re.path.rfind('/');
+        info.filename = (slash != std::string::npos)
+            ? re.path.substr(slash + 1) : re.path;
+
+        // 格式化日期 & 时间
+        struct tm* tm_info = localtime(&re.mtime);
+        char dateBuf[16], timeBuf[16];
+        strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", tm_info);
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M",   tm_info);
+        info.dateStr = dateBuf;
+        info.timeStr = timeBuf;
+        info.fileSize = 0;
+
+        // 文件大小 & 可选宽高
+        struct stat st;
+        if (stat(re.path.c_str(), &st) == 0) {
+            info.fileSize = static_cast<size_t>(st.st_size);
+        }
+
+        info.width  = 0;
+        info.height = 0;
+        if (includeInfo) {
+            readJpegSize(re.path, info.width, info.height);
+        }
+
+        auto& group = groupMap[info.dateStr];
+        if (group.dateStr.empty()) group.dateStr = info.dateStr;
+        group.photos.push_back(std::move(info));
+        totalCount++;
+    }
+
+    // 转换为 vector（保持日期倒序）
+    for (auto it = groupMap.rbegin(); it != groupMap.rend(); ++it) {
+        out.push_back(std::move(it->second));
+    }
+
+    return totalCount;
+}
+
+int StorageManager::getPhotoCount() {
+    int count = 0;
+    DIR* dp = opendir(m_photoDir.c_str());
+    if (!dp) return 0;
+
+    struct dirent* entry;
+    while ((entry = readdir(dp)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        if (entry->d_type == DT_REG &&
+            (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".JPG"))) {
+            count++;
+        } else if (entry->d_type == DT_DIR) {
+            std::string dateDir = m_photoDir + "/" + entry->d_name;
+            DIR* dp2 = opendir(dateDir.c_str());
+            if (!dp2) continue;
+            struct dirent* file;
+            while ((file = readdir(dp2)) != nullptr) {
+                if (file->d_type == DT_REG &&
+                    (strstr(file->d_name, ".jpg") || strstr(file->d_name, ".JPG"))) {
+                    count++;
+                }
+            }
+            closedir(dp2);
+        }
+    }
+    closedir(dp);
+    return count;
+}
+
+int StorageManager::deletePhoto(const std::string& path) {
+    if (unlink(path.c_str()) != 0) {
+        LOG_ERR_("deletePhoto: unlink(%s) failed: %s",
+                 path.c_str(), strerror(errno));
+        return -1;
+    }
+
+    LOG_INF("Photo deleted: %s", path.c_str());
+
+    // 尝试清理空的日期目录
+    size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        std::string dir = path.substr(0, slash);
+        // 仅当目录在 photoDir 里时才清理
+        if (dir.find(m_photoDir) == 0 && dir != m_photoDir) {
+            rmdir(dir.c_str());  // 忽略返回值：非空目录会失败，无害
+        }
+    }
+
+    return 0;
 }

@@ -187,6 +187,9 @@ int main(int argc, char* argv[]) {
     StorageManager storage(photoDir, videoDir);
     g_storage = &storage;
 
+    // 绑定存储到相册组件
+    gui.setGalleryStorage(&storage);
+
     // ---- 真实相机模式 ----
     CameraCapture*    capture      = nullptr;
     std::thread*      captureThread = nullptr;

@@ -222,6 +222,53 @@ public:
     int autoCleanup(int keep_mb = 100);
 
     // ============================================================
+    // 相册浏览 (v0.2)
+    // ============================================================
+
+    /**
+     * @brief 照片元信息
+     */
+    struct PhotoInfo {
+        std::string path;         // 完整路径
+        std::string filename;     // 文件名
+        std::string dateStr;      // "2026-05-24"
+        std::string timeStr;      // "14:30"
+        time_t      timestamp;    // Unix 时间戳（用于排序）
+        int         width;        // 图片宽度
+        int         height;       // 图片高度
+        size_t      fileSize;     // 文件大小（字节）
+    };
+
+    /** @brief 按日期分组 */
+    struct PhotoDayGroup {
+        std::string dateStr;                 // "2026-05-24"
+        std::vector<PhotoInfo> photos;
+    };
+
+    /**
+     * @brief 获取所有照片列表（按时间倒序，按日期分组）
+     * @param out          输出分组列表
+     * @param includeInfo  是否解析 JPEG 头部获取宽高（true 时较慢）
+     * @return 照片总数
+     */
+    int listPhotos(std::vector<PhotoDayGroup>& out, bool includeInfo = false);
+
+    /** @brief 获取照片总数（快速，只读目录不读文件） */
+    int getPhotoCount();
+
+    /**
+     * @brief 删除一张照片
+     * @return 0 成功，-1 失败
+     */
+    int deletePhoto(const std::string& path);
+
+    /**
+     * @brief 从 JPEG 文件头快速读取宽高（只读前 4KB，不解码像素）
+     * @return true 成功
+     */
+    static bool readJpegSize(const std::string& path, int& w, int& h);
+
+    // ============================================================
     // 配置
     // ============================================================
 
@@ -230,6 +277,9 @@ public:
 
     /** @brief 设置录像保存目录 */
     void setVideoDir(const std::string& dir) { m_videoDir = dir; }
+
+    /** @brief 获取当前照片目录 */
+    const std::string& photoDir() const { return m_photoDir; }
 
 private:
     // ---- 内部工具 ----

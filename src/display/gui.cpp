@@ -5,6 +5,8 @@
 #include <QImage>
 #include <QFont>
 #include <QDateTime>
+#include <QStackedWidget>
+#include <QScrollArea>
 #include <QDebug>
 #include <cmath>
 #include <cstring>
@@ -115,8 +117,16 @@ void CameraGUI::buildUI() {
     mainLayout->setContentsMargins(6, 4, 6, 4);
     mainLayout->setSpacing(4);
 
-    // --- (1) 视频预览区 ---
-    m_videoDisplay = new QLabel(this);
+    // --- (1) 视频预览区 + 相册（QStackedWidget 切换） ---
+    m_mainStack = new QStackedWidget(this);
+    m_mainStack->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    // 实时预览容器
+    m_liveViewContainer = new QWidget(this);
+    auto* liveLayout = new QVBoxLayout(m_liveViewContainer);
+    liveLayout->setContentsMargins(0, 0, 0, 0);
+
+    m_videoDisplay = new QLabel(m_liveViewContainer);
     m_videoDisplay->setAlignment(Qt::AlignCenter);
     m_videoDisplay->setMinimumSize(640, 360);
     m_videoDisplay->setStyleSheet(
@@ -128,7 +138,18 @@ void CameraGUI::buildUI() {
     m_videoDisplay->setText(QStringLiteral("Waiting camera..."));
     m_videoDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     m_videoDisplay->setScaledContents(true);
-    mainLayout->addWidget(m_videoDisplay, 1);
+    liveLayout->addWidget(m_videoDisplay);
+
+    m_mainStack->addWidget(m_liveViewContainer);  // index 0
+
+    // 相册（延迟创建，等 setGalleryStorage 绑定 storage）
+    m_gallery = new PhotoGallery(nullptr, this);
+    connect(m_gallery, &PhotoGallery::backToLive,
+            this, &CameraGUI::onBackFromGallery);
+    m_mainStack->addWidget(m_gallery);  // index 1
+
+    m_mainStack->setCurrentIndex(0);
+    mainLayout->addWidget(m_mainStack, 1);
 
     // --- (2) 状态栏 ---
     auto* statusLayout = new QHBoxLayout();
@@ -165,6 +186,7 @@ void CameraGUI::buildUI() {
 
     m_btnCapture = new QPushButton(QStringLiteral("Capture"), this);
     m_btnRecord  = new QPushButton(QStringLiteral("Record"), this);
+    m_btnGallery = new QPushButton(QStringLiteral("Gallery"), this);
     m_btnSettings = new QPushButton(QStringLiteral("Settings"), this);
 
     // 使用亮色 + 实线边框，确保 linuxfb 下按钮清晰可见
@@ -187,8 +209,16 @@ void CameraGUI::buildUI() {
         "}"
         "QPushButton:pressed { background-color: #1a252f; }");
 
+    m_btnGallery->setStyleSheet(btnBaseStyle +
+        "QPushButton {"
+        "  background-color: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #7f8c8d; border-radius: 4px;"
+        "}"
+        "QPushButton:pressed { background-color: #1a252f; }");
+
     btnLayout->addWidget(m_btnCapture);
     btnLayout->addWidget(m_btnRecord);
+    btnLayout->addWidget(m_btnGallery);
     btnLayout->addWidget(m_btnSettings);
     btnLayout->addStretch();
     mainLayout->addLayout(btnLayout);
@@ -249,6 +279,7 @@ void CameraGUI::connectSignals() {
     // 按钮 → 内部 slot → 回调/信号
     connect(m_btnCapture, &QPushButton::clicked, this, &CameraGUI::onCapture);
     connect(m_btnRecord,  &QPushButton::clicked, this, &CameraGUI::onRecord);
+    connect(m_btnGallery, &QPushButton::clicked, this, &CameraGUI::onGallery);
     connect(m_btnSettings, &QPushButton::clicked, this, &CameraGUI::onSettings);
     connect(m_resolutionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &CameraGUI::onResolutionComboChanged);
@@ -393,9 +424,50 @@ void CameraGUI::onFormatComboChanged(int index) {
     if (m_onFormatChanged) m_onFormatChanged(fmt);
 }
 
+void CameraGUI::onGallery() {
+    qDebug() << "[GUI] Gallery button clicked";
+    if (m_gallery && m_mainStack->currentIndex() == 0) {
+        showGallery();
+    }
+}
+
+void CameraGUI::onBackFromGallery() {
+    qDebug() << "[GUI] Back from gallery";
+    showLivePreview();
+}
+
 // ============================================================
 // 公共接口
 // ============================================================
+
+void CameraGUI::setGalleryStorage(StorageManager* storage) {
+    if (m_gallery) {
+        m_gallery->setParent(nullptr);  // 从栈中移除旧实例
+        delete m_gallery;
+    }
+
+    m_gallery = new PhotoGallery(storage, this);
+    connect(m_gallery, &PhotoGallery::backToLive,
+            this, &CameraGUI::onBackFromGallery);
+    m_mainStack->insertWidget(1, m_gallery);  // 替换 index 1
+}
+
+void CameraGUI::showGallery() {
+    if (m_gallery) {
+        m_gallery->reset();  // 刷新列表 + 回到网格
+        m_mainStack->setCurrentIndex(1);
+        // 隐藏实时预览相关的操作按钮
+        m_btnCapture->hide();
+        m_btnRecord->hide();
+        m_settingsPanel->hide();
+    }
+}
+
+void CameraGUI::showLivePreview() {
+    m_mainStack->setCurrentIndex(0);
+    m_btnCapture->show();
+    m_btnRecord->show();
+}
 
 void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
     if (!data || len <= 0) return;
