@@ -48,6 +48,10 @@ set(DISPLAY_SOURCES
 set(NETWORK_SOURCES
     src/network/mjpeg_server.cpp
     include/network/mjpeg_server.h
+    src/network/control.cpp
+    include/network/control.h
+    src/network/rtsp_server.cpp
+    include/network/rtsp_server.h
 )
 
 set(STORAGE_SOURCES

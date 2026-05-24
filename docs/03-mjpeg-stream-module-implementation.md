@@ -4,6 +4,7 @@
 > **创建日期**：2026-05-23
 > **状态**：✅ 已实现，语法检查通过
 > **依赖**：Linux socket、pthread、C++17
+> **更新**：2026-05-24 — 新增 `GET /snapshot` 和 `GET /status` 端点
 
 ---
 
@@ -48,6 +49,8 @@ SmartCam 多线程架构（更新后）
 | SO_REUSEADDR 端口快速重用 | ✅ |
 | `GET /` 返回 HTML 页面（暗色主题，手机适配） | ✅ |
 | `GET /stream` 返回 multipart MJPEG 无限流 | ✅ |
+| **`GET /snapshot` 返回单帧 JPEG 快照** | ✅ **NEW** |
+| **`GET /status` 返回 JSON 设备状态** | ✅ **NEW** |
 | 采集线程 `updateFrame()` 推帧接口 | ✅ |
 | 条件变量广播新帧到所有客户端 | ✅ |
 | 每客户端独立线程发送 | ✅ |
@@ -299,7 +302,106 @@ Content-Length: 38214\r\n
 4. 二进制数据后跟 CRLF
 5. 流结束时发送 `--boundary--`（实际因 Connection: close 非必需）
 
-### 5.3 浏览器行为
+### 5.2 GET /snapshot — 单帧 JPEG 快照（2026-05-24 新增）
+
+```
+请求:
+  GET /snapshot HTTP/1.0
+
+响应:
+  HTTP/1.0 200 OK
+  Content-Type: image/jpeg
+  Content-Length: 38214
+  Cache-Control: no-cache, no-store, must-revalidate
+  Connection: close
+  Access-Control-Allow-Origin: *
+
+  [JPEG 二进制数据: 38214 bytes]
+```
+
+**与 `/stream` 的关键区别**：
+
+| 维度 | `/stream` | `/snapshot` |
+|------|----------|-------------|
+| 行为 | 无限推送，每帧不断 | 只返当前一帧，立即断开 |
+| Content-Type | `multipart/x-mixed-replace` | `image/jpeg` |
+| 连接 | 长连接 | 短连接 |
+| 用途 | 浏览器实时观看 | curl 抓图 / 脚本 / 监控系统 |
+| HTTP 版本 | HTTP/1.0 (keep-alive 默认关闭) | HTTP/1.0 |
+
+**使用示例**：
+```bash
+# 命令行抓一张快照
+curl http://192.168.1.100:8080/snapshot -o snapshot.jpg
+
+# 监控脚本每 5 秒拍一张存到 NAS
+while true; do
+    curl http://192.168.1.100:8080/snapshot \
+        -o /nas/$(date +%Y%m%d_%H%M%S).jpg
+    sleep 5
+done
+```
+
+### 5.3 GET /status — JSON 设备状态（2026-05-24 新增）
+
+```
+请求:
+  GET /status HTTP/1.0
+
+响应:
+  HTTP/1.0 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-cache
+  Connection: close
+  Access-Control-Allow-Origin: *
+
+  {
+    "streaming": true,
+    "recording": false,
+    "width": 640,
+    "height": 480,
+    "format": "MJPEG",
+    "fps": 29.8,
+    "clients": 3,
+    "uptime_seconds": 12345
+  }
+```
+
+**实现方式**：通过 `StreamStatusProvider` 回调（类似 ControlServer 的 `StatusProvider`），由 main.cpp 在启动时注入：
+
+```cpp
+mjpegServer->setStatusProvider([capture, startTime]() -> StreamStatus {
+    StreamStatus st;
+    st.streaming     = capture->isStreaming();
+    st.recording     = g_recording.load();
+    st.width         = capture->getCurrentResolution().width;
+    st.height        = capture->getCurrentResolution().height;
+    st.format        = capture->getCurrentFormat() == MJPEG ? "MJPEG" : "YUYV";
+    st.fps           = capture->getCurrentFPS();
+    st.client_count  = mjpegServer->clientCount();
+    st.uptime_seconds = (now() - startTime).seconds();
+    return st;
+});
+```
+
+**JSON 手工拼接**（零依赖，类似 AVI 手写思路）：
+
+```cpp
+snprintf(buf, sizeof(buf),
+    "{\r\n"
+    "  \"streaming\": %s,\r\n"
+    "  \"recording\": %s,\r\n"
+    "  \"width\": %d,\r\n"
+    "  \"height\": %d,\r\n"
+    "  \"format\": \"%s\",\r\n"
+    "  \"fps\": %.1f,\r\n"
+    "  \"clients\": %d,\r\n"
+    "  \"uptime_seconds\": %d\r\n"
+    "}\r\n",
+    ...);
+```
+
+### 5.4 浏览器行为
 
 ```
 浏览器收到第一个 part:
@@ -685,11 +787,11 @@ HTTP 流测试: ✅ curl http://localhost:8080/ → HTML 页面返回
 
 ## 十三、后续 TODO
 
-- [ ] 添加 `GET /snapshot` 端点：返回当前最新 JPEG 帧（用于快照功能）
-- [ ] 添加 `GET /status` 端点：返回 JSON 格式的相机状态
+- [x] 添加 `GET /snapshot` 端点：返回当前最新 JPEG 帧（✅ 2026-05-24 完成）
+- [x] 添加 `GET /status` 端点：返回 JSON 格式的相机状态（✅ 2026-05-24 完成）
 - [ ] 支持 JPEG 质量参数 URL 参数：`/stream?quality=80`
 - [ ] 客户端超时机制：长时间不发请求的客户端自动断开
-- [ ] 集成 RTSP 服务器（Live555）：标准流媒体协议支持
+- [ ] 集成 RTSP 服务器（Live555）：标准流媒体协议支持（✅ 已自实现，见 MOD-08）
 - [ ] 添加文件描述符限制处理（ulimit -n 设置）
 - [ ] 单元测试：`tests/test_mjpeg_server.cpp`（Mock TCP 客户端）
 - [ ] 文档：`docs/api.md` Doxygen 生成类接口文档
@@ -701,3 +803,4 @@ HTTP 流测试: ✅ curl http://localhost:8080/ → HTML 页面返回
 | 日期 | 变更内容 |
 |------|----------|
 | 2026-05-23 | 初始实现：MJPEGStreamServer 类、HTTP multipart 流、条件变量广播、HTML 页面、main.cpp 集成、CMake 构建 |
+| 2026-05-24 | 新增 `GET /snapshot`（单帧 JPEG）+ `GET /status`（JSON 状态）+ StreamStatusProvider 回调模式 + HTML 页面加入 API 链接 |

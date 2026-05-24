@@ -32,11 +32,14 @@
 #include <mutex>
 #include <vector>
 #include <cstring>
+#include <arpa/inet.h>
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
 #include "include/camera/processor.h"
 #include "include/network/mjpeg_server.h"
+#include "include/network/control.h"
+#include "include/network/rtsp_server.h"
 #include "include/storage/manager.h"
 #include "include/common/logger.h"
 
@@ -88,6 +91,22 @@ int main(int argc, char* argv[]) {
     );
     parser.addOption(portOpt);
 
+    QCommandLineOption ctrlPortOpt(
+        QStringLiteral("control-port"),
+        QStringLiteral("TCP 控制协议端口 (默认 9000)"),
+        QStringLiteral("port"),
+        "9000"
+    );
+    parser.addOption(ctrlPortOpt);
+
+    QCommandLineOption rtspPortOpt(
+        QStringLiteral("rtsp-port"),
+        QStringLiteral("RTSP 流媒体端口 (默认 8554)"),
+        QStringLiteral("port"),
+        "8554"
+    );
+    parser.addOption(rtspPortOpt);
+
     QCommandLineOption fmtOpt(
         QStringLiteral("fmt"),
         QStringLiteral("像素格式: yuyv | mjpeg (默认 yuyv)"),
@@ -98,9 +117,11 @@ int main(int argc, char* argv[]) {
 
     parser.process(app);
 
-    QString device  = parser.value(deviceOpt);
-    int     httpPort = parser.value(portOpt).toInt();
-    QString fmtStr  = parser.value(fmtOpt).toLower();
+    QString device    = parser.value(deviceOpt);
+    int     httpPort  = parser.value(portOpt).toInt();
+    int     ctrlPort  = parser.value(ctrlPortOpt).toInt();
+    int     rtspPort  = parser.value(rtspPortOpt).toInt();
+    QString fmtStr    = parser.value(fmtOpt).toLower();
 
     // ---- 创建 & 显示 GUI ----
     CameraGUI gui;
@@ -114,6 +135,10 @@ int main(int argc, char* argv[]) {
     std::thread*      captureThread = nullptr;
     QTimer*           displayTimer = nullptr;
     MJPEGStreamServer* mjpegServer = nullptr;
+    ControlServer*    controlSrv   = nullptr;
+    std::thread*      controlThread = nullptr;
+    RTSPServer*       rtspServer   = nullptr;
+    std::thread*      rtspThread   = nullptr;
 
     if (!device.isEmpty()) {
         // ============================================================
@@ -190,6 +215,28 @@ int main(int argc, char* argv[]) {
             if (mjpegServer->start(httpPort) == 0) {
                 mjpegServerOk = true;
                 LOG_INF("MJPEG stream server ready on port %d", httpPort);
+
+                // 注册 /status 端点回调
+                auto startTime = std::chrono::steady_clock::now();
+                mjpegServer->setStatusProvider(
+                    [capture, mjpegServer = mjpegServer, startTime]() -> StreamStatus {
+                        StreamStatus st;
+                        st.streaming = capture->isStreaming();
+                        st.recording = g_recording.load();
+                        Resolution res = capture->getCurrentResolution();
+                        st.width  = res.width;
+                        st.height = res.height;
+                        st.format = (capture->getCurrentFormat() ==
+                                     CameraCapture::V4L2_PIX_FMT_MJPEG)
+                                     ? "MJPEG" : "YUYV";
+                        st.fps    = capture->getCurrentFPS();
+                        st.client_count = mjpegServer->clientCount();
+                        st.uptime_seconds = static_cast<int>(
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - startTime
+                            ).count());
+                        return st;
+                    });
             }
         } else {
             LOG_WRN("Current format is YUYV — MJPEG stream requires "
@@ -197,9 +244,175 @@ int main(int argc, char* argv[]) {
         }
 
         // ============================================================
+        // 启动 RTSP 流媒体服务器
+        // ============================================================
+        rtspServer = new RTSPServer();
+        rtspServer->setStreamInfo(curRes.width, curRes.height,
+                                  30 /* fps */);
+        if (curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG) {
+            rtspThread = new std::thread([rtspServer, rtspPort]() {
+                LOG_INF("RTSP thread starting on port %d", rtspPort);
+                rtspServer->start(rtspPort);
+                LOG_INF("RTSP thread exited");
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            LOG_INF("RTSP stream server ready on rtsp://<board-ip>:%d/stream", rtspPort);
+        } else {
+            LOG_WRN("Current format is YUYV — RTSP requires --fmt mjpeg");
+        }
+
+        // ============================================================
+        // 启动 TCP 私有控制协议服务器
+        // ============================================================
+        controlSrv = new ControlServer();
+
+        // 注册 状态查询 处理器
+        controlSrv->setStatusProvider([capture, mjpegServer = mjpegServer](
+                                          StatusPayload& sp) {
+            sp.streaming    = capture->isStreaming() ? 1 : 0;
+            sp.recording    = g_recording.load() ? 1 : 0;
+            sp.client_count = mjpegServer ? mjpegServer->clientCount() : 0;
+            sp.reserved     = 0;
+
+            Resolution res = capture->getCurrentResolution();
+            sp.width  = static_cast<uint16_t>(res.width);
+            sp.height = static_cast<uint16_t>(res.height);
+            sp.format = (capture->getCurrentFormat() == CameraCapture::V4L2_PIX_FMT_MJPEG) ? 1 : 0;
+            sp.fps    = static_cast<uint8_t>(capture->getCurrentFPS());
+        });
+
+        // 注册 拍照 处理器
+        controlSrv->setCommandHandler(CMD_CAPTURE,
+            [capture](const uint8_t* /*req*/, uint16_t /*req_len*/,
+                      uint8_t* resp, uint16_t* resp_len) -> uint8_t {
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                if (g_state.frameData.empty() || !g_storage) {
+                    return STATUS_BUSY;
+                }
+
+                std::string path;
+                if (g_state.format == PixelFormat::FMT_MJPEG) {
+                    path = g_storage->savePhoto(g_state.frameData.data(),
+                                                static_cast<int>(g_state.frameData.size()));
+                }
+#ifdef HAS_LIBJPEG
+                else if (g_state.format == PixelFormat::FMT_YUYV) {
+                    uint8_t* jpeg_out = nullptr;
+                    unsigned long jpeg_len = 0;
+                    if (VideoProcessor::encodeYUYVtoJPEG(
+                            g_state.frameData.data(),
+                            g_state.width, g_state.height,
+                            85, &jpeg_out, &jpeg_len) == 0) {
+                        path = g_storage->savePhoto(jpeg_out,
+                                                    static_cast<int>(jpeg_len));
+                        free(jpeg_out);
+                    }
+                }
+#endif
+                if (path.empty()) {
+                    return STATUS_INTERNAL_ERR;
+                }
+
+                // 响应负载 = 保存路径
+                uint16_t plen = static_cast<uint16_t>(std::min(path.size(),
+                                                       size_t(0xFFFF)));
+                memcpy(resp, path.c_str(), plen);
+                *resp_len = plen;
+                return STATUS_OK;
+            });
+
+        // 注册 录像控制 处理器
+        controlSrv->setCommandHandler(CMD_START_RECORD,
+            [capture](const uint8_t* /*req*/, uint16_t /*req_len*/,
+                      uint8_t* /*resp*/, uint16_t* resp_len) -> uint8_t {
+                if (!g_storage || g_recording.load()) return STATUS_BUSY;
+
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                if (g_state.format != PixelFormat::FMT_MJPEG) {
+                    return STATUS_NOT_SUPPORTED;
+                }
+
+                int w = g_state.width;
+                int h = g_state.height;
+                int fps = static_cast<int>(g_state.fps > 0 ? g_state.fps : 30.0);
+
+                if (g_storage->startRecord(w, h, fps) == 0) {
+                    g_recording = true;
+                    *resp_len = 0;
+                    return STATUS_OK;
+                }
+                return STATUS_INTERNAL_ERR;
+            });
+
+        controlSrv->setCommandHandler(CMD_STOP_RECORD,
+            [](const uint8_t* /*req*/, uint16_t /*req_len*/,
+               uint8_t* /*resp*/, uint16_t* resp_len) -> uint8_t {
+                if (!g_recording.load()) return STATUS_OK;  // 已经没在录，也算成功
+
+                g_recording = false;
+                if (g_storage) g_storage->stopRecord();
+                *resp_len = 0;
+                return STATUS_OK;
+            });
+
+        // 注册 分辨率设置 处理器
+        controlSrv->setCommandHandler(CMD_SET_RESOLUTION,
+            [capture](const uint8_t* req, uint16_t req_len,
+                      uint8_t* /*resp*/, uint16_t* resp_len) -> uint8_t {
+                if (req_len < sizeof(ResolutionPayload)) return STATUS_BAD_PARAM;
+
+                const auto* rp = reinterpret_cast<const ResolutionPayload*>(req);
+                int w = static_cast<int>(ntohs(rp->width));
+                int h = static_cast<int>(ntohs(rp->height));
+
+                if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+                    return STATUS_BAD_PARAM;
+                }
+
+                if (capture->isStreaming()) {
+                    capture->stopCapture();
+                    capture->setFormat(w, h, capture->getCurrentFormat());
+                    capture->startCapture();
+                }
+                *resp_len = 0;
+                return STATUS_OK;
+            });
+
+        // 注册 格式切换 处理器
+        controlSrv->setCommandHandler(CMD_SET_FORMAT,
+            [capture](const uint8_t* req, uint16_t req_len,
+                      uint8_t* /*resp*/, uint16_t* resp_len) -> uint8_t {
+                if (req_len < sizeof(FormatPayload)) return STATUS_BAD_PARAM;
+
+                const auto* fp = reinterpret_cast<const FormatPayload*>(req);
+                uint32_t v4l2fmt = (fp->format == 1)
+                    ? CameraCapture::V4L2_PIX_FMT_MJPEG
+                    : CameraCapture::V4L2_PIX_FMT_YUYV;
+
+                if (capture->isStreaming()) {
+                    Resolution res = capture->getCurrentResolution();
+                    capture->stopCapture();
+                    capture->setFormat(res.width, res.height, v4l2fmt);
+                    capture->startCapture();
+                }
+                *resp_len = 0;
+                return STATUS_OK;
+            });
+
+        // 启动控制线程（ControlServer::start 内部是阻塞事件循环）
+        controlThread = new std::thread([controlSrv, ctrlPort]() {
+            LOG_INF("Control thread starting on port %d", ctrlPort);
+            controlSrv->start(ctrlPort);
+            LOG_INF("Control thread exited");
+        });
+        // 给控制线程一点时间启动
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // ============================================================
         // 启动采集线程（连续拉帧 → 拷贝到共享缓冲区 + 推流）
         // ============================================================
-        captureThread = new std::thread([capture, mjpegServer, mjpegServerOk]() {
+        captureThread = new std::thread([capture, mjpegServer, mjpegServerOk,
+                                             rtspServer]() {
             FrameBuffer fb;
 
             while (g_state.running) {
@@ -223,6 +436,13 @@ int main(int argc, char* argv[]) {
                 if (mjpegServerOk && fb.format == PixelFormat::FMT_MJPEG) {
                     mjpegServer->updateFrame(fb.data,
                         static_cast<size_t>(fb.length));
+                }
+
+                // 如果格式是 MJPEG，推送帧到 RTSP 流服务器
+                if (rtspServer && fb.format == PixelFormat::FMT_MJPEG) {
+                    rtspServer->feedFrame(fb.data,
+                        static_cast<size_t>(fb.length),
+                        fb.width, fb.height);
                 }
 
                 // 如果正在录像且格式为 MJPEG，写入帧到 AVI 文件
@@ -357,8 +577,11 @@ int main(int argc, char* argv[]) {
         qInfo() << "设备:" << device;
         qInfo() << "格式:" << fmtStr;
         qInfo() << "HTTP 端口:" << httpPort;
+        qInfo() << "RTSP 端口:" << rtspPort;
+        qInfo() << "控制端口:" << ctrlPort;
         qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "⏸ 未启动 (MJPEG 模式需要 --fmt mjpeg)");
         qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
+        qInfo() << "VLC 播放:   rtsp://<dev-ip>:" << rtspPort << "/stream";
         qInfo() << "==============================================";
 
     } else {
@@ -379,9 +602,42 @@ int main(int argc, char* argv[]) {
             qDebug() << "[Main] 格式变更:" << static_cast<int>(fmt);
         });
 
+        // 启动 TCP 控制服务器（Mock 模式：仅心跳 + 状态查询可用）
+        controlSrv = new ControlServer();
+        controlSrv->setStatusProvider([](StatusPayload& sp) {
+            sp.streaming    = 0;
+            sp.recording    = 0;
+            sp.client_count = 0;
+            sp.reserved     = 0;
+            sp.width        = 640;
+            sp.height       = 480;
+            sp.format       = 1;  // MJPEG
+            sp.fps          = 30;
+        });
+        controlSrv->setCommandHandler(CMD_CAPTURE,
+            [](const uint8_t*, uint16_t, uint8_t*, uint16_t* rl) -> uint8_t {
+                *rl = 0;
+                return STATUS_NOT_SUPPORTED;
+            });
+        controlSrv->setCommandHandler(CMD_START_RECORD,
+            [](const uint8_t*, uint16_t, uint8_t*, uint16_t* rl) -> uint8_t {
+                *rl = 0;
+                return STATUS_NOT_SUPPORTED;
+            });
+        controlSrv->setCommandHandler(CMD_STOP_RECORD,
+            [](const uint8_t*, uint16_t, uint8_t*, uint16_t* rl) -> uint8_t {
+                *rl = 0;
+                return STATUS_NOT_SUPPORTED;
+            });
+        controlThread = new std::thread([controlSrv, ctrlPort]() {
+            controlSrv->start(ctrlPort);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
         qInfo() << "==============================================";
         qInfo() << "SmartCam Linux — Mock 模式";
         qInfo() << "运行在模拟环境中, 显示彩色测试条";
+        qInfo() << "控制端口:" << ctrlPort << " (Mock 模式下可用)";
         qInfo() << "传参 --device /dev/video0 切换到真实相机模式";
         qInfo() << "==============================================";
     }
@@ -402,6 +658,28 @@ int main(int argc, char* argv[]) {
     if (mjpegServer) {
         mjpegServer->stop();
         delete mjpegServer;
+    }
+
+    if (rtspServer) {
+        rtspServer->stop();
+    }
+    if (rtspThread && rtspThread->joinable()) {
+        rtspThread->join();
+        delete rtspThread;
+    }
+    if (rtspServer) {
+        delete rtspServer;
+    }
+
+    if (controlSrv) {
+        controlSrv->stop();
+    }
+    if (controlThread && controlThread->joinable()) {
+        controlThread->join();
+        delete controlThread;
+    }
+    if (controlSrv) {
+        delete controlSrv;
     }
 
     if (capture) {

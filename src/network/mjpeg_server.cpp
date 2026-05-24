@@ -165,6 +165,10 @@ void MJPEGStreamServer::updateFrame(const uint8_t* data, size_t len) {
     m_frameCV.notify_all();
 }
 
+void MJPEGStreamServer::setStatusProvider(StreamStatusProvider provider) {
+    m_statusProvider = std::move(provider);
+}
+
 // ============================================================
 // 接受线程
 // ============================================================
@@ -213,7 +217,9 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
     }
 
     // ---- 2. 解析请求路径 ----
-    bool wantStream = false;
+    bool wantStream   = false;
+    bool wantSnapshot = false;
+    bool wantStatus   = false;
     const char* line = reqBuf;
 
     // 第一行格式: GET /path HTTP/1.1
@@ -222,16 +228,42 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
         const char* pathEnd   = std::strchr(pathStart, ' ');
         if (pathEnd) {
             size_t pathLen = static_cast<size_t>(pathEnd - pathStart);
+
             if (pathLen == 1 && pathStart[0] == '/') {
                 // GET / → 返回 HTML 页面
-            } else if (pathLen == 7 && std::strncmp(pathStart, "/stream", 7) == 0) {
+            } else if (pathLen == 7 &&
+                       std::strncmp(pathStart, "/stream", 7) == 0) {
                 wantStream = true;
+            } else if (pathLen == 9 &&
+                       std::strncmp(pathStart, "/snapshot", 9) == 0) {
+                wantSnapshot = true;
+            } else if (pathLen == 7 &&
+                       std::strncmp(pathStart, "/status", 7) == 0) {
+                wantStatus = true;
             }
-            // 其他路径返回 404，走 wantStream=false 分支
+            // 其他路径 → sendIndexPage (当作 404 展示)
         }
     }
 
     // ---- 3. 发送响应 ----
+    if (wantSnapshot) {
+        // 返回单帧 JPEG 快照
+        if (!sendSnapshot(client_fd)) {
+            LOG_DBG("Failed to send snapshot");
+        }
+        removeClient(client_fd);
+        return;
+    }
+
+    if (wantStatus) {
+        // 返回 JSON 设备状态
+        if (!sendStatusJSON(client_fd)) {
+            LOG_DBG("Failed to send status JSON");
+        }
+        removeClient(client_fd);
+        return;
+    }
+
     if (wantStream) {
         // 发送 MJPEG 流
         if (!sendHttpHeader(client_fd)) {
@@ -394,6 +426,130 @@ bool MJPEGStreamServer::sendMJPEGFrame(int client_fd,
 }
 
 // ============================================================
+// 发送单帧 JPEG 快照（GET /snapshot）
+// ============================================================
+
+bool MJPEGStreamServer::sendSnapshot(int client_fd) {
+    std::vector<uint8_t> frame;
+
+    {
+        std::lock_guard<std::mutex> lock(m_frameMtx);
+        if (m_currentFrame.empty()) {
+            // 尚无帧数据，返回 503 Service Unavailable
+            const char* noContent =
+                "HTTP/1.0 503 Service Unavailable\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "No frame available yet.\r\n";
+            size_t l = std::strlen(noContent);
+            ssize_t ignored = write(client_fd, noContent, l);
+            (void)ignored;
+            return true;
+        }
+        frame = m_currentFrame;
+    }
+
+    // 构造 HTTP 响应头
+    char header[256];
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %zu\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Server: SmartCam/0.1\r\n"
+        "\r\n",
+        frame.size());
+
+    if (headerLen <= 0) return false;
+
+    // 发送 header
+    ssize_t sent = write(client_fd, header, static_cast<size_t>(headerLen));
+    if (sent != headerLen) return false;
+
+    // 发送 JPEG 数据
+    const uint8_t* ptr = frame.data();
+    size_t remaining = frame.size();
+    while (remaining > 0) {
+        sent = write(client_fd, ptr, remaining);
+        if (sent <= 0) return false;
+        ptr += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
+
+    LOG_DBG("Snapshot sent: %zu bytes", frame.size());
+    return true;
+}
+
+// ============================================================
+// 发送 JSON 设备状态（GET /status）
+// ============================================================
+
+bool MJPEGStreamServer::sendStatusJSON(int client_fd) {
+    // 构建 JSON 状态
+    std::string json;
+
+    if (m_statusProvider) {
+        StreamStatus st = m_statusProvider();
+
+        char buf[512];
+        // 手工拼 JSON（零依赖，适合嵌入式）
+        int len = snprintf(buf, sizeof(buf),
+            "{\r\n"
+            "  \"streaming\": %s,\r\n"
+            "  \"recording\": %s,\r\n"
+            "  \"width\": %d,\r\n"
+            "  \"height\": %d,\r\n"
+            "  \"format\": \"%s\",\r\n"
+            "  \"fps\": %.1f,\r\n"
+            "  \"clients\": %d,\r\n"
+            "  \"uptime_seconds\": %d\r\n"
+            "}\r\n",
+            st.streaming  ? "true" : "false",
+            st.recording  ? "true" : "false",
+            st.width,
+            st.height,
+            st.format.c_str(),
+            st.fps,
+            st.client_count,
+            st.uptime_seconds);
+
+        if (len > 0 && static_cast<size_t>(len) < sizeof(buf)) {
+            json.assign(buf, static_cast<size_t>(len));
+        }
+    }
+
+    if (json.empty()) {
+        json = "{ \"error\": \"status not available\" }\r\n";
+    }
+
+    // 构造 HTTP 响应
+    char header[256];
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Server: SmartCam/0.1\r\n"
+        "\r\n",
+        json.size());
+
+    if (headerLen <= 0) return false;
+
+    // 发送 header
+    ssize_t sent = write(client_fd, header, static_cast<size_t>(headerLen));
+    if (sent != headerLen) return false;
+
+    // 发送 JSON body
+    sent = write(client_fd, json.data(), json.size());
+    return (sent == static_cast<ssize_t>(json.size()));
+}
+
+// ============================================================
 // 发送 HTML 索引页
 // ============================================================
 
@@ -454,6 +610,17 @@ bool MJPEGStreamServer::sendIndexPage(int client_fd) {
         "    margin-right: 6px;\n"
         "    animation: pulse 1.5s ease-in-out infinite;\n"
         "  }\n"
+        "  .api-links {\n"
+        "    margin-top: 16px;\n"
+        "    font-size: 12px;\n"
+        "    color: #555;\n"
+        "  }\n"
+        "  .api-links a {\n"
+        "    color: #0f3460;\n"
+        "    text-decoration: none;\n"
+        "    margin: 0 6px;\n"
+        "  }\n"
+        "  .api-links a:hover { text-decoration: underline; }\n"
         "  @keyframes pulse {\n"
         "    0%, 100% { opacity: 1; }\n"
         "    50% { opacity: 0.4; }\n"
@@ -467,6 +634,10 @@ bool MJPEGStreamServer::sendIndexPage(int client_fd) {
         "</div>\n"
         "<div class='status'>\n"
         "  <span class='dot'></span>LIVE\n"
+        "</div>\n"
+        "<div class='api-links'>\n"
+        "  API: <a href='/snapshot'>snapshot</a>"
+        " | <a href='/status'>status</a>\n"
         "</div>\n"
         "</body>\n"
         "</html>\n";
