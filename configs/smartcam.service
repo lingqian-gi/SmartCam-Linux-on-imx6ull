@@ -2,7 +2,7 @@
 # 安装路径: /etc/systemd/system/smartcam.service
 #
 # 安装命令:
-#   sudo cp smartcam.service /etc/systemd/system/
+#   sudo cp configs/smartcam.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable smartcam
 #   sudo systemctl start smartcam
@@ -10,25 +10,77 @@
 # 状态查看:
 #   systemctl status smartcam
 #   journalctl -u smartcam -f
+#   systemctl stop/restart smartcam
 
 [Unit]
-Description=SmartCam Linux - 基于iMX6ULL的智能相机流媒体系统
+Description=SmartCam Linux - 基于 iMX6ULL 的智能相机流媒体系统
 Documentation=https://github.com/yourname/smartcam-linux
-After=network.target multi-user.target
+After=network.target syslog.target
 Wants=network.target
 
+# 摄像头未插入时不启动，避免无限重启
+ConditionPathExists=/dev/video0
+
 [Service]
-Type=forking
-ExecStart=/usr/local/bin/smartcam --device /dev/video0 --http-port 8080 -platform linuxfb
-ExecStop=/usr/local/bin/smartcam stop
+# Type=simple: 程序在前台运行，不 fork；systemd 直接管理主进程生命周期
+# stop 时 systemd 自动向主进程发 SIGTERM，超时后 SIGKILL
+Type=simple
+User=root
+
+# Qt framebuffer 后端环境变量（写在 service 里就不需要在命令行加 -platform linuxfb）
+Environment=QT_QPA_PLATFORM=linuxfb
+Environment=QT_QPA_FB_HIDECURSOR=1
+Environment=QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
+
+# 启动命令
+ExecStart=/usr/local/bin/smartcam \
+    --device /dev/video0 \
+    --http-port 8080 \
+    --control-port 9000 \
+    --rtsp-port 8554
+
+# 意外退出自动重启
 Restart=on-failure
-RestartSec=5
+RestartSec=3
+
+# 优雅停止: 先 SIGTERM，10 秒后仍未退出则 SIGKILL
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStopSec=10
+
+# 日志统一输出到 journald
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=smartcam
 
-# 安全加固 (可选)
-NoNewPrivileges=yes
+# ---- 安全加固（根据嵌入式环境调整） ----
+# 不限制权限提升（V4L2 ioctl / framebuffer mmap 在某些内核上需要）
+NoNewPrivileges=no
+
+# 独立的 /tmp 和 /var/tmp，防止与其它进程互相干扰
 PrivateTmp=yes
+
+# /usr /boot /etc 只读保护
+ProtectSystem=full
+
+# /root /home 不可访问
+ProtectHome=yes
+
+# 只放行需要写权限的路径
+ReadWritePaths=/data /tmp
+
+# 禁止修改内核参数
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+
+# 禁止修改 cgroup 层级
+ProtectControlGroups=yes
+
+# 限制系统调用（根据功能需要，V4L2/fb 需要 ioctl 和 mmap）
+# SystemCallFilter=@io-event @network-io @file-system @process
+
+# 只允许 TCP/UDP 和本地 Unix socket
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

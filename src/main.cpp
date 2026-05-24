@@ -42,6 +42,7 @@
 #include "include/network/rtsp_server.h"
 #include "include/storage/manager.h"
 #include "include/common/logger.h"
+#include "include/common/config.h"
 
 // ============================================================
 // 全局共享状态（采集线程 → GUI 线程 / 存储线程）
@@ -75,6 +76,14 @@ int main(int argc, char* argv[]) {
     parser.addHelpOption();
     parser.addVersionOption();
 
+    QCommandLineOption configOpt(
+        QStringLiteral("config"),
+        QStringLiteral("配置文件路径 (默认 /etc/smartcam/smartcam.conf)"),
+        QStringLiteral("config"),
+        QStringLiteral("/etc/smartcam/smartcam.conf")
+    );
+    parser.addOption(configOpt);
+
     QCommandLineOption deviceOpt(
         QStringLiteral("device"),
         QStringLiteral("V4L2 设备路径, 例如 /dev/video0"),
@@ -87,7 +96,7 @@ int main(int argc, char* argv[]) {
         QStringLiteral("http-port"),
         QStringLiteral("MJPEG-over-HTTP 端口 (默认 8080)"),
         QStringLiteral("port"),
-        "8080"
+        ""  // 空 → 从配置文件读取
     );
     parser.addOption(portOpt);
 
@@ -95,7 +104,7 @@ int main(int argc, char* argv[]) {
         QStringLiteral("control-port"),
         QStringLiteral("TCP 控制协议端口 (默认 9000)"),
         QStringLiteral("port"),
-        "9000"
+        ""  // 空 → 从配置文件读取
     );
     parser.addOption(ctrlPortOpt);
 
@@ -103,31 +112,79 @@ int main(int argc, char* argv[]) {
         QStringLiteral("rtsp-port"),
         QStringLiteral("RTSP 流媒体端口 (默认 8554)"),
         QStringLiteral("port"),
-        "8554"
+        ""  // 空 → 从配置文件读取
     );
     parser.addOption(rtspPortOpt);
 
     QCommandLineOption fmtOpt(
         QStringLiteral("fmt"),
-        QStringLiteral("像素格式: yuyv | mjpeg (默认 yuyv)"),
+        QStringLiteral("像素格式: yuyv | mjpeg (默认 mjpeg)"),
         QStringLiteral("fmt"),
-        "yuyv"
+        ""  // 空 → 从配置文件读取
     );
     parser.addOption(fmtOpt);
 
     parser.process(app);
 
-    QString device    = parser.value(deviceOpt);
-    int     httpPort  = parser.value(portOpt).toInt();
-    int     ctrlPort  = parser.value(ctrlPortOpt).toInt();
-    int     rtspPort  = parser.value(rtspPortOpt).toInt();
-    QString fmtStr    = parser.value(fmtOpt).toLower();
+    // ---- 加载配置文件 ----
+    ConfigManager cfg;
+    QString configPath = parser.value(configOpt);
+    bool cfgLoaded = cfg.load(configPath.toStdString());
+    if (cfgLoaded) {
+        LOG_INF("Configuration loaded: %s", configPath.toStdString().c_str());
+    } else {
+        LOG_INF("No config file at %s, using defaults", configPath.toStdString().c_str());
+    }
+
+    // ---- 合并配置: 命令行 > 配置文件 > 硬编码默认值 ----
+    QString device = parser.isSet(deviceOpt)
+        ? parser.value(deviceOpt)
+        : (cfgLoaded ? QString::fromStdString(cfg.getString("camera", "device")) : QString());
+
+    int httpPort = parser.isSet(portOpt)
+        ? parser.value(portOpt).toInt()
+        : cfg.getInt("network", "http_port", 8080);
+
+    int ctrlPort = parser.isSet(ctrlPortOpt)
+        ? parser.value(ctrlPortOpt).toInt()
+        : cfg.getInt("network", "control_port", 9000);
+
+    int rtspPort = parser.isSet(rtspPortOpt)
+        ? parser.value(rtspPortOpt).toInt()
+        : cfg.getInt("network", "rtsp_port", 8554);
+
+    QString fmtStr = parser.isSet(fmtOpt)
+        ? parser.value(fmtOpt).toLower()
+        : (cfgLoaded
+            ? QString::fromStdString(cfg.getString("camera", "format", "mjpeg")).toLower()
+            : QStringLiteral("mjpeg"));
+
+    // 存储路径
+    std::string photoDir = cfgLoaded
+        ? cfg.getString("storage", "photo_dir", "/data/photos")
+        : "/tmp/smartcam/photos";
+    std::string videoDir = cfgLoaded
+        ? cfg.getString("storage", "video_dir", "/data/videos")
+        : "/tmp/smartcam/videos";
+
+    // 日志级别
+    if (cfgLoaded) {
+        std::string logLevel = cfg.getString("logging", "level", "info");
+        if (logLevel == "debug")      Logger::instance()->setLevel(LogLevel::DEBUG);
+        else if (logLevel == "warn")  Logger::instance()->setLevel(LogLevel::WARN);
+        else if (logLevel == "error") Logger::instance()->setLevel(LogLevel::ERROR);
+        else                          Logger::instance()->setLevel(LogLevel::INFO);
+
+        if (cfg.getBool("logging", "use_syslog", false)) {
+            Logger::instance()->setSyslogEnabled(true);
+        }
+    }
 
     // ---- 创建 & 显示 GUI ----
     CameraGUI gui;
 
     // ---- 初始化存储管理器 ----
-    StorageManager storage("/tmp/smartcam/photos", "/tmp/smartcam/videos");
+    StorageManager storage(photoDir, videoDir);
     g_storage = &storage;
 
     // ---- 真实相机模式 ----
@@ -208,58 +265,55 @@ int main(int argc, char* argv[]) {
 
         // ============================================================
         // 启动 MJPEG-over-HTTP 流媒体服务器
+        //   - MJPEG 模式：摄像头硬件直出 JPEG，零拷贝推流
+        //   - YUYV 模式：libjpeg-turbo 软件编码后推流
         // ============================================================
         mjpegServer = new MJPEGStreamServer();
         bool mjpegServerOk = false;
-        if (curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG) {
-            if (mjpegServer->start(httpPort) == 0) {
-                mjpegServerOk = true;
-                LOG_INF("MJPEG stream server ready on port %d", httpPort);
+        if (mjpegServer->start(httpPort) == 0) {
+            mjpegServerOk = true;
+            LOG_INF("MJPEG stream server ready on port %d", httpPort);
 
-                // 注册 /status 端点回调
-                auto startTime = std::chrono::steady_clock::now();
-                mjpegServer->setStatusProvider(
-                    [capture, mjpegServer = mjpegServer, startTime]() -> StreamStatus {
-                        StreamStatus st;
-                        st.streaming = capture->isStreaming();
-                        st.recording = g_recording.load();
-                        Resolution res = capture->getCurrentResolution();
-                        st.width  = res.width;
-                        st.height = res.height;
-                        st.format = (capture->getCurrentFormat() ==
-                                     CameraCapture::V4L2_PIX_FMT_MJPEG)
-                                     ? "MJPEG" : "YUYV";
-                        st.fps    = capture->getCurrentFPS();
-                        st.client_count = mjpegServer->clientCount();
-                        st.uptime_seconds = static_cast<int>(
-                            std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now() - startTime
-                            ).count());
-                        return st;
-                    });
-            }
+            // 注册 /status 端点回调
+            auto startTime = std::chrono::steady_clock::now();
+            mjpegServer->setStatusProvider(
+                [capture, mjpegServer = mjpegServer, startTime]() -> StreamStatus {
+                    StreamStatus st;
+                    st.streaming = capture->isStreaming();
+                    st.recording = g_recording.load();
+                    Resolution res = capture->getCurrentResolution();
+                    st.width  = res.width;
+                    st.height = res.height;
+                    st.format = (capture->getCurrentFormat() ==
+                                 CameraCapture::V4L2_PIX_FMT_MJPEG)
+                                 ? "MJPEG" : "YUYV";
+                    st.fps    = capture->getCurrentFPS();
+                    st.client_count = mjpegServer->clientCount();
+                    st.uptime_seconds = static_cast<int>(
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - startTime
+                        ).count());
+                    return st;
+                });
         } else {
-            LOG_WRN("Current format is YUYV — MJPEG stream requires "
-                     "--fmt mjpeg or libjpeg-turbo encoding");
+            LOG_WRN("MJPEG stream server failed to start on port %d", httpPort);
         }
 
         // ============================================================
         // 启动 RTSP 流媒体服务器
+        //   - MJPEG 模式：硬件直出 JPEG → RTP 分片发送
+        //   - YUYV 模式：libjpeg-turbo 编码后 → RTP 分片发送
         // ============================================================
         rtspServer = new RTSPServer();
         rtspServer->setStreamInfo(curRes.width, curRes.height,
                                   30 /* fps */);
-        if (curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG) {
-            rtspThread = new std::thread([rtspServer, rtspPort]() {
-                LOG_INF("RTSP thread starting on port %d", rtspPort);
-                rtspServer->start(rtspPort);
-                LOG_INF("RTSP thread exited");
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            LOG_INF("RTSP stream server ready on rtsp://<board-ip>:%d/stream", rtspPort);
-        } else {
-            LOG_WRN("Current format is YUYV — RTSP requires --fmt mjpeg");
-        }
+        rtspThread = new std::thread([rtspServer, rtspPort]() {
+            LOG_INF("RTSP thread starting on port %d", rtspPort);
+            rtspServer->start(rtspPort);
+            LOG_INF("RTSP thread exited");
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        LOG_INF("RTSP stream server ready on rtsp://<board-ip>:%d/stream", rtspPort);
 
         // ============================================================
         // 启动 TCP 私有控制协议服务器
@@ -432,18 +486,47 @@ int main(int argc, char* argv[]) {
                     g_state.fps    = capture->getCurrentFPS();
                 }
 
-                // 如果格式是 MJPEG，推送帧到 HTTP 流服务器（零拷贝）
-                if (mjpegServerOk && fb.format == PixelFormat::FMT_MJPEG) {
-                    mjpegServer->updateFrame(fb.data,
-                        static_cast<size_t>(fb.length));
+                // === 推送帧到 HTTP / RTSP 流服务器 ===
+                //
+                // MJPEG 模式：摄像头硬件直出 JPEG — 零拷贝，直接推流
+                // YUYV 模式：libjpeg-turbo 软编码为 JPEG 一次，复用给两个流
+                //
+                bool needEncode = (fb.format == PixelFormat::FMT_YUYV) &&
+                                  (mjpegServerOk || rtspServer);
+                uint8_t*      jpeg_out = nullptr;
+                unsigned long jpeg_len = 0;
+
+                if (needEncode) {
+#ifdef HAS_LIBJPEG
+                    VideoProcessor::encodeYUYVtoJPEG(
+                        fb.data, fb.width, fb.height,
+                        80, &jpeg_out, &jpeg_len);
+#endif
                 }
 
-                // 如果格式是 MJPEG，推送帧到 RTSP 流服务器
-                if (rtspServer && fb.format == PixelFormat::FMT_MJPEG) {
-                    rtspServer->feedFrame(fb.data,
-                        static_cast<size_t>(fb.length),
-                        fb.width, fb.height);
+                if (mjpegServerOk) {
+                    if (fb.format == PixelFormat::FMT_MJPEG) {
+                        mjpegServer->updateFrame(fb.data,
+                            static_cast<size_t>(fb.length));
+                    } else if (jpeg_out && jpeg_len > 0) {
+                        mjpegServer->updateFrame(jpeg_out,
+                            static_cast<size_t>(jpeg_len));
+                    }
                 }
+
+                if (rtspServer) {
+                    if (fb.format == PixelFormat::FMT_MJPEG) {
+                        rtspServer->feedFrame(fb.data,
+                            static_cast<size_t>(fb.length),
+                            fb.width, fb.height);
+                    } else if (jpeg_out && jpeg_len > 0) {
+                        rtspServer->feedFrame(jpeg_out,
+                            static_cast<size_t>(jpeg_len),
+                            fb.width, fb.height);
+                    }
+                }
+
+                if (jpeg_out) free(jpeg_out);
 
                 // 如果正在录像且格式为 MJPEG，写入帧到 AVI 文件
                 if (g_recording && fb.format == PixelFormat::FMT_MJPEG && g_storage) {
@@ -574,12 +657,13 @@ int main(int argc, char* argv[]) {
 
         qInfo() << "==============================================";
         qInfo() << "SmartCam Linux — 真实相机模式";
-        qInfo() << "设备:" << device;
-        qInfo() << "格式:" << fmtStr;
-        qInfo() << "HTTP 端口:" << httpPort;
-        qInfo() << "RTSP 端口:" << rtspPort;
+        qInfo() << "配置:"  << (cfgLoaded ? configPath : "none (using defaults)");
+        qInfo() << "设备:"  << device;
+        qInfo() << "格式:"  << fmtStr;
+        qInfo() << "HTTP 端口:" << httpPort << "  |  RTSP 端口:" << rtspPort;
         qInfo() << "控制端口:" << ctrlPort;
-        qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "⏸ 未启动 (MJPEG 模式需要 --fmt mjpeg)");
+        qInfo() << "存储:" << QString::fromStdString(photoDir) << " / " << QString::fromStdString(videoDir);
+        qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "❌ 启动失败");
         qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
         qInfo() << "VLC 播放:   rtsp://<dev-ip>:" << rtspPort << "/stream";
         qInfo() << "==============================================";
@@ -636,7 +720,7 @@ int main(int argc, char* argv[]) {
 
         qInfo() << "==============================================";
         qInfo() << "SmartCam Linux — Mock 模式";
-        qInfo() << "运行在模拟环境中, 显示彩色测试条";
+        qInfo() << "配置:"  << (cfgLoaded ? configPath : "none (using defaults)");
         qInfo() << "控制端口:" << ctrlPort << " (Mock 模式下可用)";
         qInfo() << "传参 --device /dev/video0 切换到真实相机模式";
         qInfo() << "==============================================";

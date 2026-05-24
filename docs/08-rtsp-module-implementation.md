@@ -396,10 +396,24 @@ rtspThread = new std::thread([rtspServer, rtspPort]() {
 
 ```cpp
 // 采集线程 lambda 内，每获取一帧后：
-if (rtspServer && fb.format == PixelFormat::FMT_MJPEG) {
-    rtspServer->feedFrame(fb.data,
-        static_cast<size_t>(fb.length),
-        fb.width, fb.height);
+//   MJPEG 模式：fb.data 已经是 JPEG，直接推流
+//   YUYV 模式：VideoProcessor::encodeYUYVtoJPEG() 编码后推流
+
+if (rtspServer) {
+    if (fb.format == PixelFormat::FMT_MJPEG) {
+        rtspServer->feedFrame(fb.data, fb.length, fb.width, fb.height);
+    }
+#ifdef HAS_LIBJPEG
+    else if (fb.format == PixelFormat::FMT_YUYV) {
+        uint8_t* jpeg_out = nullptr;
+        unsigned long jpeg_len = 0;
+        if (VideoProcessor::encodeYUYVtoJPEG(
+                fb.data, fb.width, fb.height, 80, &jpeg_out, &jpeg_len) == 0) {
+            rtspServer->feedFrame(jpeg_out, jpeg_len, fb.width, fb.height);
+            free(jpeg_out);
+        }
+    }
+#endif
 }
 ```
 
@@ -490,11 +504,14 @@ cmake .. && make -j$(nproc)
 ### 9.3 真实相机 + RTSP
 
 ```bash
-# 启动（MJPEG 模式必须）
+# MJPEG 模式（硬件直出，推荐）
 ./smartcam --device /dev/video0 --fmt mjpeg
 
+# YUYV 模式（libjpeg-turbo 软编码后推流）
+./smartcam --device /dev/video0 --fmt yuyv
+
 # 启动信息：
-# RTSP Server started on rtsp://0.0.0.0:8554/stream
+# RTSP stream server ready on rtsp://<board-ip>:8554/stream
 # → Play: ffplay rtsp://<board-ip>:8554/stream
 
 # 自定义端口
@@ -647,3 +664,4 @@ sendto(rtp_multicast_fd, data, len, 0, &mcast_addr, sizeof(mcast_addr));
 | 日期 | 变更内容 |
 |------|----------|
 | 2026-05-24 | 初始实现：RTSPServer 类、RTSP/RTP/RTCP 协议栈、RFC 2435 JPEG 载荷、epoll ET 事件循环、SDP 动态生成、main.cpp 集成、CMake 构建 |
+| 2026-05-24 | **YUYV→RTSP 流打通**：`--fmt yuyv` 模式下，RTSP 服务器现在也会启动。采集线程中通过 `VideoProcessor::encodeYUYVtoJPEG()` 将 YUYV 帧软编码为 JPEG，编码一次同时喂给 MJPEG HTTP 流和 RTSP 流。RTSP 服务器不再要求摄像头必须是 MJPEG 格式。 |

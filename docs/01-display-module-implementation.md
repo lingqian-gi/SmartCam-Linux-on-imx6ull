@@ -16,6 +16,9 @@
 | 功能 | 状态 |
 |------|------|
 | 实时视频预览 (QTimer 33ms ≈ 30fps) | ✅ |
+| MJPEG 帧解码（libjpeg-turbo，自定义静默错误处理器） | ✅ |
+| YUYV→RGB24 软转换 | ✅ |
+| 深拷贝帧数据（`m_frameBuffer.assign`，防悬垂指针） | ✅ |
 | 拍照按钮 | ✅ |
 | 录像按钮 (toggle) | ✅ |
 | 分辨率选择 (640x480 / 320x240 / 1280x720) | ✅ |
@@ -24,10 +27,9 @@
 | 推流状态指示 | ✅ |
 | 客户端计数 | ✅ |
 | 录像指示 | ✅ |
-| YUYV → RGB24 转换 | ✅ |
 | YUYV → RGB565 转换 (16-bit LCD) | ✅ |
 | Mock 模式 (无硬件可运行) | ✅ |
-| 回调接口 (供主程序注入业务逻辑) | ✅ |
+| 回调接口 (onCaptureRequest/onRecordToggle/onResolutionChanged/onFormatChanged) | ✅ |
 | Qt 信号 (供外部监听) | ✅ |
 
 ---
@@ -245,7 +247,7 @@ offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 
 ## 八、后续 TODO
 
-- [ ] 集成真实 V4L2 采集 (CameraCapture) → `setFrame()`
+- [x] 集成真实 V4L2 采集 (CameraCapture) → `setFrame()`（已完成，见 MOD-02）
 - [ ] 触摸滑动切换模式（需要手势识别逻辑）
 - [ ] 设置面板弹窗（亮度/对比度/白平衡调节）
 - [ ] YUV→RGB NEON 汇编优化（提升 30-50%）
@@ -259,3 +261,5 @@ offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 | 日期 | 变更内容 |
 |------|----------|
 | 2026-05-20 | 初始实现：CameraGUI 类、Mock 模式、YUYV→RGB 转换、CMake 构建、编译通过 |
+| 2026-05-23 | **MJPEG 解码支持**：`frameToQImage()` 新增 `FMT_MJPEG` 分支，使用 libjpeg-turbo 自定义错误处理器静默坏帧警告。`setFrame()` 改为深拷贝（`m_frameBuffer.assign`），修复采集线程与 GUI 线程间的悬垂指针数据竞争。新增 `onCaptureRequest`/`onRecordToggle` 等回调注入接口。 |
+| 2026-05-24 | **systemd 服务完善**：`smartcam.service` 改为 `Type=simple`，新增 `ConditionPathExists=/dev/video0`、`Environment` 环境变量、`ProtectSystem=full` 加固等。`ExecStop` 不再使用不存在的 `smartcam stop` 子命令。 |

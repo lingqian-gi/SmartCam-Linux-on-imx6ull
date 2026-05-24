@@ -641,6 +641,8 @@ target_link_libraries(smartcam PRIVATE
 # endif()
 ```
 
+> **2026-05-24 更新**：libjpeg 已从可选改为 **`find_package(JPEG REQUIRED)`**，`HAS_LIBJPEG` 编译宏默认开启。原因是 YUYV→MJPEG 流打通需要 JPEG 编码功能。项目目前共链接：`Qt5::Widgets` + `pthread` + `${JPEG_LIBRARIES}`，源文件 11 个（capture / processor / gui / mjpeg_server / control / rtsp_server / manager / main + MOC）。
+
 ### 8.2 修改对比
 
 | 修改项 | 修改前 | 修改后 |
@@ -789,12 +791,13 @@ Help 参数: ✅ 显示完整命令行说明
 
 ## 十二、后续 TODO
 
-- [ ] 集成 MJPEG-over-HTTP 流媒体服务器 → 采集线程通过 FrameQueue 分发帧
-- [ ] 集成 StorageManager → onCaptureRequest/onRecordToggle 实际生效
+- [x] 集成 MJPEG-over-HTTP 流媒体服务器 → 采集线程通过 updateFrame() 分发帧（✅ MOD-03）
+- [x] 集成 RTSPServer → 采集线程通过 feedFrame() 分发帧（✅ MOD-08）
+- [x] 集成 StorageManager → onCaptureRequest/onRecordToggle 实际生效（✅ MOD-04）
 - [ ] YUYV→RGB NEON 汇编优化（预期提升 30-50%）
 - [ ] VideoProcessor 增加图像缩放功能（用于分辨率降采样）
 - [ ] 添加 V4L2 设备热插拔检测（udev 监控）
-- [ ] 添加 `CameraStatus` 结构体通过控制协议返回
+- [x] 添加 `CameraStatus` 结构体通过控制协议返回（✅ MOD-05，CMD_GET_STATUS）
 - [ ] 单元测试：`tests/test_capture.cpp`（Mock V4L2 设备）
 - [ ] 文档：`docs/api.md` Doxygen 生成类接口文档
 

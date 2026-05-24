@@ -525,27 +525,45 @@ server.stop()
 MJPEGStreamServer* mjpegServer = nullptr;
 ```
 
-### 7.3 服务器启动（仅在 MJPEG 格式时）
+### 7.3 服务器启动（始终启动）
 
 ```cpp
 // capture->startCapture() 之后:
 mjpegServer = new MJPEGStreamServer();
-if (curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG) {
-    if (mjpegServer->start(httpPort) == 0) {
-        LOG_INF("MJPEG stream server ready on port %d", httpPort);
-    }
-} else {
-    LOG_WRN("YUYV format — MJPEG stream requires --fmt mjpeg");
+if (mjpegServer->start(httpPort) == 0) {
+    LOG_INF("MJPEG stream server ready on port %d", httpPort);
+    // MJPEG 模式：硬件直出，零拷贝
+    // YUYV 模式：libjpeg-turbo 软编码后推流
 }
 ```
 
 ### 7.4 采集线程内推帧
 
 ```cpp
-// 采集线程 lambda，在拷贝到 g_state 之后:
-if (mjpegServerOk && fb.format == PixelFormat::FMT_MJPEG) {
-    mjpegServer->updateFrame(fb.data, static_cast<size_t>(fb.length));
+// 采集线程 lambda，每获取一帧后：
+//   MJPEG 模式：fb.data 已经是 JPEG，直接推流（零拷贝）
+//   YUYV 模式：VideoProcessor::encodeYUYVtoJPEG() 编码一次，
+//             编码后的 JPEG 同时喂给 MJPEG HTTP 流和 RTSP 流
+
+bool needEncode = (fb.format == PixelFormat::FMT_YUYV) &&
+                  mjpegServerOk;
+uint8_t*      jpeg_out = nullptr;
+unsigned long jpeg_len = 0;
+
+if (needEncode) {
+    VideoProcessor::encodeYUYVtoJPEG(
+        fb.data, fb.width, fb.height, 80, &jpeg_out, &jpeg_len);
 }
+
+if (mjpegServerOk) {
+    if (fb.format == PixelFormat::FMT_MJPEG) {
+        mjpegServer->updateFrame(fb.data, fb.length);
+    } else if (jpeg_out) {
+        mjpegServer->updateFrame(jpeg_out, jpeg_len);
+    }
+}
+
+if (jpeg_out) free(jpeg_out);
 ```
 
 ### 7.5 GUI 显示客户端数量
@@ -649,14 +667,14 @@ scp build/arm/smartcam root@192.168.1.100:/usr/local/bin/
 ### 9.3 硬件运行（开发板）
 
 ```bash
-# MJPEG 模式（推荐：本地预览 + HTTP 流）
+# MJPEG 模式（推荐：硬件直出，零 CPU 开销）
 ./smartcam --device /dev/video0 --fmt mjpeg -platform linuxfb
+
+# YUYV 模式（libjpeg-turbo 软编码后推流）
+./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
 
 # 指定 HTTP 端口（默认 8080）
 ./smartcam --device /dev/video0 --fmt mjpeg --http-port 9090 -platform linuxfb
-
-# YUYV 模式（仅本地预览，HTTP 流不可用）
-./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
 ```
 
 ### 9.4 浏览器观看
@@ -789,9 +807,10 @@ HTTP 流测试: ✅ curl http://localhost:8080/ → HTML 页面返回
 
 - [x] 添加 `GET /snapshot` 端点：返回当前最新 JPEG 帧（✅ 2026-05-24 完成）
 - [x] 添加 `GET /status` 端点：返回 JSON 格式的相机状态（✅ 2026-05-24 完成）
+- [x] 支持 YUYV 格式推流（✅ 2026-05-24 完成，libjpeg-turbo 软编码后推流）
+- [x] 集成 RTSP 服务器：标准流媒体协议支持（✅ 已自实现，见 MOD-08）
 - [ ] 支持 JPEG 质量参数 URL 参数：`/stream?quality=80`
 - [ ] 客户端超时机制：长时间不发请求的客户端自动断开
-- [ ] 集成 RTSP 服务器（Live555）：标准流媒体协议支持（✅ 已自实现，见 MOD-08）
 - [ ] 添加文件描述符限制处理（ulimit -n 设置）
 - [ ] 单元测试：`tests/test_mjpeg_server.cpp`（Mock TCP 客户端）
 - [ ] 文档：`docs/api.md` Doxygen 生成类接口文档
@@ -804,3 +823,4 @@ HTTP 流测试: ✅ curl http://localhost:8080/ → HTML 页面返回
 |------|----------|
 | 2026-05-23 | 初始实现：MJPEGStreamServer 类、HTTP multipart 流、条件变量广播、HTML 页面、main.cpp 集成、CMake 构建 |
 | 2026-05-24 | 新增 `GET /snapshot`（单帧 JPEG）+ `GET /status`（JSON 状态）+ StreamStatusProvider 回调模式 + HTML 页面加入 API 链接 |
+| 2026-05-24 | **YUYV→MJPEG 流打通**：`--fmt yuyv` 模式下，MJPEG 服务器现在也会启动。采集线程中通过 `VideoProcessor::encodeYUYVtoJPEG()` 将 YUYV 帧软编码为 JPEG，编码一次同时喂给 MJPEG HTTP 流和 RTSP 流。MJPEG 服务器不再要求摄像头必须是 MJPEG 格式。 |
