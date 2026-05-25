@@ -4,6 +4,54 @@
 
 ---
 
+## 9. 开发板按钮无法点击（linuxfb 无触摸输入）
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | Qt linuxfb 平台插件 / 输入事件 |
+| **现象** | PC 端 (xcb) 按钮正常点击并响应，但 imx6ull 开发板上按钮无任何反馈 |
+| **严重程度** | ❌ 严重 — GUI 完全不可操作 |
+
+### 原因
+
+`-platform linuxfb` 只负责将像素写入 `/dev/fb0` 帧缓冲区，**不处理任何输入事件**。触摸事件需要额外的 Qt 输入插件（`evdevtouch` / `tslib` / `libinput`）来从 `/dev/input/event*` 读取并转换为 Qt 事件。
+
+PC 端默认使用 `xcb` 平台插件，由 X11 统一处理输入，开发者容易忽略此差异。
+
+### 解决
+
+运行前必须设置环境变量：
+
+```bash
+export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
+export QT_QPA_FB_HIDECURSOR=1
+# ⚠️ 关键：指定触摸输入设备
+export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
+# 如不生效，显式加载插件:
+export QT_QPA_GENERIC_PLUGINS=evdevtouch
+
+./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+```
+
+### 排查方法
+
+```bash
+# 1. 确认触摸设备节点（触摸屏幕看是否有 hex 输出）
+ls /dev/input/event*
+cat /dev/input/event1 | hexdump
+
+# 2. 确认 evdevtouch 插件存在
+find / -name "*evdevtouch*" 2>/dev/null
+
+# 3. 开启 Qt 输入调试日志
+export QT_LOGGING_RULES="qt.qpa.input=true"
+./smartcam ... 2>&1 | grep -iE "touch|event|input"
+```
+
+**涉及文件：** `README.md`、`scripts/setup-vm.sh`、`docs/01-display-module-implementation.md`、`CMakeLists.txt`
+
+---
+
 ## 8. 相册模块实现
 
 | 属性 | 值 |

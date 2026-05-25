@@ -171,18 +171,25 @@ scp build/arm/smartcam root@<开发板IP>:/usr/local/bin/
 
 ### 5.3 真实硬件运行（iMX6ULL 开发板）
 
-开发板无 X server，必须使用 Qt 的 `linuxfb` 后端直写 Framebuffer：
+开发板无 X server，必须使用 Qt 的 `linuxfb` 后端直写 Framebuffer。
+
+> **⚠️ 关键**：`linuxfb` 只负责显示，**必须设置 `QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS` 环境变量** 指定触摸输入设备，否则按钮无法响应点击。
 
 ```bash
-# 开发板上执行（推荐方式一：命令行参数）
-./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
+# 开发板上执行（必须先设置环境变量）
+export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
+export QT_QPA_FB_HIDECURSOR=1
+export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
 
-# 方式二：设置环境变量
-export QT_QPA_PLATFORM=linuxfb
-./smartcam --device /dev/video0 --fmt yuyv
+# 如不生效，显式加载 evdevtouch 插件:
+# export QT_QPA_GENERIC_PLUGINS=evdevtouch
 
-# 方式三：指定帧缓冲设备（如有多个显示设备）
-./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb:fb=/dev/fb0
+# 启动应用
+./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+
+# 排查触摸设备:
+# ls /dev/input/event*
+# cat /dev/input/event1 | hexdump    # 触摸屏幕看是否有输出
 ```
 
 > **说明**：`-platform linuxfb` 是 Qt5 的平台插件参数，指定使用 Linux Framebuffer 后端代替默认的 xcb（X Window System）。iMX6ULL 无 X server，不带此参数会报 `Could not connect to any X display`。

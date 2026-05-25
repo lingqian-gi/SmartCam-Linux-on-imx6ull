@@ -85,18 +85,39 @@ ssh root@<开发板IP> "cd / && tar xzf /tmp/smartcam-arm.tar.gz"
 
 ### 开发板运行
 
+> **重要**：imx6ULL 无 X server，必须使用 `linuxfb` 后端。linuxfb 只负责显示，**触摸/鼠标输入需额外配置 `QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS`，否则按钮无法点击。**
+
 ```bash
+# ---- 必须先设置输入设备环境变量 ----
+export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
+export QT_QPA_FB_HIDECURSOR=1
+
+# ⚠️ 关键：指定触摸输入设备路径（根据实际设备调整 /dev/input/event1）
+export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
+# 如果上面不生效，尝试同时加载 evdevtouch 插件：
+# export QT_QPA_GENERIC_PLUGINS=evdevtouch
+
+# ---- 启动应用 ----
 # MJPEG 模式（摄像头硬件输出 JPEG，零 CPU 编码开销，推荐）
-./smartcam --device /dev/video0 --fmt mjpeg -platform linuxfb
+./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
 
 # YUYV 模式（libjpeg-turbo 软件编码后推流）
-./smartcam --device /dev/video0 --fmt yuyv -platform linuxfb
+./smartcam --device /dev/video0 --fmt yuyv --http-port 8080
 
 # 自定义端口
 ./smartcam --device /dev/video0 --http-port 9090 --rtsp-port 9554
 
 # 使用自定义配置文件
 ./smartcam --config /home/root/myconfig.conf --device /dev/video0
+
+# ---- 排查触摸输入 ----
+# 查看可用的输入设备：
+ls -la /dev/input/event*
+# 测试触摸是否工作（触摸屏幕看是否有输出）：
+cat /dev/input/event1 | hexdump
+# 检查 Qt 是否加载了 evdevtouch 插件：
+export QT_LOGGING_RULES="qt.qpa.input=true"
+./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080 2>&1 | grep -i touch
 ```
 
 若使用 systemd 管理（推荐用于实际部署）：
