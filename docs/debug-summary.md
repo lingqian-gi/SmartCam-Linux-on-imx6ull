@@ -4,51 +4,65 @@
 
 ---
 
-## 9. 开发板按钮无法点击（linuxfb 无触摸输入）
+## 9. 触摸屏无响应（开发板）✅ 已解决
 
 | 属性 | 值 |
 |------|-----|
-| **模块** | Qt linuxfb 平台插件 / 输入事件 |
-| **现象** | PC 端 (xcb) 按钮正常点击并响应，但 imx6ull 开发板上按钮无任何反馈 |
+| **模块** | Qt linuxfb 内置 evdev 输入 / 设备权限 |
+| **现象** | 开发板上 GUI 正常显示，但触摸按钮无任何反馈 |
 | **严重程度** | ❌ 严重 — GUI 完全不可操作 |
 
 ### 原因
 
-`-platform linuxfb` 只负责将像素写入 `/dev/fb0` 帧缓冲区，**不处理任何输入事件**。触摸事件需要额外的 Qt 输入插件（`evdevtouch` / `tslib` / `libinput`）来从 `/dev/input/event*` 读取并转换为 Qt 事件。
+**设备权限不足**，与 Qt 插件无关。`/dev/input/event2` 默认属主 `root:input`，权限 `660`，当前用户 `debian` 不在 `input` 组中，无法读取触摸事件。
 
-PC 端默认使用 `xcb` 平台插件，由 X11 统一处理输入，开发者容易忽略此差异。
+> linuxfb 后端**内置了 evdev 输入支持**，会自动检测 `/dev/input/` 下的触摸设备，**不需要**任何环境变量或额外插件。
 
-### 解决
-
-运行前必须设置环境变量：
+### 解决（永久）
 
 ```bash
-export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
-export QT_QPA_FB_HIDECURSOR=1
-# ⚠️ 关键：指定触摸输入设备
-export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
-# 如不生效，显式加载插件:
-export QT_QPA_GENERIC_PLUGINS=evdevtouch
+sudo usermod -a -G input debian
+# 重新登录或重启生效
+```
 
-./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+### 解决（临时，重启失效）
+
+```bash
+sudo chmod 666 /dev/input/event2
+```
+
+### 正确的启动命令
+
+```bash
+# 不需要任何环境变量！
+./smartcam --device /dev/video0 --fmt mjpeg -platform linuxfb
 ```
 
 ### 排查方法
 
 ```bash
-# 1. 确认触摸设备节点（触摸屏幕看是否有 hex 输出）
-ls /dev/input/event*
-cat /dev/input/event1 | hexdump
+# 1. 确认触摸设备节点
+ls -la /dev/input/event*
+# 触摸屏幕看是否有输出 → 有输出说明内核驱动正常，只是用户无权限
+cat /dev/input/event2 | hexdump
 
-# 2. 确认 evdevtouch 插件存在
-find / -name "*evdevtouch*" 2>/dev/null
+# 2. 确认当前用户在 input 组
+groups | grep input
 
-# 3. 开启 Qt 输入调试日志
+# 3. 确认 linuxfb 已识别触摸设备（看日志有无 "evdev" 字样）
 export QT_LOGGING_RULES="qt.qpa.input=true"
-./smartcam ... 2>&1 | grep -iE "touch|event|input"
+./smartcam -platform linuxfb 2>&1 | head -20
 ```
 
-**涉及文件：** `README.md`、`scripts/setup-vm.sh`、`docs/01-display-module-implementation.md`、`CMakeLists.txt`
+### 常见误区 ❌
+
+以下做法**不仅无效，还会导致 segfault**：
+
+- `export QT_QPA_GENERIC_PLUGINS=evdevtouch` — linuxfb 内置了 evdev 支持，手动加载会**冲突**导致崩溃
+- `export QT_PLUGIN_PATH=...` — 覆盖默认插件搜索路径，导致其他必需插件丢失
+- `export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=...` — 无头附加无插件的参数，无作用
+
+**涉及文件：** `docs/debug-summary.md`
 
 ---
 
