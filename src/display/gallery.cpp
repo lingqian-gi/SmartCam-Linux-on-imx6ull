@@ -13,6 +13,7 @@
 #include <QMouseEvent>
 #include <QDebug>
 #include <QFont>
+#include <algorithm>
 #include <QSizePolicy>
 #include <algorithm>
 #include <cmath>
@@ -53,13 +54,43 @@ PhotoGallery::~PhotoGallery() = default;
 void PhotoGallery::refresh() {
     m_groups.clear();
     m_flatPhotos.clear();
+
+    // 列出照片
     m_storage->listPhotos(m_groups, /*includeInfo=*/true);
 
-    // 构建扁平列表（保持分组顺序）
     for (const auto& g : m_groups) {
         for (const auto& p : g.photos) {
             m_flatPhotos.push_back(p);
         }
+    }
+
+    // 列出视频（合并到同一列表）
+    std::vector<StorageManager::PhotoDayGroup> videoGroups;
+    m_storage->listVideos(videoGroups);
+    for (const auto& g : videoGroups) {
+        for (const auto& p : g.photos) {
+            m_flatPhotos.push_back(p);
+        }
+    }
+
+    // 按时间戳倒序重新排序（照片+视频混合）
+    std::sort(m_flatPhotos.begin(), m_flatPhotos.end(),
+              [](const StorageManager::PhotoInfo& a,
+                 const StorageManager::PhotoInfo& b) {
+                  return a.timestamp > b.timestamp;
+              });
+
+    // 按日期重建分组
+    m_groups.clear();
+    std::string lastDate;
+    for (const auto& p : m_flatPhotos) {
+        if (p.dateStr != lastDate) {
+            StorageManager::PhotoDayGroup newGroup;
+            newGroup.dateStr = p.dateStr;
+            m_groups.push_back(newGroup);
+            lastDate = p.dateStr;
+        }
+        m_groups.back().photos.push_back(p);
     }
 
     loadVisibleThumbnails();
@@ -220,8 +251,15 @@ void PhotoGallery::loadVisibleThumbnails() {
 
     m_galleryEmpty->hide();
     m_scrollArea->show();
-    m_galleryTitle->setText(
-        QString("Gallery (%1 photos)").arg(m_flatPhotos.size()));
+
+    int photoCount = 0, videoCount = 0;
+    for (const auto& p : m_flatPhotos) {
+        if (p.isVideo) videoCount++; else photoCount++;
+    }
+    QString title = QString("Gallery (%1 photos").arg(photoCount);
+    if (videoCount > 0) title += QString(", %1 videos").arg(videoCount);
+    title += ")";
+    m_galleryTitle->setText(title);
 
     // 按分组渲染
     int row = 0;
@@ -257,16 +295,22 @@ void PhotoGallery::loadVisibleThumbnails() {
             "  border-color: #1a6fb5;"
             "}");
 
-        // 异步加载缩略图（使用 QPixmap）
-        QPixmap thumb;
-        std::string path = info.path;
-        if (createThumbnail(path, THUMB_W, THUMB_H, thumb)) {
-            btn->setIcon(QIcon(thumb));
-            btn->setIconSize(QSize(THUMB_W, THUMB_H));
-        } else {
-            btn->setText("?");
+        if (info.isVideo) {
+            // 视频：显示 ▶ 播放图标
+            btn->setText("\u25B6");      // ▶
             btn->setStyleSheet(btn->styleSheet() +
-                " color: #5a6c7d; font-size: 24px;");
+                " color: #2ecc71; font-size: 42px;");
+        } else {
+            // 照片：加载 JPEG 缩略图
+            QPixmap thumb;
+            if (createThumbnail(info.path, THUMB_W, THUMB_H, thumb)) {
+                btn->setIcon(QIcon(thumb));
+                btn->setIconSize(QSize(THUMB_W, THUMB_H));
+            } else {
+                btn->setText("?");
+                btn->setStyleSheet(btn->styleSheet() +
+                    " color: #5a6c7d; font-size: 24px;");
+            }
         }
 
         // 点击 → 全屏（用 lambda 捕获索引）
@@ -277,13 +321,19 @@ void PhotoGallery::loadVisibleThumbnails() {
             m_stack->setCurrentIndex(1);
         });
 
-        // 日期标签在按钮下
-        auto* infoLabel = new QLabel(
-            QString("%1  %2").arg(
+        // 信息标签在按钮下
+        QString detail;
+        if (info.isVideo) {
+            detail = QString("%1  [VID]").arg(
+                QString::fromStdString(info.timeStr));
+        } else {
+            detail = QString("%1  %2").arg(
                 QString::fromStdString(info.timeStr),
                 info.width > 0 && info.height > 0
                     ? QString("%1x%2").arg(info.width).arg(info.height)
-                    : ""), this);
+                    : "");
+        }
+        auto* infoLabel = new QLabel(detail, this);
         infoLabel->setAlignment(Qt::AlignCenter);
         infoLabel->setStyleSheet(
             "font-size: 11px; color: #7f8c8d; padding: 2px;");
@@ -412,22 +462,33 @@ void PhotoGallery::updateFullscreenDisplay() {
         sizeStr = QString::number(info.fileSize / 1024.0, 'f', 0) + " KB";
     }
     m_fullInfoLabel->setText(
-        QString("%1  |  %2x%3  |  %4  |  %5/%6")
+        QString("%1%2  |  %3  |  %4/%5")
+            .arg(info.isVideo ? "[VID] " : "")
             .arg(QString::fromStdString(info.filename))
-            .arg(info.width).arg(info.height)
             .arg(sizeStr)
             .arg(m_currentIndex + 1)
             .arg(m_flatPhotos.size()));
 
-    // 照片显示
-    QImage img(QString::fromStdString(info.path));
-    if (!img.isNull()) {
-        // 等比缩放到可用空间（最大 660×360）
-        QPixmap pix = QPixmap::fromImage(img.scaled(
-            660, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        m_fullPhotoDisplay->setPixmap(pix);
+    if (info.isVideo) {
+        // 视频：显示播放图标 + 文件名
+        m_fullPhotoDisplay->setText(
+            QString("\u25B6  %1\n\n(%2)")
+                .arg(QString::fromStdString(info.filename))
+                .arg(sizeStr));
+        m_fullPhotoDisplay->setStyleSheet(
+            "font-size: 18px; color: #2ecc71;"
+            "background-color: #0a0a1a; border: none;"
+            "padding: 40px;");
     } else {
-        m_fullPhotoDisplay->setText("Failed to load image");
+        // 照片显示
+        QImage img(QString::fromStdString(info.path));
+        if (!img.isNull()) {
+            QPixmap pix = QPixmap::fromImage(img.scaled(
+                660, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            m_fullPhotoDisplay->setPixmap(pix);
+        } else {
+            m_fullPhotoDisplay->setText("Failed to load image");
+        }
     }
 
     // 按钮状态
@@ -457,16 +518,21 @@ void PhotoGallery::onDeletePhoto() {
 
     const auto& info = m_flatPhotos[static_cast<size_t>(m_currentIndex)];
 
+    QString typeStr = info.isVideo ? "video" : "photo";
     auto reply = QMessageBox::question(
-        this, "Delete Photo",
-        QString("Delete this photo?\n\n%1")
-            .arg(QString::fromStdString(info.filename)),
+        this, QString("Delete %1").arg(typeStr),
+        QString("Delete this %1?\n\n%2")
+            .arg(typeStr, QString::fromStdString(info.filename)),
         QMessageBox::Cancel | QMessageBox::Yes,
         QMessageBox::Cancel);
 
     if (reply != QMessageBox::Yes) return;
 
-    if (m_storage->deletePhoto(info.path) == 0) {
+    int result = info.isVideo
+        ? m_storage->deleteVideo(info.path)
+        : m_storage->deletePhoto(info.path);
+
+    if (result == 0) {
         // 重新加载列表
         refresh();
 

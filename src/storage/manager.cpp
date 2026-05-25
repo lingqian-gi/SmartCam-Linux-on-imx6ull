@@ -776,3 +776,154 @@ int StorageManager::deletePhoto(const std::string& path) {
 
     return 0;
 }
+
+// ============================================================
+// 视频列表 (v0.3)
+// ============================================================
+
+int StorageManager::listVideos(std::vector<PhotoDayGroup>& out) {
+    out.clear();
+    int totalCount = 0;
+
+    DIR* dp = opendir(m_videoDir.c_str());
+    if (!dp) {
+        if (errno != ENOENT) {
+            LOG_WRN("listVideos: opendir(%s) failed: %s",
+                    m_videoDir.c_str(), strerror(errno));
+        }
+        return 0;
+    }
+
+    struct RawEntry {
+        std::string path;
+        time_t      mtime;
+    };
+    std::vector<RawEntry> rawEntries;
+
+    struct dirent* entry;
+    while ((entry = readdir(dp)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        if (entry->d_type == DT_REG) {
+            if (strstr(entry->d_name, ".avi") || strstr(entry->d_name, ".AVI")) {
+                std::string fp = m_videoDir + "/" + entry->d_name;
+                struct stat st;
+                if (stat(fp.c_str(), &st) == 0) {
+                    rawEntries.push_back({fp, st.st_mtime});
+                }
+            }
+        } else if (entry->d_type == DT_DIR) {
+            std::string dateDir = m_videoDir + "/" + entry->d_name;
+            DIR* dp2 = opendir(dateDir.c_str());
+            if (!dp2) continue;
+
+            struct dirent* file;
+            while ((file = readdir(dp2)) != nullptr) {
+                if (file->d_type != DT_REG) continue;
+                if (!strstr(file->d_name, ".avi") && !strstr(file->d_name, ".AVI"))
+                    continue;
+
+                std::string fp = dateDir + "/" + file->d_name;
+                struct stat st;
+                if (stat(fp.c_str(), &st) == 0) {
+                    rawEntries.push_back({fp, st.st_mtime});
+                }
+            }
+            closedir(dp2);
+        }
+    }
+    closedir(dp);
+
+    if (rawEntries.empty()) return 0;
+
+    std::sort(rawEntries.begin(), rawEntries.end(),
+              [](const RawEntry& a, const RawEntry& b) {
+                  return a.mtime > b.mtime;
+              });
+
+    std::map<std::string, PhotoDayGroup> groupMap;
+
+    for (const auto& re : rawEntries) {
+        PhotoInfo info;
+        info.path = re.path;
+        info.timestamp = re.mtime;
+        info.isVideo = true;
+
+        size_t slash2 = re.path.rfind('/');
+        info.filename = (slash2 != std::string::npos)
+            ? re.path.substr(slash2 + 1) : re.path;
+
+        struct tm* tm_info = localtime(&re.mtime);
+        char dateBuf[16], timeBuf[16];
+        strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", tm_info);
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M",   tm_info);
+        info.dateStr = dateBuf;
+        info.timeStr = timeBuf;
+
+        struct stat st;
+        if (stat(re.path.c_str(), &st) == 0) {
+            info.fileSize = static_cast<size_t>(st.st_size);
+        }
+        info.width  = 0;
+        info.height = 0;
+
+        auto& group = groupMap[info.dateStr];
+        if (group.dateStr.empty()) group.dateStr = info.dateStr;
+        group.photos.push_back(std::move(info));
+        totalCount++;
+    }
+
+    for (auto it = groupMap.rbegin(); it != groupMap.rend(); ++it) {
+        out.push_back(std::move(it->second));
+    }
+
+    return totalCount;
+}
+
+int StorageManager::getVideoCount() {
+    int count = 0;
+    DIR* dp = opendir(m_videoDir.c_str());
+    if (!dp) return 0;
+
+    struct dirent* entry;
+    while ((entry = readdir(dp)) != nullptr) {
+        if (entry->d_type == DT_REG &&
+            (strstr(entry->d_name, ".avi") || strstr(entry->d_name, ".AVI"))) {
+            count++;
+        } else if (entry->d_type == DT_DIR && entry->d_name[0] != '.') {
+            std::string dateDir = m_videoDir + "/" + entry->d_name;
+            DIR* dp2 = opendir(dateDir.c_str());
+            if (!dp2) continue;
+            struct dirent* file;
+            while ((file = readdir(dp2)) != nullptr) {
+                if (file->d_type == DT_REG &&
+                    (strstr(file->d_name, ".avi") || strstr(file->d_name, ".AVI"))) {
+                    count++;
+                }
+            }
+            closedir(dp2);
+        }
+    }
+    closedir(dp);
+    return count;
+}
+
+int StorageManager::deleteVideo(const std::string& path) {
+    if (unlink(path.c_str()) != 0) {
+        LOG_ERR_("deleteVideo: unlink(%s) failed: %s",
+                 path.c_str(), strerror(errno));
+        return -1;
+    }
+
+    LOG_INF("Video deleted: %s", path.c_str());
+
+    size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        std::string dir = path.substr(0, slash);
+        if (dir.find(m_videoDir) == 0 && dir != m_videoDir) {
+            rmdir(dir.c_str());
+        }
+    }
+
+    return 0;
+}

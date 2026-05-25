@@ -226,7 +226,7 @@ public:
     // ============================================================
 
     /**
-     * @brief 照片元信息
+     * @brief 媒体文件元信息（照片 / 视频共用）
      */
     struct PhotoInfo {
         std::string path;         // 完整路径
@@ -234,9 +234,10 @@ public:
         std::string dateStr;      // "2026-05-24"
         std::string timeStr;      // "14:30"
         time_t      timestamp;    // Unix 时间戳（用于排序）
-        int         width;        // 图片宽度
-        int         height;       // 图片高度
+        int         width;        // 宽（照片）或 0（视频）
+        int         height;       // 高（照片）或 0（视频）
         size_t      fileSize;     // 文件大小（字节）
+        bool        isVideo = false;  // true = AVI 视频，false = JPEG 照片
     };
 
     /** @brief 按日期分组 */
@@ -253,14 +254,35 @@ public:
      */
     int listPhotos(std::vector<PhotoDayGroup>& out, bool includeInfo = false);
 
+    /**
+     * @brief 获取所有视频列表（按时间倒序，按日期分组）
+     *
+     * 扫描 m_videoDir 目录，收集所有 .avi 文件。
+     * 分组逻辑和 listPhotos 相同，但 PhotoInfo::isVideo = true，
+     * width/height 固定为 0（视频不解析 AVI 头）。
+     *
+     * @param out  输出分组列表
+     * @return 视频总数
+     */
+    int listVideos(std::vector<PhotoDayGroup>& out);
+
     /** @brief 获取照片总数（快速，只读目录不读文件） */
     int getPhotoCount();
+
+    /** @brief 获取视频总数（快速，只读目录不读文件） */
+    int getVideoCount();
 
     /**
      * @brief 删除一张照片
      * @return 0 成功，-1 失败
      */
     int deletePhoto(const std::string& path);
+
+    /**
+     * @brief 删除一个视频文件
+     * @return 0 成功，-1 失败
+     */
+    int deleteVideo(const std::string& path);
 
     /**
      * @brief 从 JPEG 文件头快速读取宽高（只读前 4KB，不解码像素）
