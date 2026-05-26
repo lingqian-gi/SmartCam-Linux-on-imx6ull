@@ -12,10 +12,11 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build"
 
-# --- ARM 交叉编译工具链 ---
-ARM_TOOLCHAIN="/opt/arm-linux-gnueabihf"   # 根据你的环境修改
-ARM_CROSS="${ARM_TOOLCHAIN}/bin/arm-linux-gnueabihf-"
-ARM_QT_DIR="${ARM_TOOLCHAIN}/qt5"          # 野火 BSP 的 Qt 路径
+# --- ARM 交叉编译 Qt5 路径（可选，仅宿主机交叉编译时需要）---
+#   不设置 → cmake 自动查找（multiarch / 系统路径）
+#   设置   → 指定野火 BSP 等自定义路径
+#   例: export ARM_QT_DIR="/opt/arm-linux-gnueabihf/qt5"
+ARM_QT_DIR="${ARM_QT_DIR:-}"
 
 build_pc() {
     echo "==> 构建目标: x86 PC (本地调试)"
@@ -30,29 +31,29 @@ build_pc() {
 
 build_arm() {
     echo "==> 构建目标: ARM (iMX6ULL Cortex-A7)"
-    mkdir -p "${BUILD_DIR}/arm"
-    cd "${BUILD_DIR}/arm"
 
-    cat > "${BUILD_DIR}/arm/toolchain.cmake" << 'EOC'
-set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR arm)
+    local arm_build="${PROJECT_ROOT}/build/arm"
+    local toolchain="${PROJECT_ROOT}/configs/toolchain.arm.cmake"
 
-set(CMAKE_C_COMPILER   arm-linux-gnueabihf-gcc)
-set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+    mkdir -p "${arm_build}"
+    cd "${arm_build}"
 
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-EOC
+    # 收集 Qt5 cmake 参数
+    #   - 已设置 ARM_QT_DIR 环境变量 → 使用自定义路径（野火 BSP 等）
+    #   - 未设置 → cmake 自动查找（multiarch 安装 / 系统默认）
+    local qt5_args=()
+    if [ -n "${ARM_QT_DIR:-}" ] && [ -d "${ARM_QT_DIR}" ]; then
+        qt5_args+=("-DQt5_DIR=${ARM_QT_DIR}/lib/cmake/Qt5")
+        echo "  使用 ARM Qt5: ${ARM_QT_DIR}"
+    fi
 
     cmake "${PROJECT_ROOT}" \
-        -DCMAKE_TOOLCHAIN_FILE="${BUILD_DIR}/arm/toolchain.cmake" \
+        -DCMAKE_TOOLCHAIN_FILE="${toolchain}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="/usr/local" \
-        -DQt5_DIR="${ARM_QT_DIR}/lib/cmake/Qt5"
+        "${qt5_args[@]}"
     make -j"$(nproc)"
-    echo "✓ 完成: ${BUILD_DIR}/arm/smartcam"
+    echo "✓ 完成: ${arm_build}/smartcam"
 }
 
 # --- 主入口 ---

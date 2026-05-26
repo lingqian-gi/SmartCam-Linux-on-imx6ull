@@ -65,10 +65,34 @@ cmake ../.. && make -j$(nproc)
 
 ### ARM 交叉编译
 
+**方式一：Docker 一键编译（推荐，无需安装任何 ARM 依赖到宿主机）**
+
 ```bash
-# 先修改 scripts/build.sh 中的 ARM_TOOLCHAIN 为你的交叉编译器路径
+cd SmartCam-Linux-on-imx6ull
+
+# 构建镜像（仅首次，约 5 分钟）
+docker build -f Dockerfile.arm -t smartcam-cross .
+
+# 编译（每次源码变更后执行）
+docker run --rm -v $(pwd):/workspace smartcam-cross
+# 产物: build/arm/smartcam
+```
+
+**方式二：宿主机直接编译**
+
+```bash
+# 安装交叉编译器
+sudo apt install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+# 安装 ARM Qt5（关键步骤）
+sudo dpkg --add-architecture armhf
+sudo apt install -y qtbase5-dev:armhf libjpeg-dev:armhf
+
+# 编译
 scripts/build.sh arm
 ```
+
+> **Docker 方式**把 ARM 交叉编译器 + Qt5 ARM 库全部封装到镜像中（~1.5GB），宿主机零污染，任何 x86 Linux 机器上都能编译。
 
 然后部署到开发板：
 
