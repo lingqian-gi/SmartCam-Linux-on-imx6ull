@@ -29,6 +29,21 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets)
 # libjpeg-turbo (MJPEG 解码, 自定义错误处理器抑制坏帧警告)
 find_package(JPEG REQUIRED)
 
+# ARM 交叉编译时强制静态链接 libjpeg，避免开发板缺少 .so 库
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    find_library(JPEG_STATIC_LIB NAMES libjpeg.a libjpeg-turbo.a
+                 PATHS /usr/lib/arm-linux-gnueabihf
+                       /usr/lib/arm-linux-gnueabi
+                       ${JPEG_ROOT} ${JPEG_LIBRARY_DIRS}
+                 NO_DEFAULT_PATH)
+    if(JPEG_STATIC_LIB)
+        set(JPEG_LIBRARIES ${JPEG_STATIC_LIB})
+        message(STATUS "✓ ARM 静态链接 libjpeg: ${JPEG_STATIC_LIB}")
+    else()
+        message(WARNING "⚠ 未找到静态 libjpeg.a，回退到动态链接 (可能缺少 .so)")
+    endif()
+endif()
+
 # ============================================================
 # 源文件 (按模块组织)
 # ============================================================
