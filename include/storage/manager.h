@@ -290,6 +290,20 @@ public:
      */
     static bool readJpegSize(const std::string& path, int& w, int& h);
 
+    /**
+     * @brief 从 AVI 文件提取第一帧 JPEG 数据（用于视频缩略图 / 封面）
+     *
+     * 解析 AVI RIFF 容器，定位 movi LIST 中第一个 "00dc" 帧块，
+     * 将其中的 MJPEG/JPEG 数据提取到 jpegData 向量中。
+     * 只读取文件头部元数据 + 第一帧，不解码完整视频。
+     *
+     * @param aviPath   AVI 文件路径
+     * @param jpegData  输出 JPEG 数据
+     * @return true 成功提取，false 失败（文件不存在 / 格式不兼容等）
+     */
+    static bool extractAviThumbnail(const std::string& aviPath,
+                                    std::vector<uint8_t>& jpegData);
+
     // ============================================================
     // 配置
     // ============================================================

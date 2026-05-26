@@ -4,6 +4,59 @@
 
 ---
 
+## 11. 视频播放器编译错误：AviIndexEntry/AviMainHeader 非类成员 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `include/display/video_player.h` / `src/display/video_player.cpp` |
+| **现象** | `'AviIndexEntry' is not a member of 'StorageManager'` — 所有引用处报错，连 `gui.cpp` / `main.cpp` 也因间接 include 被连带 |
+| **严重程度** | ❌ 严重 — 编译不通过 |
+
+### 原因
+
+`video_player.h` 和 `video_player.cpp` 中使用了 `StorageManager::AviIndexEntry` 和 `StorageManager::AviMainHeader`，但这些结构体定义在 `StorageManager` **类外部**（`manager.h` 中类声明之前，全局命名空间）：
+
+```cpp
+// include/storage/manager.h
+
+#pragma pack(push, 1)      // ← 全局作用域
+
+struct RiffChunk { ... };
+struct AviMainHeader { ... };   // ← 全局 struct，不属于 StorageManager
+struct AviStreamHeader { ... };
+struct BitmapInfoHeader { ... };
+struct AviIndexEntry { ... };   // ← 全局 struct，不属于 StorageManager
+struct AviFrameChunk { ... };
+
+#pragma pack(pop)
+
+class StorageManager {          // ← 类定义从这里才开始
+    ...
+    // PhotoInfo / PhotoDayGroup 等定义在类内部 → 需要 StorageManager:: 前缀
+};
+```
+
+**区分规则**：
+- `PhotoInfo`、`PhotoDayGroup` → 定义在 `StorageManager` 类内 → 必须用 `StorageManager::PhotoInfo`
+- `AviMainHeader`、`AviIndexEntry`、`RiffChunk` 等 → 定义在类外（全局）→ **不能用** `StorageManager::` 前缀
+
+### 解决
+
+去掉所有 AVI 结构体的 `StorageManager::` 前缀（共 4 处）：
+
+| 文件 | 错误写法 | 正确写法 |
+|------|----------|----------|
+| `video_player.h:101` | `std::vector<StorageManager::AviIndexEntry>` | `std::vector<AviIndexEntry>` |
+| `video_player.cpp:334` | `StorageManager::AviMainHeader avih` | `AviMainHeader avih` |
+| `video_player.cpp:388` | `sizeof(StorageManager::AviIndexEntry)` | `sizeof(AviIndexEntry)` |
+| `video_player.cpp:391` | `sizeof(StorageManager::AviIndexEntry)` | `sizeof(AviIndexEntry)` |
+
+### 涉及文件
+
+`include/display/video_player.h`（1 处）、`src/display/video_player.cpp`（3 处）
+
+---
+
 ## 10. Gallery 不显示视频文件 ✅ 已解决
 
 | 属性 | 值 |

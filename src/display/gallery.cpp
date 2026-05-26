@@ -223,6 +223,71 @@ bool PhotoGallery::createThumbnail(const std::string& jpegPath,
 #endif
 }
 
+bool PhotoGallery::createThumbnailFromJpegData(
+        const std::vector<uint8_t>& jpegData,
+        int thumbW, int thumbH, QPixmap& out) {
+    if (jpegData.empty()) return false;
+
+#ifdef HAS_LIBJPEG
+    struct jpeg_decompress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpegData.data(), jpegData.size());
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    int scaleDenom = 1;
+    if (cinfo.image_width > static_cast<JDIMENSION>(thumbW * 8))  scaleDenom = 8;
+    else if (cinfo.image_width > static_cast<JDIMENSION>(thumbW * 4))  scaleDenom = 4;
+    else if (cinfo.image_width > static_cast<JDIMENSION>(thumbW * 2))  scaleDenom = 2;
+    cinfo.scale_num   = 1;
+    cinfo.scale_denom = scaleDenom;
+
+    jpeg_start_decompress(&cinfo);
+
+    int w = cinfo.output_width;
+    int h = cinfo.output_height;
+    std::vector<uint8_t> rgb(static_cast<size_t>(w * h * 3));
+
+    while (cinfo.output_scanline < static_cast<JDIMENSION>(h)) {
+        JSAMPROW row = rgb.data() + cinfo.output_scanline * w * 3;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+
+    QImage img(rgb.data(), w, h, w * 3, QImage::Format_RGB888);
+    out = QPixmap::fromImage(img.scaled(thumbW, thumbH,
+                                         Qt::KeepAspectRatio,
+                                         Qt::SmoothTransformation));
+    return !out.isNull();
+#else
+    QImage img;
+    img.loadFromData(jpegData.data(),
+                     static_cast<int>(jpegData.size()), "JPEG");
+    if (img.isNull()) return false;
+    out = QPixmap::fromImage(img.scaled(thumbW, thumbH,
+                                         Qt::KeepAspectRatio,
+                                         Qt::SmoothTransformation));
+    return !out.isNull();
+#endif
+}
+
+bool PhotoGallery::createVideoThumbnail(const std::string& aviPath,
+                                         int thumbW, int thumbH,
+                                         QPixmap& out) {
+    std::vector<uint8_t> jpegData;
+    if (!StorageManager::extractAviThumbnail(aviPath, jpegData))
+        return false;
+
+    return createThumbnailFromJpegData(jpegData, thumbW, thumbH, out);
+}
+
 // ============================================================
 // 加载可见缩略图
 // ============================================================
@@ -296,10 +361,17 @@ void PhotoGallery::loadVisibleThumbnails() {
             "}");
 
         if (info.isVideo) {
-            // 视频：显示 ▶ 播放图标
-            btn->setText("\u25B6");      // ▶
-            btn->setStyleSheet(btn->styleSheet() +
-                " color: #2ecc71; font-size: 42px;");
+            // 视频：从 AVI 提取第一帧 JPEG 作为缩略图
+            QPixmap thumb;
+            if (createVideoThumbnail(info.path, THUMB_W, THUMB_H, thumb)) {
+                btn->setIcon(QIcon(thumb));
+                btn->setIconSize(QSize(THUMB_W, THUMB_H));
+            } else {
+                // 提取失败，显示 ▶ 占位符
+                btn->setText("\u25B6");
+                btn->setStyleSheet(btn->styleSheet() +
+                    " color: #2ecc71; font-size: 42px;");
+            }
         } else {
             // 照片：加载 JPEG 缩略图
             QPixmap thumb;
@@ -386,7 +458,10 @@ void PhotoGallery::buildFullscreenView() {
     topBar->addStretch();
     layout->addLayout(topBar);
 
-    // ---- 照片显示区 ----
+    // ---- 媒体显示区（QStackedWidget: [0]照片 / [1]视频播放器） ----
+    m_fullMediaStack = new QStackedWidget(this);
+    m_fullMediaStack->setStyleSheet("background-color: #0a0a1a; border: none;");
+
     m_fullPhotoDisplay = new QLabel(this);
     m_fullPhotoDisplay->setAlignment(Qt::AlignCenter);
     m_fullPhotoDisplay->setStyleSheet(
@@ -394,7 +469,14 @@ void PhotoGallery::buildFullscreenView() {
     m_fullPhotoDisplay->setScaledContents(false);
     m_fullPhotoDisplay->setSizePolicy(
         QSizePolicy::Expanding, QSizePolicy::Expanding);
-    layout->addWidget(m_fullPhotoDisplay, 1);
+    m_fullMediaStack->addWidget(m_fullPhotoDisplay);  // index 0
+
+    m_videoPlayer = new VideoPlayer(this);
+    connect(m_videoPlayer, &VideoPlayer::playbackFinished,
+            this, &PhotoGallery::onVideoPlaybackFinished);
+    m_fullMediaStack->addWidget(m_videoPlayer);  // index 1
+
+    layout->addWidget(m_fullMediaStack, 1);
 
     // ---- 底部操作栏 ----
     auto* bottomBar = new QHBoxLayout();
@@ -448,6 +530,9 @@ void PhotoGallery::buildFullscreenView() {
 // ============================================================
 
 void PhotoGallery::updateFullscreenDisplay() {
+    // 先停止可能正在播放的视频
+    stopVideoPlayback();
+
     if (m_currentIndex < 0 ||
         m_currentIndex >= static_cast<int>(m_flatPhotos.size()))
         return;
@@ -470,24 +555,38 @@ void PhotoGallery::updateFullscreenDisplay() {
             .arg(m_flatPhotos.size()));
 
     if (info.isVideo) {
-        // 视频：显示播放图标 + 文件名
-        m_fullPhotoDisplay->setText(
-            QString("\u25B6  %1\n\n(%2)")
-                .arg(QString::fromStdString(info.filename))
-                .arg(sizeStr));
-        m_fullPhotoDisplay->setStyleSheet(
-            "font-size: 18px; color: #2ecc71;"
-            "background-color: #0a0a1a; border: none;"
-            "padding: 40px;");
+        // 视频：加载到 VideoPlayer 并自动播放
+        if (m_videoPlayer->loadVideo(info.path)) {
+            m_fullMediaStack->setCurrentIndex(1);
+            m_videoPlayer->play();
+        } else {
+            // 加载失败，回退到照片显示区显示占位符
+            m_fullPhotoDisplay->setText(
+                QString("\u25B6  %1\n\n(%2)\n\nFailed to load video")
+                    .arg(QString::fromStdString(info.filename))
+                    .arg(sizeStr));
+            m_fullPhotoDisplay->setStyleSheet(
+                "font-size: 18px; color: #e74c3c;"
+                "background-color: #0a0a1a; border: none;"
+                "padding: 40px;");
+            m_fullMediaStack->setCurrentIndex(0);
+        }
     } else {
         // 照片显示
+        m_fullMediaStack->setCurrentIndex(0);
         QImage img(QString::fromStdString(info.path));
         if (!img.isNull()) {
             QPixmap pix = QPixmap::fromImage(img.scaled(
                 660, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation));
             m_fullPhotoDisplay->setPixmap(pix);
+            m_fullPhotoDisplay->setStyleSheet(
+                "background-color: #0a0a1a; border: none;");
         } else {
             m_fullPhotoDisplay->setText("Failed to load image");
+            m_fullPhotoDisplay->setStyleSheet(
+                "font-size: 18px; color: #e74c3c;"
+                "background-color: #0a0a1a; border: none;"
+                "padding: 40px;");
         }
     }
 
@@ -498,6 +597,7 @@ void PhotoGallery::updateFullscreenDisplay() {
 }
 
 void PhotoGallery::onPrevPhoto() {
+    stopVideoPlayback();
     if (m_currentIndex > 0) {
         m_currentIndex--;
         updateFullscreenDisplay();
@@ -505,6 +605,7 @@ void PhotoGallery::onPrevPhoto() {
 }
 
 void PhotoGallery::onNextPhoto() {
+    stopVideoPlayback();
     if (m_currentIndex < static_cast<int>(m_flatPhotos.size()) - 1) {
         m_currentIndex++;
         updateFullscreenDisplay();
@@ -512,6 +613,8 @@ void PhotoGallery::onNextPhoto() {
 }
 
 void PhotoGallery::onDeletePhoto() {
+    stopVideoPlayback();
+
     if (m_currentIndex < 0 ||
         m_currentIndex >= static_cast<int>(m_flatPhotos.size()))
         return;
@@ -553,8 +656,21 @@ void PhotoGallery::onDeletePhoto() {
 }
 
 void PhotoGallery::onBackToGallery() {
+    stopVideoPlayback();
     m_stack->setCurrentIndex(0);
     loadVisibleThumbnails();  // 可能删了照片，刷新
+}
+
+void PhotoGallery::stopVideoPlayback() {
+    if (m_videoPlayer && m_videoPlayer->isPlaying()) {
+        m_videoPlayer->stop();
+    }
+}
+
+void PhotoGallery::onVideoPlaybackFinished() {
+    // 视频播放到末尾，保持暂停状态（显示最后一帧）
+    // 用户可以点击 Prev/Next 切换
+    qDebug() << "[Gallery] Video playback finished, index:" << m_currentIndex;
 }
 
 // ============================================================

@@ -15,6 +15,7 @@
 #include <string>
 
 #include "include/storage/manager.h"
+#include "include/display/video_player.h"
 
 /**
  * @brief 相册浏览组件
@@ -50,6 +51,7 @@ private slots:
     void onNextPhoto();
     void onDeletePhoto();
     void onBackToGallery();
+    void onVideoPlaybackFinished();
 
 private:
     // ---- UI 构建 ----
@@ -61,9 +63,16 @@ private:
     bool createThumbnail(const std::string& jpegPath,
                          int thumbW, int thumbH,
                          QPixmap& out);
-    void showFullscreen(int photoIndex);
+    bool createThumbnailFromJpegData(const std::vector<uint8_t>& jpegData,
+                                     int thumbW, int thumbH,
+                                     QPixmap& out);
+    bool createVideoThumbnail(const std::string& aviPath,
+                              int thumbW, int thumbH,
+                              QPixmap& out);
+    void showFullscreen(int mediaIndex);
     void updateFullscreenDisplay();
     void clearThumbnails();
+    void stopVideoPlayback();
 
     // ---- 数据 ----
     StorageManager*              m_storage;
@@ -85,7 +94,9 @@ private:
 
     // ---- 全屏视图控件 ----
     QWidget*      m_fullView        = nullptr;
+    QStackedWidget* m_fullMediaStack = nullptr;   // [0]=照片显示, [1]=视频播放器
     QLabel*       m_fullPhotoDisplay = nullptr;
+    VideoPlayer*  m_videoPlayer     = nullptr;
     QLabel*       m_fullInfoLabel   = nullptr;
     QPushButton*  m_btnPrev         = nullptr;
     QPushButton*  m_btnNext         = nullptr;

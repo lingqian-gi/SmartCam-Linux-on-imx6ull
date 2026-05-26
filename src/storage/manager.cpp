@@ -778,6 +778,107 @@ int StorageManager::deletePhoto(const std::string& path) {
 }
 
 // ============================================================
+// AVI 缩略图提取 (v0.4)
+// ============================================================
+
+bool StorageManager::extractAviThumbnail(const std::string& aviPath,
+                                          std::vector<uint8_t>& jpegData) {
+    jpegData.clear();
+
+    FILE* fp = fopen(aviPath.c_str(), "rb");
+    if (!fp) {
+        LOG_ERR_("extractAviThumbnail: fopen failed: %s", aviPath.c_str());
+        return false;
+    }
+
+    // ---- 读取 RIFF 文件头: "RIFF" + size + "AVI " ----
+    uint8_t header[12];
+    if (fread(header, 1, 12, fp) != 12) {
+        LOG_ERR_("extractAviThumbnail: failed to read RIFF header");
+        fclose(fp);
+        return false;
+    }
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "AVI ", 4) != 0) {
+        LOG_ERR_("extractAviThumbnail: not a valid AVI file");
+        fclose(fp);
+        return false;
+    }
+
+    // ---- 跳过 hdrl LIST → 定位 movi LIST ----
+    // 顶层 chunk 序列: [LIST hdrl ...] [LIST movi ...] [idx1 ...]
+    // 解析第一个 LIST (hdrl) 并跳过
+    uint8_t chunkId[4];
+    uint32_t chunkSize;
+    uint8_t listType[4];
+
+    if (fread(chunkId, 1, 4, fp) != 4) { fclose(fp); return false; }
+    if (memcmp(chunkId, "LIST", 4) != 0) {
+        LOG_ERR_("extractAviThumbnail: expected LIST (hdrl), got %.*s", 4, chunkId);
+        fclose(fp); return false;
+    }
+    if (fread(&chunkSize, 4, 1, fp) != 1) { fclose(fp); return false; }
+    if (fread(listType, 1, 4, fp) != 4) { fclose(fp); return false; }
+
+    if (memcmp(listType, "hdrl", 4) == 0) {
+        // chunkSize 包含 "hdrl" 四字节，跳过剩余数据
+        if (fseek(fp, chunkSize - 4, SEEK_CUR) != 0) {
+            fclose(fp); return false;
+        }
+    } else {
+        // 如果不是 hdrl，尝试继续扫描
+        LOG_WRN("extractAviThumbnail: unexpected first LIST type=%.*s, skipping",
+                4, listType);
+        if (fseek(fp, chunkSize - 4, SEEK_CUR) != 0) {
+            fclose(fp); return false;
+        }
+    }
+
+    // ---- 读取 movi LIST ----
+    if (fread(chunkId, 1, 4, fp) != 4) { fclose(fp); return false; }
+    if (memcmp(chunkId, "LIST", 4) != 0) {
+        LOG_ERR_("extractAviThumbnail: expected LIST (movi), got %.*s", 4, chunkId);
+        fclose(fp); return false;
+    }
+    if (fread(&chunkSize, 4, 1, fp) != 1) { fclose(fp); return false; }
+    if (fread(listType, 1, 4, fp) != 4) { fclose(fp); return false; }
+
+    if (memcmp(listType, "movi", 4) != 0) {
+        LOG_ERR_("extractAviThumbnail: expected movi LIST type, got %.*s", 4, listType);
+        fclose(fp); return false;
+    }
+
+    // ---- 读取第一个帧 chunk ("00dc" + size + JPEG) ----
+    if (fread(chunkId, 1, 4, fp) != 4) { fclose(fp); return false; }
+    if (memcmp(chunkId, "00dc", 4) != 0) {
+        LOG_ERR_("extractAviThumbnail: expected 00dc chunk, got %.*s", 4, chunkId);
+        fclose(fp); return false;
+    }
+
+    uint32_t frameSize;
+    if (fread(&frameSize, 4, 1, fp) != 1) { fclose(fp); return false; }
+
+    if (frameSize == 0 || frameSize > 500 * 1024 * 1024) {  // sanity check: max 500MB
+        LOG_ERR_("extractAviThumbnail: invalid frame size %u", frameSize);
+        fclose(fp); return false;
+    }
+
+    jpegData.resize(frameSize);
+    size_t readBytes = fread(jpegData.data(), 1, frameSize, fp);
+    if (readBytes != frameSize) {
+        LOG_ERR_("extractAviThumbnail: short read: expected %u, got %zu",
+                 frameSize, readBytes);
+        jpegData.clear();
+        fclose(fp);
+        return false;
+    }
+
+    fclose(fp);
+    LOG_DBG("extractAviThumbnail: extracted %u bytes from %s",
+            frameSize, aviPath.c_str());
+    return true;
+}
+
+// ============================================================
 // 视频列表 (v0.3)
 // ============================================================
 

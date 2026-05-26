@@ -45,6 +45,8 @@ set(DISPLAY_SOURCES
     include/display/gui.h    # 需要 MOC 处理 (含 Q_OBJECT)
     src/display/gallery.cpp
     include/display/gallery.h  # 需要 MOC 处理 (含 Q_OBJECT)
+    src/display/video_player.cpp
+    include/display/video_player.h  # 需要 MOC 处理 (含 Q_OBJECT)
 )
 
 set(NETWORK_SOURCES
