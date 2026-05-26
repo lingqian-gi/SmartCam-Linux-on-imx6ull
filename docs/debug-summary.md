@@ -4,6 +4,36 @@
 
 ---
 
+## 10. Gallery 不显示视频文件 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/storage/manager.cpp` / `src/display/gallery.cpp` |
+| **现象** | 拍照后在 Gallery 正常看到照片，但录像后 Gallery 看不到任何视频文件 |
+| **严重程度** | ⚠️ 中等 — 用户无法确认录像是否成功保存 |
+
+### 原因
+
+`StorageManager` 只实现了 `listPhotos()`（扫描 `m_photoDir` 下的 `.jpg`），完全没有视频列表功能。视频虽然被录制到 `m_videoDir` 下的 `.avi` 文件，但 Gallery 的 `refresh()` 只调 `listPhotos()`，从不查询视频目录。
+
+### 解决
+
+1. **`PhotoInfo` 新增 `isVideo` 字段** — 标记媒体类型
+2. **`StorageManager` 新增 3 个方法**：
+   - `listVideos()` — 扫描 `m_videoDir` 下的 `.avi` 文件，逻辑与 `listPhotos` 对称
+   - `getVideoCount()` — 快速统计视频数量
+   - `deleteVideo()` — 删除视频文件并清理空目录
+3. **`PhotoGallery::refresh()` 合并照片+视频列表** — 按时间戳混排，重建日期分组
+4. **缩略图网格视频区分**：视频项显示 ▶ 绿箭头图标 + 底部 `[VID]` 标签
+5. **全屏视图视频占位**：显示 ▶ + 文件名 + 大小（AVI 暂不渲染缩略图）
+6. **删除逻辑适配**：`onDeletePhoto()` 根据 `isVideo` 调用不同删除方法
+
+### 涉及文件
+
+`include/storage/manager.h`、`src/storage/manager.cpp`、`src/display/gallery.cpp`
+
+---
+
 ## 9. 触摸屏无响应（开发板）✅ 已解决
 
 | 属性 | 值 |

@@ -13,12 +13,13 @@
 | 功能 | 描述 |
 |------|------|
 | 照片浏览 | 3 列缩略图网格，按日期分组，自动滚动 |
-| 全屏查看 | 点击缩略图进入，等比缩放适配屏幕 |
+| **视频浏览** | 视频与照片混合展示，▶ 绿箭头图标 + [VID] 标签区分 |
+| 全屏查看 | 点击缩略图进入，等比缩放适配屏幕；视频显示占位符 |
 | 前后翻页 | 左右箭头按钮 + 触摸滑动翻页（阈值 60px） |
-| 照片信息 | 显示文件名、分辨率、文件大小、当前页码 |
-| 删除照片 | 确认弹窗后删除，自动清理空目录 |
+| 媒体信息 | 显示文件名、分辨率（照片）/ 文件大小、当前页码 |
+| 删除媒体 | 确认弹窗后删除（照片/视频分别处理），自动清理空目录 |
 | 返回 | 全屏→网格→实时预览，三级导航 |
-| 空相册提示 | 无照片时显示 "No photos yet — Tap Capture to take one!" |
+| 空相册提示 | 无媒体时显示 "No photos yet — Tap Capture to take one!" |
 | 自动刷新 | 删除后自动刷新列表，回到正确位置 |
 
 ---
@@ -28,15 +29,15 @@
 | 文件 | 操作 | 行数变化 | 说明 |
 |------|------|----------|------|
 | `include/display/gallery.h` | **新增** | +90 行 | `PhotoGallery` 类声明 |
-| `src/display/gallery.cpp` | **新增** | +410 行 | `PhotoGallery` 完整实现 |
-| `include/storage/manager.h` | **修改** | +65 行 | 新增 `PhotoInfo`/`PhotoDayGroup` 结构体 + 4 个新方法声明 |
-| `src/storage/manager.cpp` | **修改** | +210 行 | 实现 `listPhotos()`/`deletePhoto()`/`readJpegSize()`/`getPhotoCount()` |
+| `src/display/gallery.cpp` | **新增** | +430 行 | `PhotoGallery` 完整实现（含视频支持） |
+| `include/storage/manager.h` | **修改** | +80 行 | `PhotoInfo` 新增 `isVideo` 字段；新增 `VideoDayGroup` 别名 + 6 个新方法声明 |
+| `src/storage/manager.cpp` | **修改** | +360 行 | 实现 `listPhotos()`/`deletePhoto()`/`readJpegSize()`/`getPhotoCount()` + `listVideos()`/`deleteVideo()`/`getVideoCount()` |
 | `include/display/gui.h` | **修改** | +20 行 | 新增 QStackedWidget、Gallery 按钮、PhotoGallery 成员及 3 个公开方法 |
 | `src/display/gui.cpp` | **修改** | +90 行 | 布局重组 + Gallery 按钮/信号 + showGallery/showLivePreview/setGalleryStorage |
 | `src/main.cpp` | **修改** | +3 行 | 调用 `gui.setGalleryStorage(&storage)` 绑定存储到相册 |
 | `CMakeLists.txt` | **修改** | +2 行 | 添加 `gallery.cpp/h` 到 DISPLAY_SOURCES |
 
-**代码总量：约 890 行（新增约 500 行 + 存储扩展约 210 行 + GUI 集成约 90 行 + 其他约 90 行）**
+**代码总量：约 1040 行（新增约 530 行 + 存储扩展约 360 行 + GUI 集成约 90 行 + 其他约 60 行）**
 
 ---
 
@@ -51,9 +52,10 @@ struct PhotoInfo {
     std::string dateStr;      // "2026-05-24"
     std::string timeStr;      // "14:30"
     time_t      timestamp;    // Unix 时间戳（用于排序）
-    int         width;        // 图片宽度
-    int         height;       // 图片高度
+    int         width;        // 图片宽度（视频为 0）
+    int         height;       // 图片高度（视频为 0）
     size_t      fileSize;     // 文件大小（字节）
+    bool        isVideo;      // true = AVI 视频, false = JPEG 照片 (v0.3 新增)
 };
 
 struct PhotoDayGroup {
@@ -69,8 +71,9 @@ struct PhotoDayGroup {
 | `dateStr` | 日期分组 + 分隔线文字 | `localtime()` + `strftime()` |
 | `timeStr` | 缩略图下方标签 | `localtime()` + `strftime()` |
 | `timestamp` | 倒序排序 | `stat().st_mtime` |
-| `width / height` | 缩略图标签 + 全屏信息栏 | 可选：`readJpegSize()` 解析文件头 |
+| `width / height` | 缩略图标签 + 全屏信息栏（照片） | `readJpegSize()` 解析文件头；视频恒为 0 |
 | `fileSize` | 全屏信息栏（KB/MB） | `stat().st_size` |
+| `isVideo` | 区分照片/视频，影响缩略图图标和删除方式 | `listVideos()` 中设为 `true`，`listPhotos()` 中默认为 `false` |
 
 ---
 
@@ -153,6 +156,38 @@ const std::string& photoDir() const { return m_photoDir; }
 ```
 
 供外部查询当前照片存储路径。在 `setPhotoDir()` 声明之后新增。
+
+### 4.6 `listVideos()` — 遍历目录获取全部视频 (v0.3 新增)
+
+**文件**: `src/storage/manager.cpp:784`
+
+```cpp
+int StorageManager::listVideos(std::vector<PhotoDayGroup>& out);
+```
+
+**处理流程**（与 `listPhotos` 对称）：
+1. `opendir(m_videoDir)` 遍历视频根目录
+2. 两层目录结构：根目录直接文件 + 日期子目录（如 `20260524/`）
+3. 过滤 `.avi` / `.AVI` 文件，用 `stat()` 获取元信息
+4. 按 `st_mtime` 倒序排序
+5. 每条记录设置 `isVideo = true`，`width/height` 固定为 0（不解析 AVI 头）
+6. 按日期分组，转换为 vector 输出
+
+### 4.7 `deleteVideo()` — 删除视频文件 (v0.3 新增)
+
+```cpp
+int StorageManager::deleteVideo(const std::string& path);
+```
+
+与 `deletePhoto()` 逻辑相同，作用于 `m_videoDir` 子树。
+
+### 4.8 `getVideoCount()` — 快速统计 (v0.3 新增)
+
+```cpp
+int StorageManager::getVideoCount();
+```
+
+纯目录遍历计数，不读文件内容。
 
 ---
 
@@ -294,11 +329,36 @@ bool PhotoGallery::eventFilter(QObject* obj, QEvent* event) {
 
 ```cpp
 void PhotoGallery::refresh() {
+    // 1. 列出照片
     m_storage->listPhotos(m_groups, true);  // includeInfo=true 读宽高
-    // 扁平化：group → vector
     for (auto& g : m_groups)
         for (auto& p : g.photos)
             m_flatPhotos.push_back(p);
+
+    // 2. 列出视频（v0.3 新增）
+    std::vector<StorageManager::PhotoDayGroup> videoGroups;
+    m_storage->listVideos(videoGroups);
+    for (auto& g : videoGroups)
+        for (auto& p : g.photos)
+            m_flatPhotos.push_back(p);       // isVideo=true
+
+    // 3. 按时间戳倒序混排照片+视频
+    std::sort(m_flatPhotos.begin(), m_flatPhotos.end(),
+              [](const auto& a, const auto& b) {
+                  return a.timestamp > b.timestamp;
+              });
+
+    // 4. 按日期重建分组
+    m_groups.clear();
+    std::string lastDate;
+    for (const auto& p : m_flatPhotos) {
+        if (p.dateStr != lastDate) {
+            m_groups.push_back({p.dateStr, {}});
+            lastDate = p.dateStr;
+        }
+        m_groups.back().photos.push_back(p);
+    }
+
     loadVisibleThumbnails();  // 重建缩略图网格
 }
 
@@ -308,6 +368,19 @@ void PhotoGallery::reset() {
     refresh();
 }
 ```
+
+### 5.8 视频显示（v0.3 新增）
+
+**网格视图**：
+- 视频项**不生成 JPEG 缩略图**（AVI 不支持），改为显示 **▶ 绿箭头**（`\u25B6`，字体 42px，颜色 `#2ecc71`）
+- 信息标签中显示 `[VID]` 代替分辨率字符串
+- 标题栏统计：`"Gallery (N photos, M videos)"`
+
+**全屏视图**：
+- 视频全屏显示 ▶ 图标 + 文件名 + 文件大小（居中大字占位符）
+- 信息栏格式：`[VID] VID_20260524_143025.avi  |  2.5 MB  |  3/12`
+- 照片和视频可混合翻页浏览
+- 删除时弹窗标题自动切换为 `"Delete video"` 或 `"Delete photo"`
 
 ---
 
@@ -576,9 +649,10 @@ rm -rf /tmp/smartcam/photos/*
 
 | 限制 | 说明 | 改进思路 |
 |------|------|----------|
-| 缩略图一次性全部加载 | 照片 > 100 张时首次加载较慢 | 虚拟滚动：只加载可见 ±1 屏的缩略图 |
+| 缩略图一次性全部加载 | 媒体 > 100 条时首次加载较慢 | 虚拟滚动：只加载可见 ±1 屏的缩略图 |
 | 无幻灯片播放 | 无法自动轮播 | 添加 QTimer + Play 按钮 |
-| 无视频回放 | AVI 文件不在网格中显示 | 扩展 `listFiles()` 支持 `.avi` 并区分图标 |
+| 视频无预览缩略图 | AVI 在网格和全屏均显示 ▶ 占位符 | 读取 AVI 第一帧 I-frame JPEG 数据作为封面 |
+| 视频不支持播放 | Gallery 中无法回放录制的视频 | 集成 mplayer/vlc 后端或 Qt Multimedia |
 | 无多选删除 | 每次只能删一张 | 全选/反选 + 批量删除 |
 | 无导出功能 | 无法拷贝到 USB | 添加 Export 按钮调用 shell 脚本 |
 
