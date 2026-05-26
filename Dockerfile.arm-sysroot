@@ -1,0 +1,69 @@
+# ============================================================
+# SmartCam ARM 交叉编译 Docker 镜像（基于开发板 sysroot）
+#
+# 前置条件: 先运行 scripts/setup-sysroot.sh 导出开发板根文件系统
+#
+# 构建:
+#   docker build -f Dockerfile.arm-sysroot -t smartcam-cross-sysroot .
+#
+# 编译:
+#   docker run --rm -v $(pwd):/workspace smartcam-cross-sysroot
+#
+# 产物:
+#   build/arm/smartcam  (ARM 32-bit, 链接到开发板同款库，可直接运行)
+# ============================================================
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =========================================
+# Layer 1: 构建工具 + ARM 交叉编译器
+# =========================================
+# 只装 x86 工具链，不装任何 armhf 包！
+# 所有 ARM 库从 sysroot（开发板副本）获取，避免版本不匹配
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        cmake make pkg-config file \
+        gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf && \
+    rm -rf /var/lib/apt/lists/*
+
+# =========================================
+# Layer 2: 拷贝 toolchain 文件
+# =========================================
+COPY configs/toolchain.arm.cmake /opt/toolchain/toolchain.cmake
+
+# =========================================
+# 默认入口: 用 sysroot 交叉编译 smartcam
+# =========================================
+#
+# SYSROOT 路径: /workspace/npi-sysroot
+#   （由 docker run -v 挂载进来，即宿主机的 npi-sysroot/ 目录）
+#
+# Qt5_DIR 自动查找: CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+#   → cmake 在 sysroot 里找 Qt5Config.cmake
+#   通常位于: ${SYSROOT}/usr/lib/arm-linux-gnueabihf/cmake/Qt5/
+#
+WORKDIR /workspace
+
+CMD ["bash", "-c", "\
+    SYSROOT=/workspace/npi-sysroot && \
+    if [ ! -d \"$SYSROOT/lib\" ]; then \
+        echo '错误: 找不到 sysroot! 请先运行 scripts/setup-sysroot.sh 导出开发板根文件系统' >&2; \
+        echo '  ./scripts/setup-sysroot.sh debian@开发板IP' >&2; \
+        exit 1; \
+    fi && \
+    echo '=== 使用 sysroot: '$SYSROOT' ===' && \
+    rm -rf build/arm && mkdir -p build/arm && cd build/arm && \
+    cmake ../.. \
+        -DCMAKE_TOOLCHAIN_FILE=/opt/toolchain/toolchain.cmake \
+        -DCMAKE_SYSROOT=$SYSROOT \
+        -DCMAKE_BUILD_TYPE=Release \
+        2>&1 && \
+    make -j$(nproc) 2>&1 && \
+    echo '========================================' && \
+    file smartcam && \
+    ldd smartcam 2>&1 || true && \
+    echo '========================================' && \
+    echo '产物: build/arm/smartcam' \
+"]

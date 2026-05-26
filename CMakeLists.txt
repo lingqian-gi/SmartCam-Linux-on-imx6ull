@@ -32,10 +32,13 @@ find_package(JPEG REQUIRED)
 # ARM 交叉编译时强制静态链接 libjpeg，避免开发板缺少 .so 库
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     find_library(JPEG_STATIC_LIB NAMES libjpeg.a libjpeg-turbo.a
-                 PATHS /usr/lib/arm-linux-gnueabihf
+                 PATHS ${CMAKE_FIND_ROOT_PATH}/usr/lib/arm-linux-gnueabihf
+                       ${CMAKE_FIND_ROOT_PATH}/usr/lib/arm-linux-gnueabi
+                       ${CMAKE_FIND_ROOT_PATH}/usr/lib
+                       /usr/lib/arm-linux-gnueabihf
                        /usr/lib/arm-linux-gnueabi
-                       ${JPEG_ROOT} ${JPEG_LIBRARY_DIRS}
-                 NO_DEFAULT_PATH)
+                       ${JPEG_ROOT}
+                       ${JPEG_LIBRARY_DIRS})
     if(JPEG_STATIC_LIB)
         set(JPEG_LIBRARIES ${JPEG_STATIC_LIB})
         message(STATUS "✓ ARM 静态链接 libjpeg: ${JPEG_STATIC_LIB}")
@@ -98,6 +101,13 @@ set(CMAKE_AUTOMOC ON)
 # ============================================================
 
 add_executable(smartcam ${ALL_SOURCES})
+
+# ARM 交叉编译时静态链接 C/C++ 标准库，消除 glibc/libstdc++ 版本不匹配问题
+# （开发板可能跑 Debian oldstable，glibc 比 Docker 里的新很多）
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc)
+    message(STATUS "✓ ARM 静态链接 libstdc++ / libgcc")
+endif()
 
 target_include_directories(smartcam PRIVATE
     ${CMAKE_SOURCE_DIR}

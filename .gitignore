@@ -38,6 +38,9 @@ Thumbs.db
 # ---- 交叉编译工具链文件 ----
 toolchain.cmake
 
+# ---- 开发板 sysroot（解压后的目录不提交，只提交压缩包） ----
+npi-sysroot/
+
 # ---- 临时文件 ----
 *.log
 /tmp/
