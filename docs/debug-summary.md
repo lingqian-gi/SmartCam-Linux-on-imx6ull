@@ -4,6 +4,63 @@
 
 ---
 
+## 12. ARM 交叉编译产物 GLIBC 版本不兼容 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | 交叉编译工具链 / Docker 镜像 |
+| **现象** | 开发板运行交叉编译产物报：`GLIBCXX_3.4.29 not found`、`GLIBC_2.33 not found`、`GLIBC_2.34 not found` |
+| **严重程度** | ❌ 严重 — 程序无法启动 |
+
+### 原因
+
+Docker 基于 Ubuntu 22.04（glibc 2.35, GCC 11），其 armhf 仓库中的 Qt5/libjpeg 都链接到 glibc 2.35。但 i.MX6ULL 开发板一般跑 Debian Buster/Bullseye（glibc 2.28~2.31），运行时报这些符号不存在。
+
+| 依赖库 | Docker (Ubuntu 22.04 armhf) | 开发板 (Debian) |
+|--------|---------------------------|-----------------|
+| libstdc++ | GCC 11 → `GLIBCXX_3.4.29` | GCC 8/10 → `GLIBCXX_3.4.25` |
+| glibc | 2.35 | 2.28~2.31 |
+
+### 解决方案：sysroot 交叉编译
+
+**核心思路**：不使用 Docker 中 Ubuntu armhf 包作为依赖，而是直接使用**开发板自身的根文件系统**作为 ARM 库来源。开发板上已有的 Qt5、libjpeg 和系统库，版本和板子完全匹配。
+
+**完整链路**（适用于云端开发环境无法直连开发板）：
+
+```
+开发板 ──[tar + git push]──▶ GitHub ──[git pull]──▶ 云端编译环境
+```
+
+**解决方案涉及的代码改动：**
+
+1. **`CMakeLists.txt`** — ARM 交叉编译时 `target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc)` 消除 libstdc++ 依赖
+2. **`configs/toolchain.arm.cmake`** — 支持 `CMAKE_SYSROOT`，允许指定开发板根文件系统路径
+3. **`Dockerfile.arm-sysroot`**（新增）— 精简 Docker 镜像，只装交叉编译器 + cmake，不安装 armhf 包
+4. **`.gitattributes` / `.gitignore`** — 管理 sysroot 分包文件
+5. **`scripts/sysroot-from-board.sh`**（新增）— 在开发板上打包、提交并推送 sysroot 到 GitHub
+6. **`scripts/sysroot-setup.sh`**（新增）— 在编译环境拉取、合并 sysroot 并执行交叉编译
+
+**开发板打包注意事项（i.MX6ULL 内存不足问题）：**
+
+板子仅 512MB 物理内存（CMA 占 327MB，可用 ~185MB），`git push` 时默认 delta 压缩会触发 OOM killer。
+
+解决方案：
+- `split -b 10M` — 分包到 10MB，减小单文件处理压力
+- `git -c pack.window=0 -c pack.depth=0 push` — 关闭 delta 压缩，CPU/RAM 零压力
+- `git config http.postBuffer 52428800` — 加大 HTTP 缓冲区，防止慢速网络超时
+
+**使用方式：**
+
+```bash
+# Step 1: 在开发板上
+cd ~/smartcam/SmartCam-Linux-on-imx6ull
+./scripts/sysroot-from-board.sh
+
+# Step 2: 在编译环境
+git pull
+./scripts/sysroot-setup.sh
+```
+
 ## 11. 视频播放器编译错误：AviIndexEntry/AviMainHeader 非类成员 ✅ 已解决
 
 | 属性 | 值 |

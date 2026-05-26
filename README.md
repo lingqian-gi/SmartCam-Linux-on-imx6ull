@@ -65,7 +65,13 @@ cmake ../.. && make -j$(nproc)
 
 ### ARM 交叉编译
 
-**方式一：Docker 一键编译（推荐，无需安装任何 ARM 依赖到宿主机）**
+SmartCam 提供两种交叉编译方式，根据你的开发环境选择：
+
+---
+
+**方式一：Docker 本地交叉编译（推荐，宿主机直通 GitHub）**
+
+适用于 x86 宿主机可直接访问 GitHub 的场景。
 
 ```bash
 cd SmartCam-Linux-on-imx6ull
@@ -78,7 +84,73 @@ docker run --rm -v $(pwd):/workspace smartcam-cross
 # 产物: build/arm/smartcam
 ```
 
-**方式二：宿主机直接编译**
+> ⚠️ `Dockerfile.arm` 基于 Ubuntu 22.04（glibc 2.35）。如果开发板系统较旧（Debian 10/11，glibc ≤ 2.31），运行时会报 `GLIBC_2.33 not found`。此时请改用**方式二**。
+
+---
+
+**方式二：Docker sysroot 交叉编译（GitHub 中转，适配老旧板子系统）**
+
+适用于远程开发（如 CNB 云端环境）无法直连开发板，或板子系统库版本与 Docker 不匹配的场景。核心思路：通过 **GitHub 仓库** 中转，把开发板的根文件系统（sysroot）传到编译环境。
+
+**整体链路：**
+
+```
+开发板 ──[tar + git push]──▶ GitHub ──[git pull]──▶ 云端编译环境
+```
+
+**step 1 — 在开发板上打包 sysroot 并推送**
+
+```bash
+# 确保在项目根目录
+cd ~/smartcam/SmartCam-Linux-on-imx6ull
+
+# 打包系统库 + Qt5 + libjpeg
+tar czf npi-sysroot.tar.gz /lib /usr/lib /usr/include /usr/local /opt 2>/dev/null
+
+# 分包（避免 GitHub 单文件 100MB 限制 + 降低 git 内存压力）
+split -b 10M npi-sysroot.tar.gz npi-sysroot.part-
+rm npi-sysroot.tar.gz
+echo "npi-sysroot.tar.gz" >> .gitignore
+
+# 提交并推送（关闭 delta 压缩以节省板子内存）
+git add npi-sysroot.part-* .gitignore
+git commit -m "add board sysroot (split parts)"
+
+# ⚡ i.MX6ULL 内存仅 512MB，git 默认 delta 压缩会触发 OOM
+git config http.postBuffer 52428800
+git -c pack.window=0 -c pack.depth=0 push
+```
+
+> **关于板子内存不足**：`git push` 默认启用 delta 压缩，i.MX6ULL 只有 512MB 物理内存（CMA 占去 ~327MB，可用不足 200MB），压缩时会被 OOM killer 杀掉。`-c pack.window=0 -c pack.depth=0` 关闭 delta 压缩，CPU 和内存无压力，代价是推送体积增大，但板子 WiFi 速度慢（~780 KiB/s）才是瓶颈；实际测试 10MB 分包 + 无压缩推送，每次只需上传少量数据，耗时约 5~10 分钟。
+
+**step 2 — 在编译环境拉取并交叉编译**
+
+```bash
+# 拉取 sysroot 分包
+cd SmartCam-Linux-on-imx6ull
+git pull
+
+# 合并分包
+cat npi-sysroot.part-* > npi-sysroot.tar.gz
+mkdir -p npi-sysroot
+tar xzf npi-sysroot.tar.gz -C npi-sysroot
+
+# 构建 Docker 镜像（基于 Debian Bullseye，装交叉编译器 + cmake，无 armhf 依赖）
+docker build -f Dockerfile.arm-sysroot -t smartcam-cross-sysroot .
+
+# 编译（挂载 sysroot 作为 ARM 库搜索路径）
+docker run --rm -v $(pwd):/workspace smartcam-cross-sysroot
+# 产物: build/arm/smartcam
+
+# 也可用一键脚本
+./scripts/sysroot-setup.sh
+```
+
+> `Dockerfile.arm-sysroot` 只安装交叉编译器和 cmake，所有 ARM 库来自开发板 sysroot，**不可能出现版本不匹配**。
+
+---
+
+**方式三：宿主机直接编译（无需 Docker）**
 
 ```bash
 # 安装交叉编译器
@@ -91,8 +163,6 @@ sudo apt install -y qtbase5-dev:armhf libjpeg-dev:armhf
 # 编译
 scripts/build.sh arm
 ```
-
-> **Docker 方式**把 ARM 交叉编译器 + Qt5 ARM 库全部封装到镜像中（~1.5GB），宿主机零污染，任何 x86 Linux 机器上都能编译。
 
 然后部署到开发板：
 
