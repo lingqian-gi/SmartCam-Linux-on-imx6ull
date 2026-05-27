@@ -65,6 +65,7 @@ public:
     using CallbackFormat = std::function<void(PixelFormat)>;
     using CallbackString = std::function<void(const std::string&)>;
     using CallbackCameraControl = std::function<void(int cid, int value)>;
+    using CallbackFramerate = std::function<void(int fps)>;
 
     void onCaptureRequest(CallbackVoid cb);
     void onRecordToggle(std::function<bool(bool)> cb);  // 回调返回 true=成功, false=拒绝
@@ -72,12 +73,16 @@ public:
     void onFormatChanged(CallbackFormat cb);
     void onStoragePathChanged(CallbackString cb);  // 存储路径变更
     void onCameraControlChanged(CallbackCameraControl cb);  // 相机控制参数变更
+    void onFramerateChanged(CallbackFramerate cb);  // 帧率变更回调
 
     // ---- 相机控制参数范围设置 ----
     void setBrightnessRange(int min, int max, int step, int value);
     void setContrastRange(int min, int max, int step, int value);
     void setWhiteBalanceRange(int min, int max, int step, int value);
     void setAutoWhiteBalance(bool enabled);
+
+    // ---- 帧率设置 ----
+    void setFramerateRange(int minFps, int maxFps, int currentFps);
 
     // ---- 相册集成 ----
     void setGalleryStorage(StorageManager* storage);
@@ -106,6 +111,7 @@ private slots:
     void onAutoWbChanged(int state);
     void onWbChanged(int value);
     void onResetDefaults();
+    void onFramerateSliderChanged(int value);
 
 private:
     void buildUI();
@@ -147,6 +153,10 @@ private:
     QCheckBox*   m_autoWbCheckBox   = nullptr;
     QPushButton* m_btnResetDefaults = nullptr;
 
+    // 帧率控制
+    QSlider*     m_framerateSlider  = nullptr;
+    QLabel*      m_framerateValue   = nullptr;
+
     // ====== 数据 ======
     FrameBuffer  m_currentFrame;
     std::vector<uint8_t> m_frameBuffer;  // 内部帧数据拷贝（避免指针悬垂）
@@ -163,6 +173,10 @@ private:
     bool        m_autoWbDefault       = true;
     bool        m_cameraControlsAvailable = false;
 
+    // 帧率控制参数
+    ControlInfo m_framerateInfo;       // min/max/step/def/current
+    int         m_framerateDefault     = 30;  // V4L2 默认帧率
+
     // 回调
     CallbackVoid        m_onCapture;
     CallbackBool        m_onRecordToggle;
@@ -170,6 +184,7 @@ private:
     CallbackFormat      m_onFormatChanged;
     CallbackString      m_onStoragePathChanged;
     CallbackCameraControl m_onCameraControl;
+    CallbackFramerate    m_onFramerate;
 
     // ---- 模拟器 ----
     int         m_mockFrameIndex = 0;

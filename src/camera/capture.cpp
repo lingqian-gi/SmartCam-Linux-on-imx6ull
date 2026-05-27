@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <algorithm>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -225,6 +226,93 @@ int CameraCapture::setFramerate(int numerator, int denominator) {
     LOG_INF("Framerate set: %d/%d fps",
              parm.parm.capture.timeperframe.denominator,
              parm.parm.capture.timeperframe.numerator);
+    return 0;
+}
+
+int CameraCapture::getFramerate(int& numerator, int& denominator) {
+    if (m_fd < 0) return -ENODEV;
+
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    if (ioctl(m_fd, VIDIOC_G_PARM, &parm) < 0) {
+        LOG_WRN("VIDIOC_G_PARM failed: %s", strerror(errno));
+        return -errno;
+    }
+
+    numerator   = static_cast<int>(parm.parm.capture.timeperframe.numerator);
+    denominator = static_cast<int>(parm.parm.capture.timeperframe.denominator);
+    return 0;
+}
+
+int CameraCapture::enumFrameRates(uint32_t pixfmt, int width, int height,
+                                   std::vector<int>& frameRates) {
+    if (m_fd < 0) return -ENODEV;
+
+    frameRates.clear();
+    struct v4l2_frmivalenum frmival;
+    memset(&frmival, 0, sizeof(frmival));
+    frmival.pixel_format = pixfmt;
+    frmival.width        = static_cast<__u32>(width);
+    frmival.height       = static_cast<__u32>(height);
+
+    for (int i = 0;; ++i) {
+        frmival.index = static_cast<__u32>(i);
+        if (ioctl(m_fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) < 0) {
+            break;  // 枚举结束
+        }
+
+        if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            int fps = static_cast<int>(frmival.discrete.denominator) /
+                      static_cast<int>(frmival.discrete.numerator);
+            if (fps > 0) {
+                frameRates.push_back(fps);
+                LOG_DBG("  FrameInterval[%d]: %d/%d = %d fps",
+                         i, frmival.discrete.numerator,
+                         frmival.discrete.denominator, fps);
+            }
+        } else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
+            // 步进式：计算 min/max/step fps
+            int minFps = static_cast<int>(frmival.stepwise.min.denominator) /
+                         static_cast<int>(frmival.stepwise.min.numerator);
+            int maxFps = static_cast<int>(frmival.stepwise.max.denominator) /
+                         static_cast<int>(frmival.stepwise.max.numerator);
+            int stepFps = static_cast<int>(frmival.stepwise.step.denominator) /
+                          static_cast<int>(frmival.stepwise.step.numerator);
+            if (stepFps <= 0) stepFps = 1;
+
+            // 限制最多 20 个离散值，避免过多
+            int count = 0;
+            for (int f = minFps; f <= maxFps && count < 20; f += stepFps) {
+                if (f > 0) {
+                    frameRates.push_back(f);
+                    count++;
+                }
+            }
+            LOG_DBG("  FrameInterval stepwise: min=%d max=%d step=%d fps",
+                     minFps, maxFps, stepFps);
+            break;
+        } else {
+            break;
+        }
+    }
+
+    // 如果设备不支持枚举帧率，返回通用范围 1~120
+    if (frameRates.empty()) {
+        LOG_INF("No frame intervals enumerated, using default range 1-120");
+        for (int f = 1; f <= 120; f += 1) {
+            frameRates.push_back(f);
+        }
+        return -ENOENT;
+    }
+
+    // 排序（升序）
+    std::sort(frameRates.begin(), frameRates.end());
+    // 去重
+    frameRates.erase(std::unique(frameRates.begin(), frameRates.end()),
+                     frameRates.end());
+
     return 0;
 }
 

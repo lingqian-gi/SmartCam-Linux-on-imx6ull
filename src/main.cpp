@@ -382,6 +382,36 @@ int main(int argc, char* argv[]) {
                 LOG_INF("Auto WB: cur=%d", val);
             }
 
+            // 帧率 — 查询 V4L2 支持的帧率范围
+            {
+                int curNum = 1, curDen = 30;
+                capture->getFramerate(curNum, curDen);
+                int currentFps = (curNum > 0) ? (curDen / curNum) : 30;
+
+                // 尝试枚举设备支持的帧率
+                std::vector<int> supportedFps;
+                int enumRet = capture->enumFrameRates(
+                    capture->getCurrentFormat(),
+                    curRes.width, curRes.height,
+                    supportedFps);
+
+                if (enumRet == 0 && !supportedFps.empty()) {
+                    int minFps = supportedFps.front();
+                    int maxFps = supportedFps.back();
+                    // 确保当前帧率在范围内
+                    if (currentFps < minFps) currentFps = minFps;
+                    if (currentFps > maxFps) currentFps = maxFps;
+                    gui.setFramerateRange(minFps, maxFps, currentFps);
+                    LOG_INF("Framerate: supported=%zu rates, range=[%d, %d], current=%d",
+                             supportedFps.size(), minFps, maxFps, currentFps);
+                } else {
+                    // 设备不支持枚举帧率，使用通用安全范围 1~60
+                    gui.setFramerateRange(1, 60, currentFps);
+                    LOG_INF("Framerate: enum not supported, using safe range 1-60, current=%d",
+                             currentFps);
+                }
+            }
+
             // 注册统一回调：滑块变化 → V4L2 setControl
             gui.onCameraControlChanged([capture](int cid, int value) {
                 int ret = capture->setControl(cid, value);
@@ -391,6 +421,34 @@ int main(int argc, char* argv[]) {
                 } else {
                     LOG_INF("Camera control: cid=0x%08X → %d",
                              static_cast<uint32_t>(cid), value);
+                }
+            });
+
+            // 注册帧率变更回调：滑块变化 → V4L2 setFramerate + 更新 RTSP + 更新显示定时器
+            gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
+                if (fps <= 0) return;
+
+                int ret = capture->setFramerate(1, fps);
+                if (ret < 0) {
+                    LOG_WRN("setFramerate(%d) failed (ret=%d)", fps, ret);
+                } else {
+                    LOG_INF("Framerate changed to %d fps", fps);
+                }
+
+                // 同步更新 RTSP 服务器的 SDP 和 RTP 时间戳
+                if (rtspServer) {
+                    Resolution res = capture->getCurrentResolution();
+                    rtspServer->setStreamInfo(res.width, res.height, fps);
+                    LOG_INF("RTSP stream info updated: %dx%d @ %dfps",
+                             res.width, res.height, fps);
+                }
+
+                // 更新显示定时器间隔，至少 10ms，最高 100ms (10fps)
+                if (displayTimer) {
+                    int intervalMs = std::max(10, std::min(100, 1000 / fps));
+                    displayTimer->setInterval(intervalMs);
+                    LOG_INF("Display timer interval updated to %d ms (target %d fps)",
+                             intervalMs, fps);
                 }
             });
         }
@@ -437,8 +495,17 @@ int main(int argc, char* argv[]) {
         //   - YUYV 模式：libjpeg-turbo 编码后 → RTP 分片发送
         // ============================================================
         rtspServer = new RTSPServer();
+        // 使用 V4L2 查询到的实际帧率，若无则默认 30
+        int rtspFps = 30;
+        {
+            int num = 1, den = 30;
+            if (capture->getFramerate(num, den) == 0 && num > 0) {
+                rtspFps = den / num;
+                if (rtspFps <= 0) rtspFps = 30;
+            }
+        }
         rtspServer->setStreamInfo(curRes.width, curRes.height,
-                                  30 /* fps */);
+                                  rtspFps);
         rtspThread = new std::thread([rtspServer, rtspPort]() {
             LOG_INF("RTSP thread starting on port %d", rtspPort);
             rtspServer->start(rtspPort);

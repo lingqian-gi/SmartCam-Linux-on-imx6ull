@@ -252,6 +252,8 @@ void CameraGUI::connectSignals() {
     connect(m_contrastSlider, &QSlider::valueChanged, this, &CameraGUI::onContrastChanged);
     connect(m_autoWbCheckBox, &QCheckBox::stateChanged, this, &CameraGUI::onAutoWbChanged);
     connect(m_wbSlider, &QSlider::valueChanged, this, &CameraGUI::onWbChanged);
+    connect(m_framerateSlider, QOverload<int>::of(&QSlider::valueChanged),
+            this, &CameraGUI::onFramerateSliderChanged);
     connect(m_btnResetDefaults, &QPushButton::clicked, this, &CameraGUI::onResetDefaults);
 }
 
@@ -507,6 +509,7 @@ void CameraGUI::onResolutionChanged(CallbackIntInt cb)  { m_onResolutionChanged 
 void CameraGUI::onFormatChanged(CallbackFormat cb)      { m_onFormatChanged = std::move(cb); }
 void CameraGUI::onStoragePathChanged(CallbackString cb) { m_onStoragePathChanged = std::move(cb); }
 void CameraGUI::onCameraControlChanged(CallbackCameraControl cb) { m_onCameraControl = std::move(cb); }
+void CameraGUI::onFramerateChanged(CallbackFramerate cb)       { m_onFramerate = std::move(cb); }
 
 void CameraGUI::setStoragePath(const std::string& path) {
     if (!m_storageCombo) return;
@@ -685,6 +688,24 @@ void CameraGUI::buildSettingsDialog() {
     wbRow->addWidget(m_wbValueLabel);
     camLayout->addLayout(wbRow);
 
+    // 帧率
+    auto* fpsRow = new QHBoxLayout();
+    auto* fpsLabel = new QLabel(QStringLiteral("Framerate:"), camGroup);
+    fpsLabel->setFixedWidth(100);
+    m_framerateSlider = new QSlider(Qt::Horizontal, camGroup);
+    m_framerateSlider->setRange(1, 120);
+    m_framerateSlider->setValue(30);
+    m_framerateSlider->setSingleStep(1);
+    m_framerateSlider->setPageStep(5);
+    m_framerateSlider->setStyleSheet(sliderStyle);
+    m_framerateValue = new QLabel(QStringLiteral("30 fps"), camGroup);
+    m_framerateValue->setFixedWidth(60);
+    m_framerateValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    fpsRow->addWidget(fpsLabel);
+    fpsRow->addWidget(m_framerateSlider, 1);
+    fpsRow->addWidget(m_framerateValue);
+    camLayout->addLayout(fpsRow);
+
     mainLayout->addWidget(camGroup);
 
     // ================================================================
@@ -766,6 +787,25 @@ void CameraGUI::setAutoWhiteBalance(bool enabled) {
     m_wbSlider->setEnabled(!enabled);
 }
 
+void CameraGUI::setFramerateRange(int minFps, int maxFps, int currentFps) {
+    // 限制合理范围：最小 1fps，最大 120fps
+    minFps = std::max(1, minFps);
+    maxFps = std::min(120, maxFps);
+    if (maxFps < minFps) maxFps = minFps;
+    currentFps = std::max(minFps, std::min(maxFps, currentFps));
+
+    m_framerateInfo = {minFps, maxFps, 1, currentFps, currentFps};
+    m_framerateDefault = currentFps;
+
+    m_framerateSlider->blockSignals(true);
+    m_framerateSlider->setRange(minFps, maxFps);
+    m_framerateSlider->setSingleStep(1);
+    m_framerateSlider->setPageStep(5);
+    m_framerateSlider->setValue(currentFps);
+    m_framerateSlider->blockSignals(false);
+    m_framerateValue->setText(QString("%1 fps").arg(currentFps));
+}
+
 // ============================================================
 // 相机控制槽函数
 // ============================================================
@@ -808,6 +848,15 @@ void CameraGUI::onWbChanged(int value) {
     qDebug() << "[GUI] WB Temperature changed:" << value;
 }
 
+void CameraGUI::onFramerateSliderChanged(int value) {
+    m_framerateValue->setText(QString("%1 fps").arg(value));
+    m_framerateInfo.current = value;
+    if (m_onFramerate) {
+        m_onFramerate(value);
+    }
+    qDebug() << "[GUI] Framerate changed:" << value;
+}
+
 void CameraGUI::onResetDefaults() {
     qDebug() << "[GUI] Reset camera controls to defaults";
 
@@ -840,6 +889,14 @@ void CameraGUI::onResetDefaults() {
                           m_autoWbDefault ? 1 : 0);
         m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE),
                           m_wbInfo.def);
+    }
+
+    // 恢复帧率
+    m_framerateSlider->setValue(m_framerateInfo.def);
+    m_framerateValue->setText(QString("%1 fps").arg(m_framerateInfo.def));
+    m_framerateInfo.current = m_framerateInfo.def;
+    if (m_onFramerate) {
+        m_onFramerate(m_framerateInfo.def);
     }
 }
 

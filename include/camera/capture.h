@@ -118,6 +118,25 @@ public:
     int setFramerate(int numerator, int denominator);
 
     /**
+     * @brief 获取当前帧率设置
+     * @param numerator   输出：分子
+     * @param denominator 输出：分母
+     * @return 0 成功，负值表示设备不支持
+     */
+    int getFramerate(int& numerator, int& denominator);
+
+    /**
+     * @brief 枚举当前格式/分辨率下支持的帧率
+     * @param pixfmt       像素格式 (V4L2 FOURCC)
+     * @param width        宽度
+     * @param height       高度
+     * @param frameRates   输出：支持的帧率列表 (fps 整数值)
+     * @return 0 成功，负值无可用帧率
+     */
+    int enumFrameRates(uint32_t pixfmt, int width, int height,
+                       std::vector<int>& frameRates);
+
+    /**
      * @brief 设置摄像头控制参数
      * @param cid    V4L2 控制 ID，如 V4L2_CID_BRIGHTNESS
      * @param value  控制值
