@@ -1,4 +1,5 @@
 #include "include/display/gui.h"
+#include "include/camera/capture.h"
 #include <QApplication>
 #include <QScreen>
 #include <QPainter>
@@ -223,61 +224,7 @@ void CameraGUI::buildUI() {
     btnLayout->addStretch();
     mainLayout->addLayout(btnLayout);
 
-    // --- (4) 设置栏（可展开/收起） ---
-    m_settingsPanel = new QWidget(this);
-    auto* settingsLayout = new QHBoxLayout(m_settingsPanel);
-    settingsLayout->setContentsMargins(0, 0, 0, 0);
-    settingsLayout->setSpacing(12);
-
-    auto* resLabel = new QLabel(QStringLiteral("Res:"), this);
-    m_resolutionCombo = new QComboBox(this);
-    m_resolutionCombo->addItem(QStringLiteral("640x480"),  QVariant::fromValue(RES_640x480));
-    m_resolutionCombo->addItem(QStringLiteral("320x240"),  QVariant::fromValue(RES_320x240));
-    m_resolutionCombo->addItem(QStringLiteral("1280x720"), QVariant::fromValue(RES_1280x720));
-
-    auto* fmtLabel = new QLabel(QStringLiteral("Fmt:"), this);
-    m_formatCombo = new QComboBox(this);
-    m_formatCombo->addItem(QStringLiteral("YUV"),       static_cast<int>(PixelFormat::FMT_YUYV));
-    m_formatCombo->addItem(QStringLiteral("MJPEG"),     static_cast<int>(PixelFormat::FMT_MJPEG));
-
-    QString labelStyle = "font-size: 13px; color: #c0c0d0;";
-    resLabel->setStyleSheet(labelStyle);
-    fmtLabel->setStyleSheet(labelStyle);
-
-    QString comboStyle =
-        "QComboBox { font-size: 13px; padding: 4px 8px;"
-        "  background: #16213e; color: #e0e0e0; border: 1px solid #0f3460;"
-        "  border-radius: 4px; min-width: 120px; }"
-        "QComboBox::drop-down { border: none; }"
-        "QComboBox QAbstractItemView {"
-        "  background: #16213e; color: #e0e0e0;"
-        "  selection-background-color: #0f3460; }";
-
-    m_resolutionCombo->setStyleSheet(comboStyle);
-    m_formatCombo->setStyleSheet(comboStyle);
-
-    // 存储路径选择
-    auto* storageLabel = new QLabel(QStringLiteral("Store:"), this);
-    storageLabel->setStyleSheet(labelStyle);
-
-    m_storageCombo = new QComboBox(this);
-    m_storageCombo->addItem(QStringLiteral("Temporary (/data)"),     QString("/data"));
-    m_storageCombo->addItem(QStringLiteral("Persistent (eMMC)"),    QString("/home/debian/smartcam"));
-    m_storageCombo->setStyleSheet(comboStyle);
-
-    settingsLayout->addWidget(resLabel);
-    settingsLayout->addWidget(m_resolutionCombo);
-    settingsLayout->addSpacing(16);
-    settingsLayout->addWidget(fmtLabel);
-    settingsLayout->addWidget(m_formatCombo);
-    settingsLayout->addSpacing(16);
-    settingsLayout->addWidget(storageLabel);
-    settingsLayout->addWidget(m_storageCombo);
-    settingsLayout->addStretch();
-    mainLayout->addWidget(m_settingsPanel);
-
-    // 默认隐藏设置面板
-    m_settingsPanel->hide();
+    buildSettingsDialog();
 
     // --- 整体配色 ---
     setStyleSheet("background-color: #0a0a1a;");
@@ -299,6 +246,13 @@ void CameraGUI::connectSignals() {
             this, &CameraGUI::onFormatComboChanged);
     connect(m_storageCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &CameraGUI::onStorageComboChanged);
+
+    // 相机控制滑块
+    connect(m_brightnessSlider, &QSlider::valueChanged, this, &CameraGUI::onBrightnessChanged);
+    connect(m_contrastSlider, &QSlider::valueChanged, this, &CameraGUI::onContrastChanged);
+    connect(m_autoWbCheckBox, &QCheckBox::stateChanged, this, &CameraGUI::onAutoWbChanged);
+    connect(m_wbSlider, &QSlider::valueChanged, this, &CameraGUI::onWbChanged);
+    connect(m_btnResetDefaults, &QPushButton::clicked, this, &CameraGUI::onResetDefaults);
 }
 
 // ============================================================
@@ -411,9 +365,10 @@ void CameraGUI::onRecord() {
 }
 
 void CameraGUI::onSettings() {
-    bool visible = m_settingsPanel->isVisible();
-    m_settingsPanel->setVisible(!visible);
-    qDebug() << "[GUI] Settings panel" << (visible ? "Hide" : "Show");
+    if (m_settingsDialog) {
+        m_settingsDialog->exec();
+    }
+    qDebug() << "[GUI] Settings dialog closed";
 }
 
 void CameraGUI::onResolutionComboChanged(int index) {
@@ -479,7 +434,10 @@ void CameraGUI::showGallery() {
         // 隐藏实时预览相关的操作按钮
         m_btnCapture->hide();
         m_btnRecord->hide();
-        m_settingsPanel->hide();
+        // 关闭设置对话框（如果打开的话）
+        if (m_settingsDialog && m_settingsDialog->isVisible()) {
+            m_settingsDialog->close();
+        }
     }
 }
 
@@ -548,6 +506,7 @@ void CameraGUI::onRecordToggle(std::function<bool(bool)> cb) { m_onRecordToggle 
 void CameraGUI::onResolutionChanged(CallbackIntInt cb)  { m_onResolutionChanged = std::move(cb); }
 void CameraGUI::onFormatChanged(CallbackFormat cb)      { m_onFormatChanged = std::move(cb); }
 void CameraGUI::onStoragePathChanged(CallbackString cb) { m_onStoragePathChanged = std::move(cb); }
+void CameraGUI::onCameraControlChanged(CallbackCameraControl cb) { m_onCameraControl = std::move(cb); }
 
 void CameraGUI::setStoragePath(const std::string& path) {
     if (!m_storageCombo) return;
@@ -562,6 +521,326 @@ void CameraGUI::setStoragePath(const std::string& path) {
     m_storageCombo->addItem(QString::fromStdString(path),
                             QString::fromStdString(path));
     m_storageCombo->setCurrentIndex(m_storageCombo->count() - 1);
+}
+
+// ============================================================
+// 设置面板弹窗（亮度/对比度/白平衡调节）
+// ============================================================
+
+void CameraGUI::buildSettingsDialog() {
+    m_settingsDialog = new QDialog(this);
+    m_settingsDialog->setWindowTitle(QStringLiteral("Settings"));
+    m_settingsDialog->setMinimumSize(640, 440);
+    m_settingsDialog->setModal(true);
+
+    // 深色主题
+    m_settingsDialog->setStyleSheet(
+        "QDialog { background-color: #0a0a1a; }"
+        "QLabel { color: #e0e0e0; font-size: 13px; }"
+        "QGroupBox { color: #e0e0e0; font-size: 14px; font-weight: bold; "
+        "  border: 1px solid #0f3460; border-radius: 4px; margin-top: 12px; padding-top: 16px; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }"
+    );
+
+    auto* mainLayout = new QVBoxLayout(m_settingsDialog);
+    mainLayout->setSpacing(10);
+    mainLayout->setContentsMargins(16, 16, 16, 16);
+
+    // ---- 样式定义 ----
+    QString comboStyle =
+        "QComboBox { font-size: 13px; padding: 4px 8px;"
+        "  background: #16213e; color: #e0e0e0; border: 1px solid #0f3460;"
+        "  border-radius: 4px; min-width: 160px; }"
+        "QComboBox::drop-down { border: none; }"
+        "QComboBox QAbstractItemView {"
+        "  background: #16213e; color: #e0e0e0;"
+        "  selection-background-color: #0f3460; }";
+
+    QString sliderStyle =
+        "QSlider::groove:horizontal {"
+        "  border: 1px solid #0f3460; height: 6px; background: #16213e;"
+        "  border-radius: 3px; }"
+        "QSlider::handle:horizontal {"
+        "  background: #3498db; border: 1px solid #2980b9; width: 18px;"
+        "  margin: -7px 0; border-radius: 9px; }"
+        "QSlider::sub-page:horizontal { background: #2980b9; border-radius: 3px; }";
+
+    // ================================================================
+    // (1) 视频设置分组
+    // ================================================================
+    auto* videoGroup = new QGroupBox(QStringLiteral("Video Settings"), m_settingsDialog);
+    auto* videoLayout = new QVBoxLayout(videoGroup);
+    videoLayout->setSpacing(8);
+
+    // 分辨率
+    auto* resRow = new QHBoxLayout();
+    auto* resLabel = new QLabel(QStringLiteral("Resolution:"), videoGroup);
+    resLabel->setFixedWidth(100);
+    m_resolutionCombo = new QComboBox(videoGroup);
+    m_resolutionCombo->addItem(QStringLiteral("640x480"),  QVariant::fromValue(RES_640x480));
+    m_resolutionCombo->addItem(QStringLiteral("320x240"),  QVariant::fromValue(RES_320x240));
+    m_resolutionCombo->addItem(QStringLiteral("1280x720"), QVariant::fromValue(RES_1280x720));
+    m_resolutionCombo->setStyleSheet(comboStyle);
+    resRow->addWidget(resLabel);
+    resRow->addWidget(m_resolutionCombo, 1);
+    videoLayout->addLayout(resRow);
+
+    // 格式
+    auto* fmtRow = new QHBoxLayout();
+    auto* fmtLabel = new QLabel(QStringLiteral("Format:"), videoGroup);
+    fmtLabel->setFixedWidth(100);
+    m_formatCombo = new QComboBox(videoGroup);
+    m_formatCombo->addItem(QStringLiteral("YUYV"),   static_cast<int>(PixelFormat::FMT_YUYV));
+    m_formatCombo->addItem(QStringLiteral("MJPEG"),  static_cast<int>(PixelFormat::FMT_MJPEG));
+    m_formatCombo->setStyleSheet(comboStyle);
+    fmtRow->addWidget(fmtLabel);
+    fmtRow->addWidget(m_formatCombo, 1);
+    videoLayout->addLayout(fmtRow);
+
+    // 存储路径
+    auto* storeRow = new QHBoxLayout();
+    auto* storeLabel = new QLabel(QStringLiteral("Storage:"), videoGroup);
+    storeLabel->setFixedWidth(100);
+    m_storageCombo = new QComboBox(videoGroup);
+    m_storageCombo->addItem(QStringLiteral("Temporary (/data)"),     QString("/data"));
+    m_storageCombo->addItem(QStringLiteral("Persistent (eMMC)"),    QString("/home/debian/smartcam"));
+    m_storageCombo->setStyleSheet(comboStyle);
+    storeRow->addWidget(storeLabel);
+    storeRow->addWidget(m_storageCombo, 1);
+    videoLayout->addLayout(storeRow);
+
+    mainLayout->addWidget(videoGroup);
+
+    // ================================================================
+    // (2) 相机控制分组 — 亮度/对比度/白平衡
+    // ================================================================
+    auto* camGroup = new QGroupBox(QStringLiteral("Camera Controls"), m_settingsDialog);
+    auto* camLayout = new QVBoxLayout(camGroup);
+    camLayout->setSpacing(8);
+
+    // 亮度
+    auto* brightRow = new QHBoxLayout();
+    auto* brightLabel = new QLabel(QStringLiteral("Brightness:"), camGroup);
+    brightLabel->setFixedWidth(100);
+    m_brightnessSlider = new QSlider(Qt::Horizontal, camGroup);
+    m_brightnessSlider->setRange(0, 100);
+    m_brightnessSlider->setValue(50);
+    m_brightnessSlider->setStyleSheet(sliderStyle);
+    m_brightnessValue = new QLabel(QStringLiteral("50"), camGroup);
+    m_brightnessValue->setFixedWidth(50);
+    m_brightnessValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    brightRow->addWidget(brightLabel);
+    brightRow->addWidget(m_brightnessSlider, 1);
+    brightRow->addWidget(m_brightnessValue);
+    camLayout->addLayout(brightRow);
+
+    // 对比度
+    auto* contrastRow = new QHBoxLayout();
+    auto* contrastLabel = new QLabel(QStringLiteral("Contrast:"), camGroup);
+    contrastLabel->setFixedWidth(100);
+    m_contrastSlider = new QSlider(Qt::Horizontal, camGroup);
+    m_contrastSlider->setRange(0, 100);
+    m_contrastSlider->setValue(50);
+    m_contrastSlider->setStyleSheet(sliderStyle);
+    m_contrastValue = new QLabel(QStringLiteral("50"), camGroup);
+    m_contrastValue->setFixedWidth(50);
+    m_contrastValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    contrastRow->addWidget(contrastLabel);
+    contrastRow->addWidget(m_contrastSlider, 1);
+    contrastRow->addWidget(m_contrastValue);
+    camLayout->addLayout(contrastRow);
+
+    // 自动白平衡
+    auto* autoWbRow = new QHBoxLayout();
+    auto* autoWbLabel = new QLabel(QStringLiteral("Auto WB:"), camGroup);
+    autoWbLabel->setFixedWidth(100);
+    m_autoWbCheckBox = new QCheckBox(QStringLiteral("Auto"), camGroup);
+    m_autoWbCheckBox->setChecked(true);
+    m_autoWbCheckBox->setStyleSheet(
+        "QCheckBox { color: #e0e0e0; font-size: 13px; spacing: 6px; }"
+        "QCheckBox::indicator { width: 20px; height: 20px; }"
+        "QCheckBox::indicator:unchecked { "
+        "  border: 2px solid #7f8c8d; border-radius: 3px; background: #16213e; }"
+        "QCheckBox::indicator:checked { "
+        "  border: 2px solid #3498db; border-radius: 3px; background: #3498db; }");
+    autoWbRow->addWidget(autoWbLabel);
+    autoWbRow->addWidget(m_autoWbCheckBox);
+    autoWbRow->addStretch();
+    camLayout->addLayout(autoWbRow);
+
+    // 白平衡色温
+    auto* wbRow = new QHBoxLayout();
+    auto* wbLabel = new QLabel(QStringLiteral("WB Temp:"), camGroup);
+    wbLabel->setFixedWidth(100);
+    m_wbSlider = new QSlider(Qt::Horizontal, camGroup);
+    m_wbSlider->setRange(2500, 10000);
+    m_wbSlider->setValue(5000);
+    m_wbSlider->setEnabled(false);  // 自动白平衡开启时禁用手动色温
+    m_wbSlider->setStyleSheet(sliderStyle);
+    m_wbValueLabel = new QLabel(QStringLiteral("5000K"), camGroup);
+    m_wbValueLabel->setFixedWidth(60);
+    m_wbValueLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    wbRow->addWidget(wbLabel);
+    wbRow->addWidget(m_wbSlider, 1);
+    wbRow->addWidget(m_wbValueLabel);
+    camLayout->addLayout(wbRow);
+
+    mainLayout->addWidget(camGroup);
+
+    // ================================================================
+    // (3) 底部按钮
+    // ================================================================
+    auto* btnRow = new QHBoxLayout();
+    btnRow->addStretch();
+
+    m_btnResetDefaults = new QPushButton(QStringLiteral("Reset Defaults"), m_settingsDialog);
+    m_btnResetDefaults->setStyleSheet(
+        "QPushButton { font-size: 13px; font-weight: bold; padding: 8px 16px;"
+        "  background-color: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #7f8c8d; border-radius: 4px; }"
+        "QPushButton:pressed { background-color: #1a252f; }");
+
+    auto* btnClose = new QPushButton(QStringLiteral("Close"), m_settingsDialog);
+    btnClose->setStyleSheet(
+        "QPushButton { font-size: 13px; font-weight: bold; padding: 8px 24px;"
+        "  background-color: #1a6fb5; color: white;"
+        "  border: 2px solid #5aa9e6; border-radius: 4px; }"
+        "QPushButton:pressed { background-color: #0d4a7a; }");
+
+    btnRow->addWidget(m_btnResetDefaults);
+    btnRow->addSpacing(12);
+    btnRow->addWidget(btnClose);
+    mainLayout->addLayout(btnRow);
+
+    // ---- 关闭按钮连接 ----
+    connect(btnClose, &QPushButton::clicked, m_settingsDialog, &QDialog::close);
+}
+
+// ============================================================
+// 相机控制参数范围设置（由 main.cpp 在 V4L2 查询后调用）
+// ============================================================
+
+void CameraGUI::setBrightnessRange(int min, int max, int step, int value) {
+    m_brightnessInfo = {min, max, step, value, value};
+    m_cameraControlsAvailable = true;
+
+    // 阻止信号，避免设置范围时触发回调
+    m_brightnessSlider->blockSignals(true);
+    m_brightnessSlider->setRange(min, max);
+    m_brightnessSlider->setSingleStep(step);
+    m_brightnessSlider->setPageStep(step * 10);
+    m_brightnessSlider->setValue(value);
+    m_brightnessSlider->blockSignals(false);
+    m_brightnessValue->setText(QString::number(value));
+}
+
+void CameraGUI::setContrastRange(int min, int max, int step, int value) {
+    m_contrastInfo = {min, max, step, value, value};
+
+    m_contrastSlider->blockSignals(true);
+    m_contrastSlider->setRange(min, max);
+    m_contrastSlider->setSingleStep(step);
+    m_contrastSlider->setPageStep(step * 10);
+    m_contrastSlider->setValue(value);
+    m_contrastSlider->blockSignals(false);
+    m_contrastValue->setText(QString::number(value));
+}
+
+void CameraGUI::setWhiteBalanceRange(int min, int max, int step, int value) {
+    m_wbInfo = {min, max, step, value, value};
+
+    m_wbSlider->blockSignals(true);
+    m_wbSlider->setRange(min, max);
+    m_wbSlider->setSingleStep(step);
+    m_wbSlider->setPageStep(step * 100);
+    m_wbSlider->setValue(value);
+    m_wbSlider->blockSignals(false);
+    m_wbValueLabel->setText(QString("%1K").arg(value));
+}
+
+void CameraGUI::setAutoWhiteBalance(bool enabled) {
+    m_autoWbDefault = enabled;
+    m_autoWbCheckBox->blockSignals(true);
+    m_autoWbCheckBox->setChecked(enabled);
+    m_autoWbCheckBox->blockSignals(false);
+    m_wbSlider->setEnabled(!enabled);
+}
+
+// ============================================================
+// 相机控制槽函数
+// ============================================================
+
+void CameraGUI::onBrightnessChanged(int value) {
+    m_brightnessValue->setText(QString::number(value));
+    m_brightnessInfo.current = value;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_BRIGHTNESS), value);
+    }
+    qDebug() << "[GUI] Brightness changed:" << value;
+}
+
+void CameraGUI::onContrastChanged(int value) {
+    m_contrastValue->setText(QString::number(value));
+    m_contrastInfo.current = value;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_CONTRAST), value);
+    }
+    qDebug() << "[GUI] Contrast changed:" << value;
+}
+
+void CameraGUI::onAutoWbChanged(int state) {
+    bool autoWb = (state == Qt::Checked);
+    m_wbSlider->setEnabled(!autoWb);
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_AUTO_WHITE_BALANCE),
+                          autoWb ? 1 : 0);
+    }
+    qDebug() << "[GUI] Auto WB changed:" << (autoWb ? "ON" : "OFF");
+}
+
+void CameraGUI::onWbChanged(int value) {
+    m_wbValueLabel->setText(QString("%1K").arg(value));
+    m_wbInfo.current = value;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE),
+                          value);
+    }
+    qDebug() << "[GUI] WB Temperature changed:" << value;
+}
+
+void CameraGUI::onResetDefaults() {
+    qDebug() << "[GUI] Reset camera controls to defaults";
+
+    // 恢复亮度
+    m_brightnessSlider->setValue(m_brightnessInfo.def);
+    m_brightnessValue->setText(QString::number(m_brightnessInfo.def));
+    m_brightnessInfo.current = m_brightnessInfo.def;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_BRIGHTNESS),
+                          m_brightnessInfo.def);
+    }
+
+    // 恢复对比度
+    m_contrastSlider->setValue(m_contrastInfo.def);
+    m_contrastValue->setText(QString::number(m_contrastInfo.def));
+    m_contrastInfo.current = m_contrastInfo.def;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_CONTRAST),
+                          m_contrastInfo.def);
+    }
+
+    // 恢复白平衡
+    m_autoWbCheckBox->setChecked(m_autoWbDefault);
+    m_wbSlider->setValue(m_wbInfo.def);
+    m_wbValueLabel->setText(QString("%1K").arg(m_wbInfo.def));
+    m_wbInfo.current = m_wbInfo.def;
+    m_wbSlider->setEnabled(!m_autoWbDefault);
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_AUTO_WHITE_BALANCE),
+                          m_autoWbDefault ? 1 : 0);
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE),
+                          m_wbInfo.def);
+    }
 }
 
 // ============================================================

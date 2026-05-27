@@ -342,6 +342,60 @@ int main(int argc, char* argv[]) {
         g_state.running = true;
 
         // ============================================================
+        // 查询 V4L2 控制参数范围 & 注册相机控制回调
+        // ============================================================
+        {
+            int min, max, step, def, val;
+
+            // 亮度
+            if (capture->queryControl(CameraCapture::V4L2_CID_BRIGHTNESS,
+                                       min, max, step, def) == 0) {
+                capture->getControl(CameraCapture::V4L2_CID_BRIGHTNESS, val);
+                gui.setBrightnessRange(min, max, step, (val != 0 ? val : def));
+                LOG_INF("Brightness: min=%d max=%d step=%d def=%d cur=%d",
+                         min, max, step, def, val);
+            }
+
+            // 对比度
+            if (capture->queryControl(CameraCapture::V4L2_CID_CONTRAST,
+                                       min, max, step, def) == 0) {
+                capture->getControl(CameraCapture::V4L2_CID_CONTRAST, val);
+                gui.setContrastRange(min, max, step, (val != 0 ? val : def));
+                LOG_INF("Contrast: min=%d max=%d step=%d def=%d cur=%d",
+                         min, max, step, def, val);
+            }
+
+            // 白平衡色温
+            if (capture->queryControl(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                                       min, max, step, def) == 0) {
+                capture->getControl(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE, val);
+                gui.setWhiteBalanceRange(min, max, step, (val != 0 ? val : def));
+                LOG_INF("WB Temp: min=%d max=%d step=%d def=%d cur=%d",
+                         min, max, step, def, val);
+            }
+
+            // 自动白平衡
+            if (capture->queryControl(CameraCapture::V4L2_CID_AUTO_WHITE_BALANCE,
+                                       min, max, step, def) == 0) {
+                capture->getControl(CameraCapture::V4L2_CID_AUTO_WHITE_BALANCE, val);
+                gui.setAutoWhiteBalance(val != 0);
+                LOG_INF("Auto WB: cur=%d", val);
+            }
+
+            // 注册统一回调：滑块变化 → V4L2 setControl
+            gui.onCameraControlChanged([capture](int cid, int value) {
+                int ret = capture->setControl(cid, value);
+                if (ret < 0) {
+                    LOG_WRN("setControl(cid=0x%08X, val=%d) failed (ret=%d)",
+                             static_cast<uint32_t>(cid), value, ret);
+                } else {
+                    LOG_INF("Camera control: cid=0x%08X → %d",
+                             static_cast<uint32_t>(cid), value);
+                }
+            });
+        }
+
+        // ============================================================
         // 启动 MJPEG-over-HTTP 流媒体服务器
         //   - MJPEG 模式：摄像头硬件直出 JPEG，零拷贝推流
         //   - YUYV 模式：libjpeg-turbo 软件编码后推流

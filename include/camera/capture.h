@@ -207,6 +207,12 @@ public:
     static constexpr uint32_t V4L2_PIX_FMT_MJPEG = 0x47504A4D;
     static constexpr uint32_t V4L2_PIX_FMT_RGB24 = 0x00000001;
 
+    /** @brief V4L2 控制 ID 常量（来自 linux/videodev2.h） */
+    static constexpr uint32_t V4L2_CID_BRIGHTNESS               = 0x00980900;
+    static constexpr uint32_t V4L2_CID_CONTRAST                 = 0x00980901;
+    static constexpr uint32_t V4L2_CID_AUTO_WHITE_BALANCE       = 0x0098090C;
+    static constexpr uint32_t V4L2_CID_WHITE_BALANCE_TEMPERATURE = 0x0098090A;
+
 private:
     // ============================================================
     // 内部实现

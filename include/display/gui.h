@@ -11,6 +11,9 @@
 #include <QStackedWidget>
 #include <QGroupBox>
 #include <QStatusBar>
+#include <QDialog>
+#include <QSlider>
+#include <QCheckBox>
 #include <cstdint>
 
 #include "include/common/types.h"
@@ -61,12 +64,20 @@ public:
     using CallbackIntInt = std::function<void(int, int)>;
     using CallbackFormat = std::function<void(PixelFormat)>;
     using CallbackString = std::function<void(const std::string&)>;
+    using CallbackCameraControl = std::function<void(int cid, int value)>;
 
     void onCaptureRequest(CallbackVoid cb);
     void onRecordToggle(std::function<bool(bool)> cb);  // 回调返回 true=成功, false=拒绝
     void onResolutionChanged(CallbackIntInt cb);  // (w, h)
     void onFormatChanged(CallbackFormat cb);
     void onStoragePathChanged(CallbackString cb);  // 存储路径变更
+    void onCameraControlChanged(CallbackCameraControl cb);  // 相机控制参数变更
+
+    // ---- 相机控制参数范围设置 ----
+    void setBrightnessRange(int min, int max, int step, int value);
+    void setContrastRange(int min, int max, int step, int value);
+    void setWhiteBalanceRange(int min, int max, int step, int value);
+    void setAutoWhiteBalance(bool enabled);
 
     // ---- 相册集成 ----
     void setGalleryStorage(StorageManager* storage);
@@ -90,9 +101,15 @@ private slots:
     void onFormatComboChanged(int index);
     void onBackFromGallery();  // 新增：从相册返回
     void onStorageComboChanged(int index);  // 新增：存储路径切换
+    void onBrightnessChanged(int value);
+    void onContrastChanged(int value);
+    void onAutoWbChanged(int state);
+    void onWbChanged(int value);
+    void onResetDefaults();
 
 private:
     void buildUI();
+    void buildSettingsDialog();
     void connectSignals();
     void enterMockMode();        // 无摄像头时使用模拟帧
     QImage frameToQImage(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
@@ -105,10 +122,6 @@ private:
     QPushButton*    m_btnRecord      = nullptr;   // 录像（toggle）
     QPushButton*    m_btnSettings    = nullptr;   // 设置
     QPushButton*    m_btnGallery     = nullptr;   // 相册
-    QComboBox*      m_resolutionCombo = nullptr;  // 分辨率选择
-    QComboBox*      m_formatCombo    = nullptr;   // 格式选择 (YUV/MJPEG)
-    QComboBox*      m_storageCombo   = nullptr;   // 存储路径选择 (tmpfs/eMMC)
-    QWidget*        m_settingsPanel  = nullptr;   // 设置面板容器（可展开/收起）
     PhotoGallery*   m_gallery        = nullptr;   // 相册组件
 
     // 状态栏
@@ -120,11 +133,35 @@ private:
     // 定时器
     QTimer*      m_refreshTimer   = nullptr;
 
+    // ====== 设置对话框 ======
+    QDialog*     m_settingsDialog  = nullptr;
+    QComboBox*   m_resolutionCombo = nullptr;  // 分辨率选择（在对话框中）
+    QComboBox*   m_formatCombo     = nullptr;  // 格式选择（在对话框中）
+    QComboBox*   m_storageCombo    = nullptr;  // 存储路径选择（在对话框中）
+    QSlider*     m_brightnessSlider = nullptr;
+    QLabel*      m_brightnessValue  = nullptr;
+    QSlider*     m_contrastSlider   = nullptr;
+    QLabel*      m_contrastValue    = nullptr;
+    QSlider*     m_wbSlider         = nullptr;
+    QLabel*      m_wbValueLabel     = nullptr;
+    QCheckBox*   m_autoWbCheckBox   = nullptr;
+    QPushButton* m_btnResetDefaults = nullptr;
+
     // ====== 数据 ======
     FrameBuffer  m_currentFrame;
     std::vector<uint8_t> m_frameBuffer;  // 内部帧数据拷贝（避免指针悬垂）
     bool         m_isRecording    = false;
     bool         m_mockMode       = false;
+
+    // 相机控制参数范围信息（用于重置默认值）
+    struct ControlInfo {
+        int min = 0, max = 100, step = 1, def = 0, current = 0;
+    };
+    ControlInfo m_brightnessInfo;
+    ControlInfo m_contrastInfo;
+    ControlInfo m_wbInfo;
+    bool        m_autoWbDefault       = true;
+    bool        m_cameraControlsAvailable = false;
 
     // 回调
     CallbackVoid        m_onCapture;
@@ -132,6 +169,7 @@ private:
     CallbackIntInt      m_onResolutionChanged;
     CallbackFormat      m_onFormatChanged;
     CallbackString      m_onStoragePathChanged;
+    CallbackCameraControl m_onCameraControl;
 
     // ---- 模拟器 ----
     int         m_mockFrameIndex = 0;
