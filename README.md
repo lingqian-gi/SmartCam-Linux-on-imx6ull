@@ -281,6 +281,7 @@ SmartCam-Linux-on-imx6ull/
 │   ├── 08-rtsp-module-implementation.md
 │   ├── 09-gallery-module-implementation.md
 │   ├── 10-settings-panel-implementation.md
+│   ├── 11-framerate-control-implementation.md
 │   ├── debug-summary.md
 │   ├── plan-gallery-module.md
 │   └── 求职项目-智能相机流媒体系统.md
