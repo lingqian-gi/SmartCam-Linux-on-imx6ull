@@ -54,6 +54,7 @@ endif()
 set(CAMERA_SOURCES
     src/camera/capture.cpp
     src/camera/processor.cpp
+    src/camera/processor_neon.cpp
     include/camera/capture.h
     include/camera/processor.h
 )

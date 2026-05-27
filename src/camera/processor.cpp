@@ -64,6 +64,14 @@ int VideoProcessor::findJPEGFrame(const uint8_t* data, int len,
 
 void VideoProcessor::yuyvToRgb24(const uint8_t* yuyv, uint8_t* rgb,
                                   int w, int h) {
+#ifdef __ARM_NEON
+    // ARM 平台: 使用 NEON SIMD 加速（外部链接到 processor_neon.cpp）
+    extern void yuyv_to_rgb24_neon(const uint8_t*, uint8_t*, int, int);
+    yuyv_to_rgb24_neon(yuyv, rgb, w, h);
+    return;
+#endif
+
+    // x86 / 无 NEON 退路: 标量 C++ 实现
     const int pixels = w * h;
     int di = 0;
     for (int i = 0; i < pixels; i += 2) {

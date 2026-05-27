@@ -152,10 +152,18 @@ private:
  * @param h     高 (像素)
  */
 inline void yuyv_to_rgb24(const uint8_t* yuyv, uint8_t* rgb, int w, int h) {
+#ifdef __ARM_NEON
+    // ARM 平台: 使用 NEON SIMD 加速 (processor_neon.cpp)
+    extern void yuyv_to_rgb24_neon(const uint8_t*, uint8_t*, int, int);
+    yuyv_to_rgb24_neon(yuyv, rgb, w, h);
+    return;
+#endif
+
+    // x86 / 无 NEON 退路: 标量 C++ 实现
     const int pixels = w * h;
-    int di = 0;  // rgb 写入索引
+    int di = 0;
     for (int i = 0; i < pixels; i += 2) {
-        int si = i * 2;   // yuyv 中每2像素=4字节
+        int si = i * 2;
         int y0 = yuyv[si];
         int u  = yuyv[si + 1] - 128;
         int y1 = yuyv[si + 2];
@@ -166,9 +174,9 @@ inline void yuyv_to_rgb24(const uint8_t* yuyv, uint8_t* rgb, int w, int h) {
             return static_cast<uint8_t>(x < 0 ? 0 : (x > 255 ? 255 : x));
         };
 
-        int r0 = y0 + ((v * 359) >> 8);              // 1.402 ≈ 359/256
-        int g0 = y0 - ((u * 88) >> 8) - ((v * 183) >> 8); // 0.344≈88/256, 0.714≈183/256
-        int b0 = y0 + ((u * 454) >> 8);              // 1.772 ≈ 454/256
+        int r0 = y0 + ((v * 359) >> 8);
+        int g0 = y0 - ((u * 88) >> 8) - ((v * 183) >> 8);
+        int b0 = y0 + ((u * 454) >> 8);
 
         int r1 = y1 + ((v * 359) >> 8);
         int g1 = y1 - ((u * 88) >> 8) - ((v * 183) >> 8);

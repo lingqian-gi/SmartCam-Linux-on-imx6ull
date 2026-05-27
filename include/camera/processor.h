@@ -68,6 +68,17 @@ public:
     static void yuyvToRgb24(const uint8_t* yuyv, uint8_t* rgb, int w, int h);
 
     /**
+     * @brief YUYV 4:2:2 → RGB24（ARM NEON 加速版）
+     *
+     * 使用 Cortex-A7 NEON 128-bit SIMD 指令，一次处理 16 像素。
+     * 仅在 __ARM_NEON 定义时可用，否则退化为 yuyvToRgb24 标量版本。
+     * 对最终 RGB 数据无任何影响——仅加速转换过程。
+     */
+#ifdef __ARM_NEON
+    static void yuyvToRgb24Neon(const uint8_t* yuyv, uint8_t* rgb, int w, int h);
+#endif
+
+    /**
      * @brief YUYV 4:2:2 → RGB565（适配 16-bit LCD framebuffer）
      *
      * 输出为小端字节序，每像素 2 字节:
