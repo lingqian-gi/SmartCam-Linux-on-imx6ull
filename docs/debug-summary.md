@@ -352,12 +352,12 @@ git pull
 
 ---
 
-## 13. sysroot 交叉编译：cmake/Qt5 工具链四重连环坑 ✅ 已解决
+## 13. sysroot 交叉编译：cmake/Qt5 工具链连环坑 ✅ 已解决
 
 | 属性 | 值 |
 |------|-----|
 | **模块** | `Dockerfile.arm-sysroot` / `scripts/cross-build.sh` / cmake 配置 |
-| **现象** | `./scripts/sysroot-setup.sh` 依次报 4 个不同错误，每个错误修复后暴露下一个 |
+| **现象** | `./scripts/sysroot-setup.sh` 依次报多个不同错误，每个错误修复后暴露下一个 |
 | **严重程度** | ❌ 严重 — 编译完全中断 |
 
 ---
@@ -368,49 +368,62 @@ sysroot 交叉编译方案在上节已设计完毕，但实际执行过程中遇
 
 ---
 
-### 坑 1：`qmake` 符号链接断裂（cmake configure 阶段）
+### 坑 1：`qmake` 符号链接断裂 → CMake configure 失败
 
 **错误信息：**
 
 ```
-Call Stack (most recent call first):
-  npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/Qt5CoreConfigExtras.cmake:6 (_qt5_Core_check_file_exists)
-  ...
-  CMakeLists.txt:27 (find_package)
-
--- Configuring incomplete, errors occurred!
+The imported target "Qt5::Core" references the file
+  "/workspace/npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake"
+but this file does not exist.
 ```
 
 **根因：**
 
-解压 sysroot 后，`npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake` 是一个符号链接，指向 `../../../../bin/arm-linux-gnueabihf-qmake`，解析后为 `npi-sysroot/usr/bin/arm-linux-gnueabihf-qmake`，该文件**不存在**。
+sysroot 中 `qmake` 的软链接指向了未被导出的目录：
 
-CMake `find_package(Qt5)` 加载 `Qt5CoreConfigExtras.cmake`，其中 `_qt5_Core_check_file_exists()` 对 qmake 路径做 `if(NOT EXISTS)` 检查，文件不存在则 FATAL_ERROR。
+```
+npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake
+  → ../../../../bin/arm-linux-gnueabihf-qmake
+  → npi-sysroot/usr/bin/arm-linux-gnueabihf-qmake  ← 不存在！
+```
 
-实际可用的 qmake 二进制位于 `npi-sysroot/usr/lib/qt5/bin/qmake`（ARM 版，和 moc/rcc 放在同一目录）。
+导出 sysroot 的脚本（`sysroot-from-board.sh`）只捕获了 `/lib`、`/usr/lib`、`/usr/include` 等，**没有导出 `/usr/bin/`**。对比 `moc`/`rcc`/`uic` 的链接指向 `../../../qt5/bin/...`（在 `/usr/lib/` 下），均正常。
+
+CMake `find_package(Qt5)` 加载 `Qt5CoreConfigExtras.cmake`，其中 `_qt5_Core_check_file_exists()` 检查 `qmake` 是否存在，文件不存在则 FATAL_ERROR。
 
 **修复：**
 
+在 `cross-build.sh` 中检测并修复断链，重定向到宿主 `qmake`：
+
 ```bash
-cd npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/
-rm -f qmake
-ln -s ../../../qt5/bin/qmake qmake   # 指向正确路径
+QMAKE_SYMLINK="$SYSROOT/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake"
+if [ -L "$QMAKE_SYMLINK" ] && [ ! -e "$QMAKE_SYMLINK" ]; then
+    rm -f "$QMAKE_SYMLINK"
+    ln -s "$HOST_QMAKE" "$QMAKE_SYMLINK"
+fi
 ```
 
 ---
 
-### 坑 2：ARM 版 `moc` 需要 qemu 执行（make 阶段）
+### 坑 2：ARM 版 `moc` 通过 qemu-arm 执行 → 失败（make 阶段）
 
 **错误信息：**
 
 ```
+/workspace/npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/moc ...
+
+Output
+------
 qemu-arm: Could not open '/lib/ld-linux-armhf.so.3': No such file or directory
-make[2]: *** [CMakeFiles/smartcam_autogen.dir/build.make:71: ...] Error 1
+make[2]: *** [CMakeFiles/smartcam_autogen.dir/build.make:58: ...] Error 1
 ```
 
 **根因：**
 
-CMake 的 AUTOMOC 在编译期需要运行 `moc` 来解析头文件生成 `moc_*.cpp`。但 sysroot 中的 `moc` 是 ARM 二进制，qemu 能找到 `moc` 文件本身，却找不到 ARM 的动态链接器 `ld-linux-armhf.so.3` —— qemu 默认在宿主 `/lib` 下寻找，而不是 sysroot 里。
+解决了坑 1 后，CMake configure 通过，进入 make 阶段。AUTOMOC 调用 `moc`，但 sysroot 中的 `moc` 是 ARM 二进制，宿主内核通过 `binfmt_misc` 用 `qemu-arm` 模拟执行，却找不到 ARM 动态链接器 `/lib/ld-linux-armhf.so.3`（qemu 默认在宿主 `/lib` 下寻找，而非 sysroot）。
+
+> **注**：此时调用的 moc 路径仍然指向 sysroot 中的 ARM 二进制。仅靠替换软链接不足以解决——见坑 5。
 
 **初步尝试：**
 
@@ -485,7 +498,118 @@ set(imported_location "${_qt5Widgets_install_prefix}/lib/qt5/bin/uic")
 
 最初的 `cross-build.sh` sed 模式写的是 `qt5/bin/moc` 等字符串，**完全不匹配**上面的 `/usr/bin/moc` 或变量引用形式，patch 静默失效。
 
----
+
+### 坑 5：`_qt5Core_install_prefix` 动态路径拼接 → CMake 始终找到 ARM 二进制
+
+**错误信息（与前文 qemu-arm 相同，但原因更深层）：**
+
+```
+Command
+-------
+/workspace/npi-sysroot/usr/lib/qt5/bin/moc -I/workspace/ ...
+
+Output
+------
+qemu-arm: Could not open '/lib/ld-linux-armhf.so.3': No such file or directory
+```
+
+> 这个错误在修复坑 1~4 后依然存在。即使 sed patch 正确匹配了 `/usr/bin/moc` 并替换为 `/usr/lib/qt5/bin/moc`，make 阶段 AUTOMOC 调用的仍然是 ARM 二进制。
+
+**根因：CMake 通过 `_qt5Core_install_prefix` 动态推导工具路径**
+
+`Qt5CoreConfig.cmake` 第 9–14 行（位于 `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/`）计算安装前缀：
+
+```cmake
+get_filename_component(_realCurr "${_IMPORT_PREFIX}" REALPATH)
+get_filename_component(_realOrig "/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core" REALPATH)
+if(_realCurr STREQUAL _realOrig)
+    get_filename_component(_qt5Core_install_prefix "/usr/lib/arm-linux-gnueabihf/../../" ABSOLUTE)
+else()
+    # 在 sysroot 中，CMAKE_CURRENT_LIST_DIR ≠ /usr，走这个分支
+    get_filename_component(_qt5Core_install_prefix
+        "${CMAKE_CURRENT_LIST_DIR}/../../../../" ABSOLUTE)
+endif()
+```
+
+推导过程：
+
+```
+CMAKE_CURRENT_LIST_DIR = /workspace/npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core
+
+_qt5Core_install_prefix = CMAKE_CURRENT_LIST_DIR / ../../.. / ..
+                        = /workspace/npi-sysroot/usr/
+```
+
+然后 `Qt5CoreConfigExtras.cmake` 第 16 行用它拼接 moc 路径：
+
+```cmake
+set(imported_location "${_qt5Core_install_prefix}/lib/qt5/bin/moc")
+# = /workspace/npi-sysroot/usr/lib/qt5/bin/moc  ← ARM ELF 二进制！
+```
+
+**这就是核心问题**：无论我们在 `arm-linux-gnueabihf/qt5/bin/` 目录下如何改软链接，CMake 最终找到的是 **`sysroot/usr/lib/qt5/bin/moc`**——这是从开发板导出的真实 ARM ELF 可执行文件，不是软链接！
+
+```
+sysroot/usr/lib/qt5/bin/moc (ARM ELF) → binfmt_misc → qemu-arm → 失败 (缺 ld-linux-armhf.so.3)
+```
+
+**为什么 `-DQt5Core_MOC_EXECUTABLE` 也不生效？**
+
+CMake 的 AUTOMOC 使用 `Qt5::moc` **IMPORTED 目标**（`Qt5CoreConfigExtras.cmake` 第 14 行）：
+
+```cmake
+add_executable(Qt5::moc IMPORTED)
+set(imported_location "${_qt5Core_install_prefix}/lib/qt5/bin/moc")
+set_target_properties(Qt5::moc PROPERTIES
+    IMPORTED_LOCATION ${imported_location}
+)
+```
+
+`-DQt5Core_MOC_EXECUTABLE=/usr/lib/qt5/bin/moc` 设置的是 CMake **缓存变量**，但 AUTOMOC 的 make 规则读取的是 `Qt5::moc` 目标的 `IMPORTED_LOCATION` **属性**，该属性已在 `Qt5CoreConfigExtras.cmake` 中被硬编码为 sysroot 路径，**不会被同名 CMake 变量覆盖**。
+
+**为什么必须两处都替换？**
+
+| 位置 | 内容 | CMake 是否使用 |
+|------|------|:---:|
+| `sysroot/usr/lib/qt5/bin/moc` | 真实 ARM ELF 二进制 | ✅ 是，通过 `_qt5Core_install_prefix` 拼接 |
+| `sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/moc` | 软链接 → 上面的 ARM 二进制 | 兜底路径 |
+
+即使把第二个位置的软链接改为指向宿主工具，CMake 直接拼接出的 `sysroot/usr/lib/qt5/bin/moc` 仍然是 ARM 二进制。**必须两个位置都替换**为指向宿主 x86_64 的软链接。
+
+**修复：**
+
+```bash
+# cross-build.sh 中同时对两个目录执行替换
+for tool in moc rcc uic qmake; do
+    for dir in \
+        "$SYSROOT/usr/lib/qt5/bin" \                    # ← CMake 实际拼接的路径
+        "$SYSROOT/usr/lib/arm-linux-gnueabihf/qt5/bin"; do  # ← 原软链接目录（兜底）
+        rm -f "$dir/$tool"
+        ln -s "/usr/lib/qt5/bin/$tool" "$dir/$tool"  # → 宿主 x86_64
+    done
+done
+```
+
+替换后的路径解析：
+
+```
+CMake 查找: sysroot/usr/lib/qt5/bin/moc
+  → 软链接 → /usr/lib/qt5/bin/moc (x86_64 宿主二进制)
+  → 直接在本机执行 ✓
+```
+
+**对最终 ARM 程序的影响：完全无影响**
+
+`moc`/`rcc`/`uic`/`qmake` 是**代码生成器**，仅在编译期间运行，不参与最终链接：
+
+| 工具 | 输入 | 输出 | 是否链接到产物 |
+|------|------|------|:---:|
+| `moc` | `.h` (含 Q_OBJECT) | `moc_xxx.cpp`（C++ 文本） | ❌ |
+| `rcc` | `.qrc` (资源) | `qrc_xxx.cpp`（C++ 文本） | ❌ |
+| `uic` | `.ui` (界面 XML) | `ui_xxx.h`（C++ 文本） | ❌ |
+| `qmake` | `.pro` | `Makefile`（构建配置） | ❌ |
+
+最终由 `arm-linux-gnueabihf-g++` 编译所有源码 + 链接 sysroot 中的 ARM 库 → 产物仍是 ARM ELF。
 
 ### 最终完整解决方案
 
@@ -536,29 +660,53 @@ _qt5_Widgets_check_file_exists(${imported_location}) # ✓ 文件存在，检查
 
 这样 CMake 的 AUTOMOC/AUTOUIC/AUTORCC 会调用 x86 版工具，直接在本机运行，无需 qemu 模拟 ARM。
 
-#### 4) 环境变量
+**但仅靠 sed patch 不够！** 因为 CMake 通过 `_qt5Core_install_prefix` 动态拼接出 `sysroot/usr/lib/qt5/bin/moc`（ARM 二进制），sed 改的是 `/usr/bin/moc`，这个路径不是 CMake 最终使用的路径。必须同时做第 4 步。
+
+#### 4) 替换 sysroot 中 Qt5 工具为宿主 x86_64 版本（关键步骤）
+
+sysroot 中 `usr/lib/qt5/bin/{moc,rcc,uic,qmake}` 均为 ARM ELF 二进制。**必须全部替换**为指向宿主 x86_64 工具的软链接：
+
+```bash
+# 两处目录都要替换：
+#   ① sysroot/usr/lib/qt5/bin/          ← CMake _qt5Core_install_prefix 实际拼接的路径
+#   ② sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/  ← 原始软链接目录（兜底）
+for tool in moc rcc uic qmake; do
+    for dir in \
+        "$SYSROOT/usr/lib/qt5/bin" \
+        "$SYSROOT/usr/lib/arm-linux-gnueabihf/qt5/bin"; do
+        rm -f "$dir/$tool"
+        ln -s "/usr/lib/qt5/bin/$tool" "$dir/$tool"
+    done
+done
+```
+
+> **为什么必须两处都替换？**
+>
+> CMake 通过 `_qt5Core_install_prefix` 动态拼接为 `sysroot/usr/lib/qt5/bin/moc`（目录 ①），
+> 但 `arm-linux-gnueabihf/qt5/bin/moc`（目录 ②）是原软链接位置，某些路径解析也可能用到。两处都替换最安全。
+
+#### 5) 环境变量
 
 ```dockerfile
 ENV QT_SELECT=5    # 确保 qtchooser 选择 Qt5（备用，实际已 bypass qtchooser）
 ```
 
-#### 5) 完整调用链
+#### 6) 完整调用链
 
-```mermaid
-graph TD
-    A[sysroot-setup.sh] --> B[合并分包 → npi-sysroot/]
-    B --> C[docker build Dockerfile.arm-sysroot]
-    C --> D[docker run -v pwd:/workspace cross-build.sh]
-    D --> E[patch Qt5CoreConfigExtras.cmake<br>/usr/bin/moc → /usr/lib/qt5/bin/moc]
-    D --> F[patch Qt5WidgetsConfigExtras.cmake<br>uic 路径 → /usr/lib/qt5/bin/uic]
-    E --> G[cmake -DCMAKE_SYSROOT=...]
-    F --> G
-    G --> H[AUTOMOC 调用宿主 x86 moc]
-    H --> I[make -j nproc]
-    I --> J[build/arm/smartcam<br>ARM 32-bit, glibc 2.28]
+```
+sysroot-setup.sh
+  ├──[1/3] 合并分包 → npi-sysroot/
+  ├──[2/3] docker build Dockerfile.arm-sysroot
+  └──[3/3] docker run → cross-build.sh
+              ├── patch Qt5CoreConfigExtras.cmake  (/usr/bin/moc → /usr/lib/qt5/bin/moc)
+              ├── patch Qt5WidgetsConfigExtras.cmake (uic 路径)
+              ├── 替换 sysroot 两处目录的 ARM Qt5 工具 → 宿主 x86_64
+              ├── cmake -DCMAKE_SYSROOT=npi-sysroot -DCMAKE_TOOLCHAIN_FILE=...
+              └── make -j$(nproc)
+                    └── AUTOMOC 调用宿主 x86 moc ✓
 ```
 
-#### 6) 产物验证
+#### 7) 产物验证
 
 ```bash
 file build/arm/smartcam
@@ -575,13 +723,16 @@ arm-linux-gnueabihf-readelf -d build/arm/smartcam | grep NEEDED
 
 | 文件 | 角色 |
 |------|------|
-| `Dockerfile.arm-sysroot` | Docker 镜像定义，选型 debian:buster + qtbase5-dev |
-| `scripts/cross-build.sh` | 构建入口，包含 cmake 配置 patch + cmake + make 全流程 |
+| `Dockerfile.arm-sysroot` | Docker 镜像定义，选型 `debian:buster` + `qtbase5-dev` |
+| `scripts/cross-build.sh` | 构建入口，含 cmake 配置 patch + **两处 ARM 工具替换** + cmake/make 全流程 |
 | `configs/toolchain.arm.cmake` | 交叉编译工具链文件，支持 `CMAKE_SYSROOT` |
 | `scripts/sysroot-setup.sh` | 顶层脚本，组装 sysroot + 触发 Docker 构建 |
-| `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/Qt5CoreConfigExtras.cmake` | **被 patch 的文件**（qmake/moc/rcc 路径） |
-| `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Widgets/Qt5WidgetsConfigExtras.cmake` | **被 patch 的文件**（uic 路径） |
-| `npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake` | **被修复的符号链接**（初始状态断裂） |
+| `CMakeLists.txt` | 目标编译选项中添加 `-static-libstdc++ -static-libgcc` |
+| `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/Qt5CoreConfigExtras.cmake` | **被 patch 的文件** — moc/rcc/qmake 的 `IMPORTED_LOCATION` 和 `_qt5_Core_check_file_exists` |
+| `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/Qt5CoreConfig.cmake` | moc 路径来源 — `_qt5Core_install_prefix` 推导逻辑（路径动态拼接的根因） |
+| `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Widgets/Qt5WidgetsConfigExtras.cmake` | **被 patch 的文件** — uic 的 `IMPORTED_LOCATION` |
+| `npi-sysroot/usr/lib/qt5/bin/` | **被替换的目录** — ARM Qt5 工具 (moc/rcc/uic/qmake) → 宿主 x86_64 软链接 |
+| `npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/` | **被替换的目录** — 原始软链接位置，也替换为宿主 x86_64 |
 
 ---
 
