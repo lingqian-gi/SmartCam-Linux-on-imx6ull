@@ -551,6 +551,19 @@ int CameraCapture::unmapBuffers() {
     m_buffers  = nullptr;
     m_nbuffers = 0;
 
+    // 释放 V4L2 驱动侧缓冲区资源，否则后续 VIDIOC_S_FMT 会返回 EBUSY
+    if (m_fd >= 0) {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count  = 0;
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(m_fd, VIDIOC_REQBUFS, &req) < 0) {
+            LOG_WRN("VIDIOC_REQBUFS(0) failed: %s", strerror(errno));
+        }
+    }
+
     return 0;
 }
 
