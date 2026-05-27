@@ -30,6 +30,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <cstring>
 #include <arpa/inet.h>
@@ -55,6 +56,10 @@ struct CaptureState {
     PixelFormat             format = PixelFormat::FMT_RGB24;
     double                  fps    = 0.0;
     std::atomic<bool>       running{false};
+    std::atomic<bool>       paused{false};   // 暂停采集（分辨率/格式切换等需要）
+    std::mutex              pauseMtx;        // 暂停同步锁
+    std::condition_variable pauseCv;         // 暂停同步条件变量
+    std::atomic<bool>       pausedAck{false}; // 采集线程已确认暂停
 };
 static CaptureState g_state;
 
@@ -473,6 +478,16 @@ int main(int argc, char* argv[]) {
             FrameBuffer fb;
 
             while (g_state.running) {
+                // 暂停期间等待恢复（分辨率/格式切换中）
+                if (g_state.paused) {
+                    g_state.pausedAck = true;
+                    g_state.pauseCv.notify_one();
+                    std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+                    g_state.pauseCv.wait(lk, [] { return !g_state.paused.load(); });
+                    continue;
+                }
+                g_state.pausedAck = false;
+
                 if (capture->getFrame(&fb, 1000) < 0) {
                     if (!g_state.running) break;
                     continue;  // 超时重试
@@ -566,25 +581,62 @@ int main(int argc, char* argv[]) {
         // 连接回调：分辨率/格式变更 → 重新配置摄像头
         // ============================================================
         gui.onResolutionChanged([capture](int w, int h) {
-            if (capture->isStreaming()) {
-                capture->stopCapture();
-                capture->setFormat(w, h, capture->getCurrentFormat());
-                capture->startCapture();
-                LOG_INF("Resolution changed to %dx%d", w, h);
+            if (!capture->isStreaming()) return;
+
+            // 1. 暂停采集线程，防止 stopCapture 时采集线程还在使用 mmap 缓冲区
+            g_state.paused = true;
+            // 等待采集线程确认暂停（getFrame 有 1s 超时，最多等 1.1s）
+            {
+                std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+                g_state.pauseCv.wait_until(lk,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+                    [] { return g_state.pausedAck.load(); });
             }
+
+            // 2. 安全停止采集、切换格式、重启
+            capture->stopCapture();
+            int ret = capture->setFormat(w, h, capture->getCurrentFormat());
+            if (ret < 0) {
+                LOG_ERR_("setFormat(%dx%d) failed (ret=%d), reverting to 640x480",
+                          w, h, ret);
+                capture->setFormat(640, 480, capture->getCurrentFormat());
+            }
+            capture->startCapture();
+
+            // 3. 恢复采集线程
+            g_state.paused = false;
+            g_state.pauseCv.notify_one();
+            LOG_INF("Resolution changed to %dx%d", w, h);
         });
 
         gui.onFormatChanged([capture, device](PixelFormat fmt) {
+            if (!capture->isStreaming()) return;
+
             uint32_t v4l2fmt = (fmt == PixelFormat::FMT_YUYV)
                                    ? CameraCapture::V4L2_PIX_FMT_YUYV
                                    : CameraCapture::V4L2_PIX_FMT_MJPEG;
-            if (capture->isStreaming()) {
-                capture->stopCapture();
-                capture->setFormat(640, 480, v4l2fmt);
-                capture->startCapture();
-                LOG_INF("Format changed to %s",
-                         (fmt == PixelFormat::FMT_YUYV) ? "YUYV" : "MJPEG");
+
+            // 暂停采集线程，防止竞态
+            g_state.paused = true;
+            {
+                std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+                g_state.pauseCv.wait_until(lk,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+                    [] { return g_state.pausedAck.load(); });
             }
+
+            capture->stopCapture();
+            int ret = capture->setFormat(640, 480, v4l2fmt);
+            if (ret < 0) {
+                LOG_ERR_("setFormat(640x480, %s) failed (ret=%d)",
+                          (fmt == PixelFormat::FMT_YUYV) ? "YUYV" : "MJPEG", ret);
+            }
+            capture->startCapture();
+
+            g_state.paused = false;
+            g_state.pauseCv.notify_one();
+            LOG_INF("Format changed to %s",
+                     (fmt == PixelFormat::FMT_YUYV) ? "YUYV" : "MJPEG");
         });
 
         gui.onCaptureRequest([capture]() {

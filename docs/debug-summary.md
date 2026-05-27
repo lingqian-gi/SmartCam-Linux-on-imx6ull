@@ -582,3 +582,123 @@ arm-linux-gnueabihf-readelf -d build/arm/smartcam | grep NEEDED
 | `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Core/Qt5CoreConfigExtras.cmake` | **被 patch 的文件**（qmake/moc/rcc 路径） |
 | `npi-sysroot/usr/lib/arm-linux-gnueabihf/cmake/Qt5Widgets/Qt5WidgetsConfigExtras.cmake` | **被 patch 的文件**（uic 路径） |
 | `npi-sysroot/usr/lib/arm-linux-gnueabihf/qt5/bin/qmake` | **被修复的符号链接**（初始状态断裂） |
+
+---
+
+## 14. 录像 AVI 文件损坏：movi 四字符被覆盖 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/storage/manager.cpp` — `finalizeAvi()` |
+| **现象** | 录像后打开 Gallery 报错，视频无法播放、无缩略图 |
+| **严重程度** | ❌ 严重 — 所有录制后的 AVI 文件均不可用 |
+
+---
+
+### 错误信息
+
+```
+[ERROR] manager.cpp:846 (extractAviThumbnail) extractAviThumbnail: expected movi LIST type, got ▒▒
+[VideoPlayer] Expected movi LIST, got "\xEC\xCE\n\x00"
+```
+
+两个独立的 AVI 解析器（`extractAviThumbnail` / `VideoPlayer::parseAviHeader`）在跳过 hdrl LIST 后，都无法在预期位置找到 movi LIST，读到的 4 个字节不是 `"movi"` (0x6D 0x6F 0x76 0x69)，而是乱码 `\xEC\xCE\x0A\x00`。
+
+---
+
+### 根因
+
+`finalizeAvi()` 回填 movi LIST 大小时，偏移量计算错误，**把 size 值写到了 `"movi"` FOURCC 的位置**。
+
+#### AVI 文件布局
+
+```
+... "LIST"(4) | size(4) | "movi"(4) | "00dc"(4) | size(4) | JPEG 数据 ...
+      offset   offset+4   offset+8   offset+12 = m_moviDataOffset
+```
+
+#### 错误代码
+
+```cpp
+// finalizeAvi()
+long moviSizePos = m_moviDataOffset - 4;   // ← offset+8，指向 "movi"
+fseek(fp, moviSizePos, SEEK_SET);
+writeU32(fp, static_cast<uint32_t>(moviSize));  // 把 "movi" 覆盖成 uint32 数值
+```
+
+`m_moviDataOffset` 是第一个帧的 `"00dc"` 位置（offset+12），减 4 得到 offset+8，正好是 `"movi"` FOURCC 的地址。`writeU32` 将 movi LIST 大小（如 725KB = 0x000ACEEC）以小端序写入，覆盖了 `"movi"`：
+
+```
+┌───────┬───────┬───────┬───────┐
+│  'm'  │  'o'  │  'v'  │  'i'  │  ← 原本的 "movi"
+│  0x6D │  0x6F │  0x76 │  0x69 │
+├───────┼───────┼───────┼───────┤
+│  0xEC │  0xCE │  0x0A │  0x00 │  ← 被覆盖成 0x000ACEEC
+│   'ì'  │   'Î'  │  '\n' │  NUL  │
+└───────┴───────┴───────┴───────┘
+```
+
+这就是为何错误信息中显示 `\xEC\xCE\x0A\x00` — 它其实是 movi LIST 的 size 数值。
+
+同时，正确的 size 字段位置（offset+4）从未被回填，保留了初始值 0，导致 `VideoPlayer::parseAviHeader` 后续跳帧到 idx1 的逻辑也失效。
+
+---
+
+### 修复
+
+#### 修复 1：moviSizePos 偏移更正（核心修复）
+
+```cpp
+// 修复前
+long moviSizePos = m_moviDataOffset - 4;  // → "movi"，错误！
+
+// 修复后
+long moviSizePos = m_moviDataOffset - 8;  // → size 字段，正确！
+```
+
+```
+... "LIST"(4) | size(4) | "movi"(4) | "00dc" ...
+         ↑          ↑
+      offset+4   offset+8 = m_moviDataOffset - 8 ✓
+```
+
+#### 修复 2：帧数据 WORD 对齐填充
+
+RIFF 规范要求所有 chunk 数据 2 字节对齐。当 JPEG 帧大小为奇数时，需要在数据后追加 1 字节 padding（不计入 chunk size）：
+
+```cpp
+// writeRecordFrame() — 写入帧数据后
+if (len % 2 != 0) {
+    uint8_t pad = 0;
+    fwrite(&pad, 1, 1, m_recordFile);
+}
+```
+
+此前缺失 padding 会导致后续 chunk 起始偏移为奇数，虽然本项目内用 idx1 索引 seek 不受影响，但不符合 RIFF 规范，外部播放器可能拒绝。
+
+#### 修复 3：idx1 `dwChunkLength` 规范修正
+
+```cpp
+// 修复前：包含了 chunk 头（"00dc" + size = 8 字节）
+idx.length = static_cast<uint32_t>(sizeof(AviFrameChunk) + len);
+
+// 修复后：按 RIFF idx1 规范，只记录帧数据大小
+idx.length = static_cast<uint32_t>(len);
+```
+
+`readFrameJpeg()` 不依赖 `dwChunkLength`（它直接从 chunk 头读取 size），所以不影响内部播放器，但修复后符合规范，兼容第三方工具。
+
+---
+
+### 影响范围
+
+- 修复前录制的 AVI 文件**已永久损坏**，"movi" FOURCC 已被覆盖无法恢复，需要删除后重新录制
+- 修复后新录制的 AVI 文件结构完全正确，Gallery 缩略图提取和视频播放均正常
+
+### 涉及文件
+
+| 文件 | 修改内容 |
+|------|----------|
+| `src/storage/manager.cpp:finalizeAvi()` | `m_moviDataOffset - 4` → `m_moviDataOffset - 8` |
+| `src/storage/manager.cpp:writeRecordFrame()` | 新增奇数帧 WORD 对齐 padding |
+| `src/storage/manager.cpp:writeRecordFrame()` | idx1 `dwChunkLength` = `len`（去除 chunk 头 8 字节） |
