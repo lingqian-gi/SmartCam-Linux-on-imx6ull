@@ -172,6 +172,17 @@ int main(int argc, char* argv[]) {
         ? cfg.getString("storage", "video_dir", "/data/videos")
         : "/tmp/smartcam/videos";
 
+    // 提取基础存储路径（去掉尾部的 /photos 或 /videos）
+    auto stripSuffix = [](std::string s, const std::string& suffix) -> std::string {
+        if (s.size() > suffix.size() &&
+            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return s.substr(0, s.size() - suffix.size());
+        }
+        return s;
+    };
+    std::string basePath = stripSuffix(photoDir, "/photos");
+    if (basePath.empty()) basePath = "/data";
+
     // 日志级别
     if (cfgLoaded) {
         std::string logLevel = cfg.getString("logging", "level", "info");
@@ -194,6 +205,35 @@ int main(int argc, char* argv[]) {
 
     // 绑定存储到相册组件
     gui.setGalleryStorage(&storage);
+
+    // 同步当前存储路径到 GUI（Settings 下拉框显示当前路径）
+    gui.setStoragePath(basePath);
+
+    // 存储路径变更回调（重启后生效：更新配置并保存，下次启动使用新路径）
+    gui.onStoragePathChanged([&cfg, &photoDir, &videoDir, &basePath](const std::string& path) {
+        // 更新内存中的路径变量
+        basePath = path;
+        photoDir = path + "/photos";
+        videoDir = path + "/videos";
+
+        // 更新 StorageManager 的路径（即时生效）
+        if (g_storage) {
+            g_storage->setPhotoDir(photoDir);
+            g_storage->setVideoDir(videoDir);
+        }
+
+        // 保存到配置文件（持久化）
+        cfg.setString("storage", "photo_dir", photoDir);
+        cfg.setString("storage", "video_dir", videoDir);
+        if (cfg.save()) {
+            LOG_INF("Storage path saved: %s", path.c_str());
+        } else {
+            LOG_WRN("Failed to save config — storage path may not persist after reboot");
+        }
+
+        LOG_INF("Storage path changed: photos=%s  videos=%s",
+                photoDir.c_str(), videoDir.c_str());
+    });
 
     // ---- 真实相机模式 ----
     CameraCapture*    capture      = nullptr;

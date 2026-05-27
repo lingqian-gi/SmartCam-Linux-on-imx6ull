@@ -256,11 +256,23 @@ void CameraGUI::buildUI() {
     m_resolutionCombo->setStyleSheet(comboStyle);
     m_formatCombo->setStyleSheet(comboStyle);
 
+    // 存储路径选择
+    auto* storageLabel = new QLabel(QStringLiteral("Store:"), this);
+    storageLabel->setStyleSheet(labelStyle);
+
+    m_storageCombo = new QComboBox(this);
+    m_storageCombo->addItem(QStringLiteral("Temporary (/data)"),     QString("/data"));
+    m_storageCombo->addItem(QStringLiteral("Persistent (eMMC)"),    QString("/home/debian/smartcam"));
+    m_storageCombo->setStyleSheet(comboStyle);
+
     settingsLayout->addWidget(resLabel);
     settingsLayout->addWidget(m_resolutionCombo);
     settingsLayout->addSpacing(16);
     settingsLayout->addWidget(fmtLabel);
     settingsLayout->addWidget(m_formatCombo);
+    settingsLayout->addSpacing(16);
+    settingsLayout->addWidget(storageLabel);
+    settingsLayout->addWidget(m_storageCombo);
     settingsLayout->addStretch();
     mainLayout->addWidget(m_settingsPanel);
 
@@ -285,6 +297,8 @@ void CameraGUI::connectSignals() {
             this, &CameraGUI::onResolutionComboChanged);
     connect(m_formatCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &CameraGUI::onFormatComboChanged);
+    connect(m_storageCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &CameraGUI::onStorageComboChanged);
 }
 
 // ============================================================
@@ -424,6 +438,12 @@ void CameraGUI::onFormatComboChanged(int index) {
     if (m_onFormatChanged) m_onFormatChanged(fmt);
 }
 
+void CameraGUI::onStorageComboChanged(int index) {
+    QString path = m_storageCombo->itemData(index).toString();
+    qDebug() << "[GUI] Storage path changed:" << path;
+    if (m_onStoragePathChanged) m_onStoragePathChanged(path.toStdString());
+}
+
 void CameraGUI::onGallery() {
     qDebug() << "[GUI] Gallery button clicked";
     if (m_gallery && m_mainStack->currentIndex() == 0) {
@@ -527,6 +547,22 @@ void CameraGUI::onCaptureRequest(CallbackVoid cb)       { m_onCapture = std::mov
 void CameraGUI::onRecordToggle(std::function<bool(bool)> cb) { m_onRecordToggle = std::move(cb); }
 void CameraGUI::onResolutionChanged(CallbackIntInt cb)  { m_onResolutionChanged = std::move(cb); }
 void CameraGUI::onFormatChanged(CallbackFormat cb)      { m_onFormatChanged = std::move(cb); }
+void CameraGUI::onStoragePathChanged(CallbackString cb) { m_onStoragePathChanged = std::move(cb); }
+
+void CameraGUI::setStoragePath(const std::string& path) {
+    if (!m_storageCombo) return;
+    // 查找匹配 path 的条目并选中
+    for (int i = 0; i < m_storageCombo->count(); ++i) {
+        if (m_storageCombo->itemData(i).toString().toStdString() == path) {
+            m_storageCombo->setCurrentIndex(i);
+            return;
+        }
+    }
+    // 如果没匹配到，添加自定义路径
+    m_storageCombo->addItem(QString::fromStdString(path),
+                            QString::fromStdString(path));
+    m_storageCombo->setCurrentIndex(m_storageCombo->count() - 1);
+}
 
 // ============================================================
 // Mock 模式 — 生成彩色竖条测试图

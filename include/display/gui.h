@@ -53,17 +53,20 @@ public:
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
+    void setStoragePath(const std::string& path);  // 同步存储路径到下拉框
 
     // ---- 回调注册（供主程序注入业务逻辑） ----
     using CallbackVoid   = std::function<void()>;
     using CallbackBool   = std::function<bool(bool)>;
     using CallbackIntInt = std::function<void(int, int)>;
     using CallbackFormat = std::function<void(PixelFormat)>;
+    using CallbackString = std::function<void(const std::string&)>;
 
     void onCaptureRequest(CallbackVoid cb);
     void onRecordToggle(std::function<bool(bool)> cb);  // 回调返回 true=成功, false=拒绝
     void onResolutionChanged(CallbackIntInt cb);  // (w, h)
     void onFormatChanged(CallbackFormat cb);
+    void onStoragePathChanged(CallbackString cb);  // 存储路径变更
 
     // ---- 相册集成 ----
     void setGalleryStorage(StorageManager* storage);
@@ -86,6 +89,7 @@ private slots:
     void onResolutionComboChanged(int index);
     void onFormatComboChanged(int index);
     void onBackFromGallery();  // 新增：从相册返回
+    void onStorageComboChanged(int index);  // 新增：存储路径切换
 
 private:
     void buildUI();
@@ -103,6 +107,7 @@ private:
     QPushButton*    m_btnGallery     = nullptr;   // 相册
     QComboBox*      m_resolutionCombo = nullptr;  // 分辨率选择
     QComboBox*      m_formatCombo    = nullptr;   // 格式选择 (YUV/MJPEG)
+    QComboBox*      m_storageCombo   = nullptr;   // 存储路径选择 (tmpfs/eMMC)
     QWidget*        m_settingsPanel  = nullptr;   // 设置面板容器（可展开/收起）
     PhotoGallery*   m_gallery        = nullptr;   // 相册组件
 
@@ -126,6 +131,7 @@ private:
     CallbackBool        m_onRecordToggle;
     CallbackIntInt      m_onResolutionChanged;
     CallbackFormat      m_onFormatChanged;
+    CallbackString      m_onStoragePathChanged;
 
     // ---- 模拟器 ----
     int         m_mockFrameIndex = 0;

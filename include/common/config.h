@@ -139,6 +139,47 @@ public:
         return secIt->second.find(key) != secIt->second.end();
     }
 
+    /** @brief 设置/修改字符串值（内存中） */
+    void setString(const std::string& section,
+                   const std::string& key,
+                   const std::string& value) {
+        m_data[section][key] = value;
+    }
+
+    /** @brief 将当前配置写回文件 */
+    bool save() const {
+        if (m_path.empty()) return false;
+
+        std::ofstream file(m_path);
+        if (!file.is_open()) return false;
+
+        for (const auto& sec : m_data) {
+            file << "[" << sec.first << "]\n";
+            for (const auto& kv : sec.second) {
+                file << kv.first << " = " << kv.second << "\n";
+            }
+            file << "\n";
+        }
+
+        return true;
+    }
+
+    /** @brief 保存到指定路径 */
+    bool saveAs(const std::string& path) const {
+        std::ofstream file(path);
+        if (!file.is_open()) return false;
+
+        for (const auto& sec : m_data) {
+            file << "[" << sec.first << "]\n";
+            for (const auto& kv : sec.second) {
+                file << kv.first << " = " << kv.second << "\n";
+            }
+            file << "\n";
+        }
+
+        return true;
+    }
+
 private:
     static std::string trim(const std::string& s) {
         size_t start = s.find_first_not_of(" \t\r\n");
