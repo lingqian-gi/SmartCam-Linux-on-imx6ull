@@ -1142,12 +1142,27 @@ rm -rf /tmp/smartcam/photos/*
 
 | 限制 | 说明 | 改进思路 |
 |------|------|----------|
+| ~~开发板重启后照片丢失~~ | ✅ **v0.5 已解决**：Settings 面板 Store 下拉框支持切换存储路径至 eMMC；系统级/用户级配置优先级 | - |
 | 缩略图一次性全部加载 | 媒体 > 100 条时首次加载较慢 | 虚拟滚动：只加载可见 ±1 屏的缩略图 |
 | 无幻灯片播放 | 无法自动轮播 | 添加 QTimer + Play 按钮 |
 | ~~视频无预览缩略图~~ | ✅ **v0.4 已解决**：`extractAviThumbnail()` 从 AVI 提取第一帧 JPEG | - |
 | ~~视频不支持播放~~ | ✅ **v0.4 已解决**：`VideoPlayer` 轻量 AVI 解码器 + QTimer 帧率控制 | - |
 | 无多选删除 | 每次只能删一张 | 全选/反选 + 批量删除 |
 | 无导出功能 | 无法拷贝到 USB | 添加 Export 按钮调用 shell 脚本 |
+
+### 15.1 重启后照片丢失问题 (v0.5)
+
+**现象**：程序关闭再启动后 Gallery 能看到照片，但重启开发板后照片消失。
+
+**根因**：`/data` 在 i.MX6ULL 开发板上是 tmpfs（内存文件系统），内容在断电/重启时丢失。照片虽写入 `/data/photos/YYYYMMDD/IMG_*.jpg`，但实际存在于 RAM 中，不是持久存储。
+
+**解决**：在 GUI Settings 面板新增 **Store** 下拉框，用户可选择：
+- **Temporary (/data)** — tmpfs，速度快但重启丢失
+- **Persistent (eMMC)** — `/home/debian/smartcam`，eMMC 持久化
+
+切换即时生效（`StorageManager::setPhotoDir()` / `setVideoDir()`），并自动保存到配置文件（`~/.config/smartcam/smartcam.conf`），重启后自动恢复。
+
+详见 `04-storage-module-implementation.md` 第十二节。
 
 ---
 
@@ -1157,4 +1172,5 @@ rm -rf /tmp/smartcam/photos/*
 |------|----------|
 | 2026-05-24 | 初始实现：StorageManager 扩展（listPhotos/deletePhoto/readJpegSize）、PhotoGallery 类、CameraGUI 集成、CMake 构建 |
 | 2026-05-24 | 修复编译错误：移除头文件中未实现的 `onThumbnailClicked()` slot 声明 |
-| 2026-05-26 | **v0.4**：视频缩略图 + 播放支持。新增 `extractAviThumbnail()` 从 AVI 提取第一帧 JPEG 作封面；新增 `VideoPlayer` 轻量 AVI 播放器；`PhotoGallery` 全屏集成视频播放
+| 2026-05-26 | **v0.4**：视频缩略图 + 播放支持。新增 `extractAviThumbnail()` 从 AVI 提取第一帧 JPEG 作封面；新增 `VideoPlayer` 轻量 AVI 播放器；`PhotoGallery` 全屏集成视频播放 |
+| 2026-05-27 | **v0.5**：Settings 面板增加 Store 下拉框（tmpfs/eMMC 存储路径切换）；ConfigManager 写支持；配置加载三级优先级；解决开发板重启后照片丢失问题 |

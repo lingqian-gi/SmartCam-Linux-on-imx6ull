@@ -25,6 +25,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 class ConfigManager {
 public:
@@ -164,8 +166,14 @@ public:
         return true;
     }
 
-    /** @brief 保存到指定路径 */
+    /** @brief 保存到指定路径（自动创建父目录） */
     bool saveAs(const std::string& path) const {
+        // 确保父目录存在
+        size_t slash = path.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            mkdirParents(path.substr(0, slash));
+        }
+
         std::ofstream file(path);
         if (!file.is_open()) return false;
 
@@ -186,6 +194,17 @@ private:
         if (start == std::string::npos) return "";
         size_t end = s.find_last_not_of(" \t\r\n");
         return s.substr(start, end - start + 1);
+    }
+
+    /** @brief 递归创建目录 (类似 mkdir -p) */
+    static void mkdirParents(const std::string& path) {
+        if (path.empty() || path == "/") return;
+        std::string parent = path;
+        size_t slash = parent.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            mkdirParents(parent.substr(0, slash));
+        }
+        mkdir(path.c_str(), 0755);  // 忽略 EEXIST 错误
     }
 
     std::string m_path;

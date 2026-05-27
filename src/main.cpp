@@ -131,14 +131,31 @@ int main(int argc, char* argv[]) {
 
     parser.process(app);
 
-    // ---- 加载配置文件 ----
+    // ---- 加载配置文件（优先级: 命令行 --config > ~/.config > /etc） ----
     ConfigManager cfg;
-    QString configPath = parser.value(configOpt);
+    QString configPath;
+    if (parser.isSet(configOpt)) {
+        // 用户明确指定了 --config，直接使用
+        configPath = parser.value(configOpt);
+    } else {
+        // 优先读用户级配置，不存在则用系统级
+        const char* home = getenv("HOME");
+        if (home) {
+            std::string userCfg = std::string(home) + "/.config/smartcam/smartcam.conf";
+            if (cfg.load(userCfg)) {
+                configPath = QString::fromStdString(userCfg);
+            }
+        }
+        if (configPath.isEmpty()) {
+            configPath = QStringLiteral("/etc/smartcam/smartcam.conf");
+        }
+    }
     bool cfgLoaded = cfg.load(configPath.toStdString());
     if (cfgLoaded) {
         LOG_INF("Configuration loaded: %s", configPath.toStdString().c_str());
     } else {
-        LOG_INF("No config file at %s, using defaults", configPath.toStdString().c_str());
+        LOG_INF("No config file at %s, using defaults",
+                configPath.isEmpty() ? "<none>" : configPath.toStdString().c_str());
     }
 
     // ---- 合并配置: 命令行 > 配置文件 > 硬编码默认值 ----
@@ -222,12 +239,25 @@ int main(int argc, char* argv[]) {
             g_storage->setVideoDir(videoDir);
         }
 
-        // 保存到配置文件（持久化）
+        // 保存到配置文件（持久化：优先原路径，失败则写用户目录）
         cfg.setString("storage", "photo_dir", photoDir);
         cfg.setString("storage", "video_dir", videoDir);
-        if (cfg.save()) {
-            LOG_INF("Storage path saved: %s", path.c_str());
+
+        bool saved = cfg.save();  // 尝试写回原始路径（如 /etc/smartcam/smartcam.conf）
+        if (!saved) {
+            // 原始路径不可写（非 root 用户），写 ~/.config/smartcam/smartcam.conf
+            const char* home = getenv("HOME");
+            std::string userCfg = (home ? std::string(home) : "/home/debian")
+                                  + "/.config/smartcam/smartcam.conf";
+            saved = cfg.saveAs(userCfg);
+            if (saved) {
+                LOG_INF("Config saved to user path: %s", userCfg.c_str());
+            }
         } else {
+            LOG_INF("Storage path saved: %s", path.c_str());
+        }
+
+        if (!saved) {
             LOG_WRN("Failed to save config — storage path may not persist after reboot");
         }
 

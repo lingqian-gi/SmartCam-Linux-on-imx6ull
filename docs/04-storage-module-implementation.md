@@ -485,3 +485,135 @@ set(ALL_SOURCES
 ```
 
 无外部库依赖，纯 C 标准库 + POSIX 系统调用，ARM/x86 零配置编译。
+
+---
+
+## 十二、持久化存储路径与板载 tmpfs 问题 (v0.5)
+
+### 12.1 问题背景
+
+在 i.MX6ULL 开发板上运行 SmartCam 时发现：
+
+- **程序关闭再启动** → Gallery 能正常看到之前拍的照片 ✅
+- **重启开发板后再启动** → Gallery 看不到之前的照片 ❌
+
+经排查，原因是开发板的 `/data` 目录挂载为 **tmpfs**（RAM 文件系统）：
+
+```bash
+$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/mmcblk1p2  7.1G  1.6G  5.2G  24% /
+tmpfs           244M     0  244M   0% /dev/shm
+...
+```
+
+`/data` 不存在于 df 输出中，说明它没有独立挂载点，由 rootfs 的 tmpfs overlay 管理。**tmpfs 数据只存在于内存中，断电/重启即丢失**。照片和录像虽然看似正常写入 `/data/photos/YYYYMMDD/IMG_*.jpg`，但实际写入的是 RAM，重启后自然消失。
+
+### 12.2 解决方案：Settings 面板选择存储路径
+
+在 GUI 的 **Settings 面板** 中增加存储路径下拉选择器，允许用户在两种存储策略之间切换：
+
+```
+Settings 面板布局（新增第三项）
+┌──────────────────────────────────────────────────┐
+│  Res: [640x480  ▽]    Fmt: [MJPEG  ▽]            │
+│  Store: [Persistent (eMMC)  ▽]                   │
+└──────────────────────────────────────────────────┘
+```
+
+| 选项 | 路径 | 特点 |
+|------|------|------|
+| **Temporary (/data)** | `/data` | tmpfs，读写速度快，重启丢失 |
+| **Persistent (eMMC)** | `/home/debian/smartcam` | eMMC 分区 (`/dev/mmcblk1p2`)，重启不丢失 |
+
+实际存储时自动追加 `/photos` 和 `/videos` 子目录：
+- `Temporary (/data)` → 照片存 `/data/photos/`，录像存 `/data/videos/`
+- `Persistent (eMMC)` → 照片存 `/home/debian/smartcam/photos/`，录像存 `/home/debian/smartcam/videos/`
+
+### 12.3 涉及文件与改动
+
+| 文件 | 改动 | 行数 |
+|------|------|------|
+| `include/common/config.h` | 🆕 新增 `setString()`、`save()`、`saveAs()`、`mkdirParents()` | +45 |
+| `include/display/gui.h` | 🆕 `m_storageCombo` 成员；`onStoragePathChanged` 回调；`setStoragePath()` 方法 | +5 |
+| `src/display/gui.cpp` | 🆕 Settings 面板添加 Store 下拉框 + 信号连接 + slot 实现 | +20 |
+| `src/main.cpp` | 🆕 配置加载优先级；存储路径变更回调（更新 StorageManager + 持久化） | +30 |
+| `configs/smartcam.conf` | 📝 添加注释说明两种存储模式 | +3 |
+
+### 12.4 配置文件持久化流程
+
+```
+用户在 Settings 面板切换 Store
+        │
+        ▼
+  gui.onStorageComboChanged(index)
+        │
+        ▼
+  m_onStoragePathChanged(path)     # main.cpp 注册的回调
+        │
+        ├──► g_storage->setPhotoDir(path + "/photos")   # 即时生效
+        ├──► g_storage->setVideoDir(path + "/videos")   # 即时生效
+        │
+        └──► cfg.setString("storage", "photo_dir", ...) # 内存中修改
+             cfg.setString("storage", "video_dir", ...)
+                  │
+                  ├──► cfg.save()              # 尝试写 /etc/smartcam/...
+                  │         ↓ 失败（非 root）
+                  └──► cfg.saveAs(userCfg)     # fallback：写 ~/.config/smartcam/smartcam.conf
+                             ↓ 自动 mkdirParents() 创建父目录
+                             ✅ 持久化成功
+```
+
+### 12.5 配置加载优先级
+
+```
+命令行 --config 显式指定
+        │
+        ▼ 未指定？
+~/.config/smartcam/smartcam.conf  ← 用户级，debian 可写
+        │
+        ▼ 不存在？
+/etc/smartcam/smartcam.conf       ← 系统级，需 root
+```
+
+首次运行（debian 用户）：
+1. 读取 `/etc/smartcam/smartcam.conf`（系统级默认配置）
+2. 用户在 Settings 中切换到 `Persistent (eMMC)`
+3. 程序自动创建 `~/.config/smartcam/` 目录并写入配置文件
+4. 下次启动时自动发现用户级配置存在，优先读取 → 路径选择自动恢复
+
+### 12.6 ConfigManager 新增 API
+
+```cpp
+class ConfigManager {
+    // ...原有只读接口...
+
+    // v0.5 新增：写支持
+    void setString(const std::string& section,
+                   const std::string& key,
+                   const std::string& value);   // 内存中修改
+    bool save() const;                          // 写回加载时的文件
+    bool saveAs(const std::string& path) const; // 写入指定路径（自动创建父目录）
+};
+```
+
+`saveAs()` 内部通过 `mkdirParents()` 递归创建目标目录，确保 `~/.config/smartcam/smartcam.conf` 首次写入时不会因父目录不存在而失败。
+
+### 12.7 面试要点
+
+**Q: 为什么不在 StorageManager 初始化时自动检测 tmpfs 并切换？**
+
+> 自动检测需要解析 `/proc/mounts` 或 `statfs`，增加模块间的隐式耦合。当前方案将存储策略的选择权交给用户（通过 GUI Settings），既清晰又灵活。`StorageManager` 本身保持纯存储职责，不感知文件系统类型。
+
+**Q: 为什么要读写两份配置文件（系统级 + 用户级）？**
+
+> 这是 UNIX 配置管理的标准做法。系统级配置 (`/etc/`) 提供出厂默认值，用户级配置 (`~/.config/`) 允许非 root 用户个性化设置。用户在 GUI 中做的任何调整都会自动保存到用户级配置，重启后通过优先级机制自动恢复。
+
+---
+
+## 十三、变更记录
+
+| 日期 | 变更内容 |
+|------|----------|
+| 2026-05-23 | 文档创建：StorageManager 类设计、AVI 容器格式、空间管理、面试要点 |
+| 2026-05-27 | v0.5：持久化存储路径 — Settings 面板 Store 选择器、ConfigManager 写入支持、用户级配置 fallback |

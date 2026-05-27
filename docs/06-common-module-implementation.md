@@ -45,6 +45,7 @@ SmartCam 项目文件结构
 | 日志系统 | `logger.h` | ~190 | 带颜色/时间戳/syslog 的线程安全日志 |
 | 环形缓冲区 | `ringbuf.h` | ~140 | 线程安全固定容量环形队列模板 |
 | 共享类型 | `types.h` | ~50 | PixelFormat / Resolution / FrameBuffer / CameraStatus |
+| **配置管理** | **`config.h`** | **~180** | **INI 解析 + 写入 + 用户级配置优先级** |
 
 ---
 
@@ -441,7 +442,167 @@ target_include_directories(smartcam PRIVATE
 
 ---
 
-## 八、后续 TODO
+---
+
+## 八、配置管理器 (`config.h`) — v0.5 增强
+
+### 8.1 原始设计（只读 INI 解析器）
+
+```cpp
+class ConfigManager {
+public:
+    bool load(const std::string& path);        // 从 INI 文件加载
+
+    std::string getString(section, key, def);  // 读取字符串
+    int         getInt(section, key, def);     // 读取整数
+    bool        getBool(section, key, def);    // 读取布尔
+    bool        hasSection(section);            // 检查段存在
+    bool        hasKey(section, key);           // 检查键存在
+};
+```
+
+原始设计仅支持**读取**，不支持回写。这导致 GUI 中的存储路径切换等持久化操作无法实现。
+
+### 8.2 v0.5 新增：写入支持
+
+为了支持用户通过 Settings 面板修改存储路径并持久化到配置文件，ConfigManager 新增三个写接口和一个目录创建辅助函数：
+
+```cpp
+class ConfigManager {
+    // ...原有只读接口...
+
+    // v0.5 新增
+    void setString(const std::string& section,
+                   const std::string& key,
+                   const std::string& value);      // 内存中修改/新增键值对
+
+    bool save() const;                              // 写回加载时的文件
+    bool saveAs(const std::string& path) const;     // 写入指定文件（自动创建父目录）
+
+private:
+    static void mkdirParents(const std::string& path);  // 递归 mkdir -p
+};
+```
+
+#### `setString()` — 内存修改
+
+```cpp
+void ConfigManager::setString(const std::string& section,
+                               const std::string& key,
+                               const std::string& value) {
+    m_data[section][key] = value;  // map 的 operator[] 自动创建不存在的 section/key
+}
+```
+
+直接操作 `std::map<std::string, std::map<std::string, std::string>>` 内层容器。
+
+#### `save()` / `saveAs()` — 持久化
+
+```cpp
+bool ConfigManager::save() const {
+    std::ofstream file(m_path);
+    for (const auto& sec : m_data) {
+        file << "[" << sec.first << "]\n";
+        for (const auto& kv : sec.second) {
+            file << kv.first << " = " << kv.second << "\n";
+        }
+        file << "\n";   // section 之间空行分隔
+    }
+    return file.good();
+}
+```
+
+输出格式与 `load()` 的解析格式完全兼容，支持回读。
+
+#### `mkdirParents()` — 自动 mkdir -p
+
+```cpp
+static void mkdirParents(const std::string& path) {
+    size_t slash = path.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+        mkdirParents(path.substr(0, slash));  // 递归创建父目录
+    }
+    mkdir(path.c_str(), 0755);  // 忽略 EEXIST
+}
+```
+
+`saveAs()` 在打开文件前调用此函数，确保 `~/.config/smartcam/` 这类首次写入的路径存在。
+
+### 8.3 配置加载优先级（main.cpp 中的实现）
+
+```cpp
+// main.cpp: 配置加载逻辑
+ConfigManager cfg;
+QString configPath;
+
+if (parser.isSet(configOpt)) {
+    configPath = parser.value(configOpt);       // 1. 命令行 --config 显式优先
+} else {
+    const char* home = getenv("HOME");
+    if (home) {
+        std::string userCfg = string(home) + "/.config/smartcam/smartcam.conf";
+        if (cfg.load(userCfg)) {                // 2. 用户级配置优先
+            configPath = QString::fromStdString(userCfg);
+        }
+    }
+    if (configPath.isEmpty()) {
+        configPath = "/etc/smartcam/smartcam.conf";  // 3. 系统级兜底
+    }
+}
+bool cfgLoaded = cfg.load(configPath.toStdString());
+```
+
+```mermaid
+flowchart TD
+    A[程序启动] --> B{--config 指定?}
+    B -->|Yes| C[直接使用指定路径]
+    B -->|No| D{~/.config/smartcam/smartcam.conf 存在?}
+    D -->|Yes| E[加载用户级配置]
+    D -->|No| F[加载 /etc/smartcam/smartcam.conf]
+    C --> G[解析配置]
+    E --> G
+    F --> G
+```
+
+### 8.4 调用端：存储路径持久化流程
+
+```
+用户在 Settings 面板选择 "Persistent (eMMC)"
+  │
+  ▼
+gui.onStorageComboChanged()  → 回调触发
+  │
+  ▼
+main.cpp callback:
+  │
+  ├─► g_storage→setPhotoDir("/home/debian/smartcam/photos")  # 即时生效
+  ├─► g_storage→setVideoDir("/home/debian/smartcam/videos")
+  │
+  └─► cfg.setString("storage", "photo_dir", "/home/debian/smartcam/photos")
+      cfg.setString("storage", "video_dir", "/home/debian/smartcam/videos")
+           │
+           ├─► cfg.save()                     # Step 1: 尝试写原路径
+           │       ↓ 失败（非 root 无权写 /etc/）
+           └─► cfg.saveAs(userCfg)            # Step 2: 写 ~/.config/smartcam/...
+                   ↓ mkdirParents() 自动创建 ~/.config/smartcam/
+                   ✅ 持久化成功
+```
+
+### 8.5 设计要点
+
+**Q: 为什么不直接用 JSON/TOML 而是手写 INI？**
+
+> INI 格式简单直白，手写解析器无需引入任何第三方库。配置内容仅几十行，JSON 库（nlohmann/json ≈ 30KB 头文件）的复杂度收益比低。控制端口等其他功能用自定义二进制协议（`control.h`），无需 JSON。
+
+**Q: `mkdirParents` 有问题吗——它忽略了 `mkdir` 的返回值？**
+
+> 是故意的。递归创建时，中间目录可能已存在（`EEXIST`），这不算错误。最终 `saveAs()` 中的 `ofstream::is_open()` 才是真正的失败检测。如果任何一级目录创建失败（如权限不足），`ofstream` 打开文件时会失败，`saveAs()` 返回 `false`。
+
+**Q: 用户级配置和系统级配置会不会冲突？**
+
+> 配置加载是**互斥**的——一旦用户级配置存在，就不加载系统级配置。这意味着用户级配置必须包含所有需要的字段（通过从系统级"继承"并修改而来）。当前实现中，用户级配置由 `saveAs()` 从内存中全量写入（包含所有 section），因此不会丢失字段。
+
+## 九、后续 TODO
 
 - [ ] `ringbuf.h` 增加 `tryPop()` 方法（非阻塞 + 超时，使用条件变量）
 - [ ] `logger.h` 增加日志文件轮转功能（按大小/日期切分）
@@ -452,8 +613,9 @@ target_include_directories(smartcam PRIVATE
 
 ---
 
-## 九、变更记录
+## 十、变更记录
 
 | 日期 | 变更内容 |
 |------|----------|
 | 2026-05-24 | 文档创建：Logger 单例、RingBuffer 模板、共享类型定义的设计说明与使用指南 |
+| 2026-05-27 | v0.5：ConfigManager 增强 — `setString()`/`save()`/`saveAs()`/`mkdirParents()` 写支持；配置加载优先级；存储路径持久化集成 |
