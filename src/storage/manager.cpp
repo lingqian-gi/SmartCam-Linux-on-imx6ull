@@ -193,6 +193,13 @@ int StorageManager::writeRecordFrame(const uint8_t* jpeg_data, int len) {
     writeFourCC(m_recordFile, "00dc");
     writeU32(m_recordFile, static_cast<uint32_t>(len));
     size_t written = fwrite(jpeg_data, 1, static_cast<size_t>(len), m_recordFile);
+
+    // RIFF 规范：chunk 数据必须 WORD(2字节) 对齐，奇数大小需补 1 字节
+    if (len % 2 != 0) {
+        uint8_t pad = 0;
+        fwrite(&pad, 1, 1, m_recordFile);
+    }
+
     fflush(m_recordFile);
 
     if (written != static_cast<size_t>(len)) {
@@ -209,7 +216,8 @@ int StorageManager::writeRecordFrame(const uint8_t* jpeg_data, int len) {
     // 记录帧索引
     FrameIndex idx;
     idx.offset = static_cast<uint32_t>(frameDataOffset - m_moviDataOffset);
-    idx.length = static_cast<uint32_t>(sizeof(AviFrameChunk) + len);
+    // dwChunkLength 为帧数据大小（不含 chunk 头），符合 RIFF idx1 规范
+    idx.length = static_cast<uint32_t>(len);
     m_frameIndexList.push_back(idx);
 
     m_recordFrameCount++;
@@ -386,10 +394,13 @@ int StorageManager::finalizeAvi() {
     FILE* fp = m_recordFile;
 
     // ---- 回填 movi LIST 大小 ----
-    // movi LIST 的 size 字段位于 m_moviDataOffset - 4 处
+    // m_moviDataOffset 指向第一个 "00dc"，往前 8 字节才是 LIST size 字段：
+    //   ... "LIST"(4) | size(4) | "movi"(4) | "00dc" ...
+    //                         ↑                    ↑
+    //                  m_moviDataOffset-8    m_moviDataOffset
     long moviEnd = ftell(fp);
     long moviSize = moviEnd - m_moviDataOffset + 4;  // +4 补上 "movi" FOURCC
-    long moviSizePos = m_moviDataOffset - 4;           // movi LIST size 位置
+    long moviSizePos = m_moviDataOffset - 8;          // movi LIST size 位置
     fseek(fp, moviSizePos, SEEK_SET);
     writeU32(fp, static_cast<uint32_t>(moviSize));
     fseek(fp, moviEnd, SEEK_SET);

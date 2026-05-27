@@ -179,19 +179,24 @@ ssh root@<开发板IP> "cd / && tar xzf /tmp/smartcam-arm.tar.gz"
 
 ### 开发板运行
 
-> **重要**：imx6ULL 无 X server，必须使用 `linuxfb` 后端。linuxfb 只负责显示，**触摸/鼠标输入需额外配置 `QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS`，否则按钮无法点击。**
+> **重要**：imx6ULL 无 X server，必须使用 `linuxfb` 后端。linuxfb 内置了 evdev 输入支持，会自动检测 `/dev/input/` 下的触摸设备，**不需要 `QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS` 等环境变量**。触摸不响应的唯一原因是 **设备权限不足**。
 
 ```bash
-# ---- 必须先设置输入设备环境变量 ----
+# ---- 解决触摸权限问题 ----
+# /dev/input/event2 默认权限 660 (root:input)，普通用户无权读取
+
+# ① 临时修复（重启失效）
+sudo chmod 666 /dev/input/event2
+
+# ② 永久修复（将当前用户加入 input 组，重新登录生效）
+sudo usermod -a -G input $USER
+# 退出重新登录后验证：
+groups | grep input
+
+# ---- 启动应用 ----
 export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
 export QT_QPA_FB_HIDECURSOR=1
 
-# ⚠️ 关键：指定触摸输入设备路径（根据实际设备调整 /dev/input/event1）
-export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
-# 如果上面不生效，尝试同时加载 evdevtouch 插件：
-# export QT_QPA_GENERIC_PLUGINS=evdevtouch
-
-# ---- 启动应用 ----
 # MJPEG 模式（摄像头硬件输出 JPEG，零 CPU 编码开销，推荐）
 ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
 
@@ -208,8 +213,8 @@ export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
 # 查看可用的输入设备：
 ls -la /dev/input/event*
 # 测试触摸是否工作（触摸屏幕看是否有输出）：
-cat /dev/input/event1 | hexdump
-# 检查 Qt 是否加载了 evdevtouch 插件：
+cat /dev/input/event2 | hexdump    # event2 换成你的实际设备
+# 查看 Qt 输入调试日志：
 export QT_LOGGING_RULES="qt.qpa.input=true"
 ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080 2>&1 | grep -i touch
 ```

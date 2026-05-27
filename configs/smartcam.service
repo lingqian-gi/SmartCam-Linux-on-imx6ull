@@ -28,9 +28,9 @@ Type=simple
 User=root
 
 # Qt framebuffer 后端环境变量（写在 service 里就不需要在命令行加 -platform linuxfb）
+# linuxfb 自动检测触摸设备，不需要 QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS
 Environment=QT_QPA_PLATFORM=linuxfb
 Environment=QT_QPA_FB_HIDECURSOR=1
-Environment=QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=/dev/input/event1:rotate=0
 
 # 启动命令
 ExecStart=/usr/local/bin/smartcam \
