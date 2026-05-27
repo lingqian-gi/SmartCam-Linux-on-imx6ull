@@ -853,3 +853,83 @@ idx.length = static_cast<uint32_t>(len);
 | `src/storage/manager.cpp:finalizeAvi()` | `m_moviDataOffset - 4` → `m_moviDataOffset - 8` |
 | `src/storage/manager.cpp:writeRecordFrame()` | 新增奇数帧 WORD 对齐 padding |
 | `src/storage/manager.cpp:writeRecordFrame()` | idx1 `dwChunkLength` = `len`（去除 chunk 头 8 字节） |
+
+
+---
+
+## 15. YUYV→RGB NEON SIMD 加速优化 ✅ 已实现
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/camera/processor_neon.cpp`（新增）/ `src/camera/processor.cpp` / `include/display/gui.h` |
+| **现象** | YUYV 模式下 GUI 实时预览帧率低、CPU 占用高；640×480 YUYV→RGB24 标量转换耗时 ~8ms，30fps 下仅转换就占 24% CPU 时间 |
+| **严重程度** | 🟡 次要 — 性能优化，功能正常但用户体验可提升 |
+
+### 背景
+
+项目在 ARM 交叉编译时已启用 `-mfpu=neon`（CMakeLists.txt），但 YUYV→RGB24 转换使用纯 C++ 标量循环——每轮处理 1 个宏像素（2 像素），共做 6 组 BT.601 定点乘法+clip。
+
+i.MX6ULL 的 Cortex-A7 @ 792MHz 单核标量处理 640×480 帧约需 8ms。虽然 30fps 仍可达成，但 YUYV→RGB 转换占用了大量 CPU 时间，剩余预算紧张。
+
+### 优化目标
+
+利用 Cortex-A7 的 NEON 128-bit SIMD 指令集，将每轮处理量从 **2 像素 → 16 像素**，目标：
+- YUYV→RGB24 耗时从 ~8ms → ~1ms（理论加速 8×）
+- 减少 CPU 占用，为 GUI 渲染和网络推流留出更多预算
+
+### 实现方案
+
+**新增文件：** `src/camera/processor_neon.cpp`（~150 行）
+
+**核心技术：** ARM NEON Intrinsics（`arm_neon.h`），非手写汇编
+
+| 步骤 | NEON 指令 | 说明 |
+|:---:|------|------|
+| 1 | `vld2q_u8(src)` | 一次加载 32 字节 YUYV，去交织分离 Y 和 UV |
+| 2 | `vuzp_u8` + `vmovl_u8` | 从 UV 交错数组中提取 U、V，扩展到 16-bit 并减 128 |
+| 3 | `vmovl_u8` | Y 扩展到 16-bit（低 8 像素 / 高 8 像素） |
+| 4 | `vmulq_s16` + `vaddq_s16` + `vshrq_n_s16` | BT.601 矩阵运算: R=Y+V×359>>8, G=Y−(U×88+V×183)>>8, B=Y+U×454>>8 |
+| 5 | `vqmovun_s16` | 饱和转换 int16→uint8，自动 clip 到 [0,255]（替代标量的手动 `clip()`） |
+| 6 | `vst3_u8(dst, rgb)` | 交织写入 RGB24（R0,G0,B0,R1,G1,B1,...） |
+
+**主循环**：每轮 8 宏像素 = 16 像素 = 32B YUYV → 48B RGB，尾部 <16 像素退化为标量。
+
+**关键设计决策：**
+
+- **Intrinsics 而非手写汇编** — 编译器管寄存器分配，同代码 armv7/armv8 通用
+- **两处调用点统一代理** — `processor.cpp` 和 `gui.h` 两处 `yuyv_to_rgb24` 都转发到同一个 NEON 函数，避免代码重复
+- **编译期分支 (`#ifdef __ARM_NEON`)** — 零运行时开销，x86 本地调试不受影响
+
+### 调用方集成
+
+三处调用点，编译期自动分流：
+
+| 调用点 | 文件 | ARM (`__ARM_NEON`) | x86 (无 NEON) |
+|--------|------|:---:|:---:|
+| `VideoProcessor::yuyvToRgb24()` | `processor.cpp` | → `yuyv_to_rgb24_neon()` | 原标量代码 |
+| GUI 预览 `yuyv_to_rgb24()` | `gui.h` (inline) | → `yuyv_to_rgb24_neon()` | 原标量代码 |
+| `encodeYUYVtoJPEG()` | `processor.cpp` | 调用上面的 → NEON | 标量 |
+
+编译行为：ARM 交叉编译（`-mfpu=neon`）→ `__ARM_NEON` 自动定义 → NEON 路径；x86 PC 本地调试 → 标量路径，功能完全一致。
+
+### 性能对比（估算，640×480）
+
+| 指标 | 标量 C++ | NEON Intrinsics | 加速比 |
+|------|:-------:|:---------------:|:-----:|
+| 每轮处理像素 | 2 | **16** | 8× |
+| 核心循环总次数 | ~153,600 | **~19,200** | 8× |
+| 单帧耗时 | ~8 ms | **~1 ms** | 8× |
+| CPU 占用 (30fps) | ~24% | **~3%** | — |
+| 指令数/像素 | ~30 | **~2** | 15× |
+| 代码行数 | 35 (标量) | 150 (含注释) | — |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/camera/processor_neon.cpp` | 🆕 新增，150 行 NEON intrinsics 实现 |
+| `src/camera/processor.cpp` | `yuyvToRgb24()` 入口添加 `#ifdef __ARM_NEON` → NEON 分流 |
+| `include/display/gui.h` | inline `yuyv_to_rgb24()` 添加 `#ifdef __ARM_NEON` → NEON 分流 |
+| `include/camera/processor.h` | 新增 `yuyvToRgb24Neon()` 声明 (`#ifdef __ARM_NEON`) |
+| `CMakeLists.txt` | `CAMERA_SOURCES` 加入 `processor_neon.cpp` |
+
