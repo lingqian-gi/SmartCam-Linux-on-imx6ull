@@ -809,7 +809,7 @@ HTTP 流测试: ✅ curl http://localhost:8080/ → HTML 页面返回
 - [x] 添加 `GET /status` 端点：返回 JSON 格式的相机状态（✅ 2026-05-24 完成）
 - [x] 支持 YUYV 格式推流（✅ 2026-05-24 完成，libjpeg-turbo 软编码后推流）
 - [x] 集成 RTSP 服务器：标准流媒体协议支持（✅ 已自实现，见 MOD-08）
-- [ ] 支持 JPEG 质量参数 URL 参数：`/stream?quality=80`
+- [x] 支持 JPEG 质量参数 URL 参数：`/stream?quality=80`（✅ 2026-05-27 完成）
 - [ ] 客户端超时机制：长时间不发请求的客户端自动断开
 - [ ] 添加文件描述符限制处理（ulimit -n 设置）
 - [ ] 单元测试：`tests/test_mjpeg_server.cpp`（Mock TCP 客户端）

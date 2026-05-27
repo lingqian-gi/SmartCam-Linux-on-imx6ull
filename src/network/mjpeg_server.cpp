@@ -24,11 +24,106 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 
+#ifdef HAS_LIBJPEG
+#include <jpeglib.h>
+#endif
+
 // ============================================================
 // multipart 边界字符串
 // ============================================================
 static constexpr const char* kBoundary  = "SmartCamFrame";
 static constexpr const char* kCRLF      = "\r\n";
+
+// ============================================================
+// JPEG 质量重编码工具（libjpeg-turbo，可选）
+//
+// 当客户端请求 ?quality=N 且 N<100 时，解码原始 JPEG
+// 然后在目标质量下重新编码。quality=100 或未指定时直通。
+// ============================================================
+#ifdef HAS_LIBJPEG
+
+/**
+ * @brief 以指定质量重新编码 JPEG
+ * @param src      输入 JPEG 数据
+ * @param srcLen   输入长度
+ * @param dst      输出 JPEG 数据（内部 malloc，调用者 free）
+ * @param dstLen   输出长度
+ * @param quality  目标质量 (1-100)，100 时直接返回原数据
+ * @return 0=成功, -1=失败
+ */
+static int reencodeJpegQuality(const uint8_t* src, size_t srcLen,
+                                uint8_t** dst, size_t* dstLen,
+                                int quality) {
+    if (!src || srcLen == 0 || !dst || !dstLen) return -1;
+    if (quality >= 100) {
+        // quality=100 → 直接返回原数据（零开销直通）
+        *dst = static_cast<uint8_t*>(malloc(srcLen));
+        if (!*dst) return -1;
+        std::memcpy(*dst, src, srcLen);
+        *dstLen = srcLen;
+        return 0;
+    }
+
+    // ---- 1. 解码 JPEG → RGB24 ----
+    struct jpeg_decompress_struct dinfo;
+    struct jpeg_error_mgr jerr;
+    dinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&dinfo);
+
+    jpeg_mem_src(&dinfo, src, static_cast<unsigned long>(srcLen));
+    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&dinfo);
+        return -1;
+    }
+
+    jpeg_start_decompress(&dinfo);
+
+    int w = static_cast<int>(dinfo.output_width);
+    int h = static_cast<int>(dinfo.output_height);
+    int rowStride = w * 3;
+
+    // 分配行缓冲区
+    std::vector<uint8_t> rgbBuf(static_cast<size_t>(w * h * 3));
+
+    JSAMPROW rowPtr[1];
+    while (dinfo.output_scanline < dinfo.output_height) {
+        rowPtr[0] = &rgbBuf[dinfo.output_scanline * rowStride];
+        jpeg_read_scanlines(&dinfo, rowPtr, 1);
+    }
+    jpeg_finish_decompress(&dinfo);
+    jpeg_destroy_decompress(&dinfo);
+
+    // ---- 2. RGB24 → JPEG（目标质量） ----
+    struct jpeg_compress_struct cinfo;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    unsigned char* outBuf = nullptr;
+    unsigned long  outLen = 0;
+    jpeg_mem_dest(&cinfo, &outBuf, &outLen);
+
+    cinfo.image_width      = static_cast<JDIMENSION>(w);
+    cinfo.image_height     = static_cast<JDIMENSION>(h);
+    cinfo.input_components = 3;
+    cinfo.in_color_space   = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    while (cinfo.next_scanline < cinfo.image_height) {
+        rowPtr[0] = &rgbBuf[cinfo.next_scanline * rowStride];
+        jpeg_write_scanlines(&cinfo, rowPtr, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    *dst    = outBuf;
+    *dstLen = static_cast<size_t>(outLen);
+    return 0;
+}
+
+#endif  // HAS_LIBJPEG
 
 // ============================================================
 // 构造 / 析构
@@ -161,6 +256,47 @@ void MJPEGStreamServer::updateFrame(const uint8_t* data, size_t len) {
         m_frameIndex++;
     }
 
+    // ── 按需预生成各质量级别的重编码缓存 ──
+    // 仅在 HAS_LIBJPEG 时做；遍历所有活跃客户端，收集其 quality 值，
+    // 对每个 quality<100 且缓存在另一帧变过期时重新编码一次，
+    // 多客户端同 quality 共用一个缓存 → 避免重复计算
+#ifdef HAS_LIBJPEG
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMtx);
+        std::map<int, bool> needed;  // quality → 是否有客户端在用
+
+        for (const auto& c : m_clients) {
+            if (c.active && c.quality < 100) {
+                needed[c.quality] = true;
+            }
+        }
+
+        // 对每个需要的 quality 做重编码（同一帧只在 updateFrame 时做一次）
+        for (const auto& [quality, _] : needed) {
+            uint8_t* reJpeg = nullptr;
+            size_t   reLen  = 0;
+            if (reencodeJpegQuality(data, len, &reJpeg, &reLen, quality) == 0) {
+                std::lock_guard<std::mutex> cacheLock(m_qualityCacheMtx);
+                m_qualityCache[quality].assign(reJpeg, reJpeg + reLen);
+                free(reJpeg);
+            }
+        }
+
+        // 清理不再需要的缓存条目
+        {
+            std::lock_guard<std::mutex> cacheLock(m_qualityCacheMtx);
+            auto it = m_qualityCache.begin();
+            while (it != m_qualityCache.end()) {
+                if (needed.find(it->first) == needed.end()) {
+                    it = m_qualityCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+#endif
+
     // 广播新帧到所有等待的客户端线程
     m_frameCV.notify_all();
 }
@@ -220,20 +356,39 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
     bool wantStream   = false;
     bool wantSnapshot = false;
     bool wantStatus   = false;
+    int  streamQuality = 100;  // 默认无损直通
     const char* line = reqBuf;
 
-    // 第一行格式: GET /path HTTP/1.1
+    // 第一行格式: GET /path?params HTTP/1.1
     if (std::strncmp(line, "GET ", 4) == 0) {
         const char* pathStart = line + 4;
         const char* pathEnd   = std::strchr(pathStart, ' ');
+        const char* queryStart = std::strchr(pathStart, '?');  // 查询参数起始
+
         if (pathEnd) {
-            size_t pathLen = static_cast<size_t>(pathEnd - pathStart);
+            size_t pathLen = (queryStart && queryStart < pathEnd)
+                               ? static_cast<size_t>(queryStart - pathStart)
+                               : static_cast<size_t>(pathEnd - pathStart);
 
             if (pathLen == 1 && pathStart[0] == '/') {
                 // GET / → 返回 HTML 页面
             } else if (pathLen == 7 &&
                        std::strncmp(pathStart, "/stream", 7) == 0) {
                 wantStream = true;
+
+                // ── 解析 ?quality=N ──
+                if (queryStart && queryStart < pathEnd) {
+                    const char* param = queryStart + 1;  // 跳过 '?'
+                    // 匹配 "quality=" 前缀
+                    if (std::strncmp(param, "quality=", 8) == 0) {
+                        int q = std::atoi(param + 8);
+                        if (q >= 1 && q <= 100) {
+                            streamQuality = q;
+                        } else if (q > 100) {
+                            streamQuality = 100;
+                        }
+                    }
+                }
             } else if (pathLen == 9 &&
                        std::strncmp(pathStart, "/snapshot", 9) == 0) {
                 wantSnapshot = true;
@@ -272,15 +427,21 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
             return;
         }
 
-        // 获取当前客户端信息来更新 lastSentIndex
+        // 记录客户端的 quality 和 lastSentIndex
         {
             std::lock_guard<std::mutex> lock(m_clientsMtx);
             for (auto& c : m_clients) {
                 if (c.fd == client_fd) {
+                    c.quality       = streamQuality;
                     c.lastSentIndex = m_frameIndex.load();
                     break;
                 }
             }
+        }
+
+        bool reEncode = (streamQuality < 100);
+        if (reEncode) {
+            LOG_INF("Client fd=%d streaming at quality=%d", client_fd, streamQuality);
         }
 
         // 流发送循环
@@ -292,31 +453,58 @@ void MJPEGStreamServer::clientHandler(int client_fd) {
             {
                 std::unique_lock<std::mutex> lock(m_frameMtx);
 
-                // 等待新帧（超时 1s 以便检查 m_running）
                 if (!m_frameCV.wait_for(lock, std::chrono::seconds(1),
                         [this, &lastIndex = lastIndex]() {
                             return !m_running ||
                                    m_frameIndex.load() != lastIndex;
                         })) {
-                    // 超时，检查是否需要退出
                     if (!m_running) break;
                     continue;
                 }
 
                 if (!m_running) break;
 
-                // 有新帧，拷贝出来（在锁外发送）
                 frame.assign(m_currentFrame.begin(), m_currentFrame.end());
                 currentIndex = m_frameIndex.load();
             }
 
             lastIndex = currentIndex;
-
             if (frame.empty()) continue;
 
-            if (!sendMJPEGFrame(client_fd, frame.data(), frame.size())) {
-                LOG_DBG("Client disconnected (send failed)");
-                break;
+            // ── 按需读取质量缓存（在 updateFrame 中已预生成） ──
+            if (reEncode) {
+#ifdef HAS_LIBJPEG
+                std::vector<uint8_t> cachedJpeg;
+                {
+                    std::lock_guard<std::mutex> cacheLock(m_qualityCacheMtx);
+                    auto it = m_qualityCache.find(streamQuality);
+                    if (it != m_qualityCache.end()) {
+                        cachedJpeg = it->second;  // 拷贝出锁以加速
+                    }
+                }
+
+                if (!cachedJpeg.empty()) {
+                    if (!sendMJPEGFrame(client_fd, cachedJpeg.data(),
+                                        cachedJpeg.size())) {
+                        LOG_DBG("Client disconnected (quality=%d)", streamQuality);
+                        break;
+                    }
+                } else {
+                    // 缓存未命中（如刚连接、第一帧尚未编码）→ 直通原始帧
+                    if (!sendMJPEGFrame(client_fd, frame.data(), frame.size())) {
+                        break;
+                    }
+                }
+#else
+                if (!sendMJPEGFrame(client_fd, frame.data(), frame.size())) {
+                    break;
+                }
+#endif
+            } else {
+                if (!sendMJPEGFrame(client_fd, frame.data(), frame.size())) {
+                    LOG_DBG("Client disconnected (send failed)");
+                    break;
+                }
             }
         }
     } else {
@@ -637,7 +825,8 @@ bool MJPEGStreamServer::sendIndexPage(int client_fd) {
         "</div>\n"
         "<div class='api-links'>\n"
         "  API: <a href='/snapshot'>snapshot</a>"
-        " | <a href='/status'>status</a>\n"
+        " | <a href='/status'>status</a>"
+        " | <a href='/stream?quality=50'>quality=50</a>\n"
         "</div>\n"
         "</body>\n"
         "</html>\n";

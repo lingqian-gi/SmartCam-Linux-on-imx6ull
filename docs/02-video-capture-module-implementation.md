@@ -794,7 +794,7 @@ Help 参数: ✅ 显示完整命令行说明
 - [x] 集成 MJPEG-over-HTTP 流媒体服务器 → 采集线程通过 updateFrame() 分发帧（✅ MOD-03）
 - [x] 集成 RTSPServer → 采集线程通过 feedFrame() 分发帧（✅ MOD-08）
 - [x] 集成 StorageManager → onCaptureRequest/onRecordToggle 实际生效（✅ MOD-04）
-- [ ] YUYV→RGB NEON 汇编优化（预期提升 30-50%）
+- [x] YUYV→RGB NEON 汇编优化（✅ 已完成，2026-05-27，~8× 加速）
 - [ ] VideoProcessor 增加图像缩放功能（用于分辨率降采样）
 - [ ] 添加 V4L2 设备热插拔检测（udev 监控）
 - [x] 添加 `CameraStatus` 结构体通过控制协议返回（✅ MOD-05，CMD_GET_STATUS）

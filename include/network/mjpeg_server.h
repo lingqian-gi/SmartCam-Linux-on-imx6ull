@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <map>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -122,6 +123,7 @@ private:
         int          fd;               // socket 文件描述符
         bool         active;           // 是否活跃
         uint64_t     lastSentIndex;    // 已发送的最新帧序号
+        int          quality = 100;    // JPEG 质量 (1-100), 100=直通不重编码
     };
 
     // ---- 线程入口 ----
@@ -154,6 +156,10 @@ private:
     std::condition_variable m_frameCV;
     std::vector<uint8_t>    m_currentFrame;
     std::atomic<uint64_t>   m_frameIndex{0};
+
+    // ---- 质量缓存: quality → 重编码后的 JPEG（按需生成，多客户端共享） ----
+    std::mutex                       m_qualityCacheMtx;
+    std::map<int, std::vector<uint8_t>> m_qualityCache;  // quality → JPEG bytes
 
     // ---- 客户端管理 ----
     mutable std::mutex  m_clientsMtx;
