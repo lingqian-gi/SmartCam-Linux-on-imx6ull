@@ -273,25 +273,30 @@ int CameraCapture::enumFrameRates(uint32_t pixfmt, int width, int height,
                          frmival.discrete.denominator, fps);
             }
         } else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
-            // 步进式：计算 min/max/step fps
-            int minFps = static_cast<int>(frmival.stepwise.min.denominator) /
-                         static_cast<int>(frmival.stepwise.min.numerator);
-            int maxFps = static_cast<int>(frmival.stepwise.max.denominator) /
-                         static_cast<int>(frmival.stepwise.max.numerator);
+            // 步进式帧间隔：stepwise.min = 最短帧间隔(最高fps),
+            //              stepwise.max = 最长帧间隔(最低fps)
+            int highFps = static_cast<int>(frmival.stepwise.min.denominator) /
+                          static_cast<int>(frmival.stepwise.min.numerator);
+            int lowFps  = static_cast<int>(frmival.stepwise.max.denominator) /
+                          static_cast<int>(frmival.stepwise.max.numerator);
             int stepFps = static_cast<int>(frmival.stepwise.step.denominator) /
                           static_cast<int>(frmival.stepwise.step.numerator);
             if (stepFps <= 0) stepFps = 1;
+            if (lowFps <= 0)  lowFps  = 1;
+            if (highFps <= 0) highFps = 1;
+            // 确保 lowFps <= highFps
+            if (lowFps > highFps) std::swap(lowFps, highFps);
 
             // 限制最多 20 个离散值，避免过多
             int count = 0;
-            for (int f = minFps; f <= maxFps && count < 20; f += stepFps) {
+            for (int f = lowFps; f <= highFps && count < 20; f += stepFps) {
                 if (f > 0) {
                     frameRates.push_back(f);
                     count++;
                 }
             }
-            LOG_DBG("  FrameInterval stepwise: min=%d max=%d step=%d fps",
-                     minFps, maxFps, stepFps);
+            LOG_DBG("  FrameInterval stepwise: low=%d high=%d step=%d fps",
+                     lowFps, highFps, stepFps);
             break;
         } else {
             break;

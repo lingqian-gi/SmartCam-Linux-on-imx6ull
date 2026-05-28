@@ -398,6 +398,17 @@ int main(int argc, char* argv[]) {
                 if (enumRet == 0 && !supportedFps.empty()) {
                     int minFps = supportedFps.front();
                     int maxFps = supportedFps.back();
+
+                    // 仅枚举到一个离散帧率时，minFps == maxFps，滑块无法滑动
+                    // 回退到安全范围 1~60，允许用户尝试其他帧率
+                    // （许多 UVC 摄像头虽只报告一个离散帧率，但 VIDIOC_S_PARM 仍可接受其他值）
+                    if (minFps == maxFps) {
+                        LOG_INF("Framerate: only one discrete rate (%d fps) enumerated, "
+                                "falling back to safe range 1-60", minFps);
+                        minFps = 1;
+                        maxFps = 60;
+                    }
+
                     // 确保当前帧率在范围内
                     if (currentFps < minFps) currentFps = minFps;
                     if (currentFps > maxFps) currentFps = maxFps;
