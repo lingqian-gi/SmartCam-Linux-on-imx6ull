@@ -61,6 +61,11 @@ struct CaptureState {
     std::condition_variable pauseCv;         // 暂停同步条件变量
     std::atomic<bool>       pausedAck{false}; // 采集线程已确认暂停
     std::atomic<int>        targetFps{0};    // 用户设定的目标帧率（0=不限制，跟随硬件）
+
+    // 帧处理线程同步
+    std::mutex              procMtx;           // 处理线程专用锁
+    std::condition_variable procCv;            // 新帧通知
+    std::atomic<bool>       frameReady{false}; // 有新帧待处理
 };
 static CaptureState g_state;
 
@@ -269,6 +274,7 @@ int main(int argc, char* argv[]) {
     // ---- 真实相机模式 ----
     CameraCapture*    capture      = nullptr;
     std::thread*      captureThread = nullptr;
+    std::thread*      processThread = nullptr;
     QTimer*           displayTimer = nullptr;
     MJPEGStreamServer* mjpegServer = nullptr;
     ControlServer*    controlSrv   = nullptr;
@@ -698,8 +704,10 @@ int main(int argc, char* argv[]) {
         // ============================================================
         // 启动采集线程（连续拉帧 → 拷贝到共享缓冲区 + 推流）
         // ============================================================
-        captureThread = new std::thread([capture, mjpegServer, mjpegServerOk,
-                                             rtspServer]() {
+        // ============================================================
+        // 采集线程（仅做 getFrame → 拷贝 → putFrame，不阻塞在推流/录像上）
+        // ============================================================
+        captureThread = new std::thread([capture]() {
             FrameBuffer fb;
             // 帧率节流：记录上次输出帧的时间戳
             auto lastOutputTime = std::chrono::steady_clock::now();
@@ -725,8 +733,6 @@ int main(int argc, char* argv[]) {
                 }
 
                 // ---- 帧率节流 ----
-                // 当用户设定了目标帧率时，如果硬件实际出帧率高于目标，
-                // 通过丢帧来限制输出帧率
                 if (throttleFps > 0) {
                     auto now = std::chrono::steady_clock::now();
                     auto elapsedMs = std::chrono::duration_cast<
@@ -734,80 +740,109 @@ int main(int argc, char* argv[]) {
                     auto minIntervalMs = 1000 / throttleFps;
 
                     if (elapsedMs < minIntervalMs) {
-                        // 距离上次输出帧的时间不够，跳过此帧（丢帧节流）
                         capture->putFrame(&fb);
                         continue;
                     }
                     lastOutputTime = now;
                 }
 
+                // 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
                 {
                     std::lock_guard<std::mutex> lock(g_state.mtx);
-
-                    // 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
                     g_state.frameData.assign(fb.data, fb.data + fb.length);
                     g_state.width  = fb.width;
                     g_state.height = fb.height;
                     g_state.format = fb.format;
-                    g_state.fps = capture->getCurrentFPS();
+                    g_state.fps    = capture->getCurrentFPS();
                 }
 
-                // === 立即归还 V4L2 缓冲区 ===
-                // 拷贝完成后马上归还，让硬件可以写入下一帧，避免缓冲区耗尽导致丢帧
+                // 立即归还 V4L2 缓冲区，让硬件可以写入下一帧
                 capture->putFrame(&fb);
 
-                // === 推送帧到 HTTP / RTSP 流服务器 ===
-                // 注意：此时 fb.data 已不可用（已归还V4L2），推流使用 g_state.frameData
-                //
-                // MJPEG 模式：从共享缓冲区推流
-                // YUYV 模式：libjpeg-turbo 软编码为 JPEG 一次，复用给两个流
-                //
-                bool needEncode = (g_state.format == PixelFormat::FMT_YUYV) &&
+                // 通知处理线程：有新帧可用
+                {
+                    std::lock_guard<std::mutex> lock(g_state.procMtx);
+                    g_state.frameReady = true;
+                }
+                g_state.procCv.notify_one();
+            }
+        });
+
+        // ============================================================
+        // 处理线程（推流 MJPEG/RTSP + 录像，与采集解耦避免阻塞取帧）
+        // ============================================================
+        std::thread* processThread = new std::thread([mjpegServer, mjpegServerOk,
+                                                       rtspServer]() {
+            while (g_state.running) {
+                // 等待采集线程通知新帧
+                {
+                    std::unique_lock<std::mutex> lk(g_state.procMtx);
+                    g_state.procCv.wait(lk, [] {
+                        return g_state.frameReady.load() || !g_state.running.load();
+                    });
+                    g_state.frameReady = false;
+                }
+
+                if (!g_state.running) break;
+
+                // 从共享状态读取帧数据（独立锁，不阻塞采集线程）
+                std::vector<uint8_t> localFrame;
+                int localW = 0, localH = 0;
+                PixelFormat localFmt = PixelFormat::FMT_RGB24;
+
+                {
+                    std::lock_guard<std::mutex> lock(g_state.mtx);
+                    if (g_state.frameData.empty()) continue;
+                    localFrame = g_state.frameData;  // 拷贝出来，快速释放锁
+                    localW   = g_state.width;
+                    localH   = g_state.height;
+                    localFmt = g_state.format;
+                }
+
+                // YUYV → JPEG 编码（CPU 密集，不阻塞采集线程）
+                bool needEncode = (localFmt == PixelFormat::FMT_YUYV) &&
                                   (mjpegServerOk || rtspServer);
                 uint8_t*      jpeg_out = nullptr;
                 unsigned long jpeg_len = 0;
 
                 if (needEncode) {
 #ifdef HAS_LIBJPEG
-                    std::lock_guard<std::mutex> lock(g_state.mtx);
                     VideoProcessor::encodeYUYVtoJPEG(
-                        g_state.frameData.data(),
-                        g_state.width, g_state.height,
+                        localFrame.data(), localW, localH,
                         80, &jpeg_out, &jpeg_len);
 #endif
                 }
 
+                // 推流到 MJPEG HTTP 服务器
                 if (mjpegServerOk) {
-                    if (g_state.format == PixelFormat::FMT_MJPEG) {
-                        std::lock_guard<std::mutex> lock(g_state.mtx);
-                        mjpegServer->updateFrame(g_state.frameData.data(),
-                            static_cast<size_t>(g_state.frameData.size()));
+                    if (localFmt == PixelFormat::FMT_MJPEG) {
+                        mjpegServer->updateFrame(localFrame.data(),
+                            static_cast<size_t>(localFrame.size()));
                     } else if (jpeg_out && jpeg_len > 0) {
                         mjpegServer->updateFrame(jpeg_out,
                             static_cast<size_t>(jpeg_len));
                     }
                 }
 
+                // 推流到 RTSP 服务器
                 if (rtspServer) {
-                    if (g_state.format == PixelFormat::FMT_MJPEG) {
-                        std::lock_guard<std::mutex> lock(g_state.mtx);
-                        rtspServer->feedFrame(g_state.frameData.data(),
-                            static_cast<size_t>(g_state.frameData.size()),
-                            g_state.width, g_state.height);
+                    if (localFmt == PixelFormat::FMT_MJPEG) {
+                        rtspServer->feedFrame(localFrame.data(),
+                            static_cast<size_t>(localFrame.size()),
+                            localW, localH);
                     } else if (jpeg_out && jpeg_len > 0) {
                         rtspServer->feedFrame(jpeg_out,
                             static_cast<size_t>(jpeg_len),
-                            g_state.width, g_state.height);
+                            localW, localH);
                     }
                 }
 
                 if (jpeg_out) free(jpeg_out);
 
-                // 如果正在录像且格式为 MJPEG，写入帧到 AVI 文件
-                if (g_recording && g_state.format == PixelFormat::FMT_MJPEG && g_storage) {
-                    std::lock_guard<std::mutex> lock(g_state.mtx);
-                    g_storage->writeRecordFrame(g_state.frameData.data(),
-                        static_cast<int>(g_state.frameData.size()));
+                // 录像写入（磁盘 I/O，不阻塞采集线程）
+                if (g_recording && localFmt == PixelFormat::FMT_MJPEG && g_storage) {
+                    g_storage->writeRecordFrame(localFrame.data(),
+                        static_cast<int>(localFrame.size()));
                 }
             }
         });
@@ -1044,10 +1079,16 @@ int main(int argc, char* argv[]) {
 
     // ---- 清理 ----
     g_state.running = false;
+    g_state.procCv.notify_all();  // 唤醒处理线程使其退出
 
     if (captureThread && captureThread->joinable()) {
         captureThread->join();
         delete captureThread;
+    }
+
+    if (processThread && processThread->joinable()) {
+        processThread->join();
+        delete processThread;
     }
 
     if (mjpegServer) {
