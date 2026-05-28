@@ -252,6 +252,8 @@ void CameraGUI::connectSignals() {
     connect(m_contrastSlider, &QSlider::valueChanged, this, &CameraGUI::onContrastChanged);
     connect(m_autoWbCheckBox, &QCheckBox::stateChanged, this, &CameraGUI::onAutoWbChanged);
     connect(m_wbSlider, &QSlider::valueChanged, this, &CameraGUI::onWbChanged);
+    connect(m_autoExposureCheckBox, &QCheckBox::stateChanged, this, &CameraGUI::onAutoExposureChanged);
+    connect(m_exposureSlider, &QSlider::valueChanged, this, &CameraGUI::onExposureChanged);
     connect(m_framerateSlider, QOverload<int>::of(&QSlider::valueChanged),
             this, &CameraGUI::onFramerateSliderChanged);
     connect(m_btnResetDefaults, &QPushButton::clicked, this, &CameraGUI::onResetDefaults);
@@ -688,6 +690,41 @@ void CameraGUI::buildSettingsDialog() {
     wbRow->addWidget(m_wbValueLabel);
     camLayout->addLayout(wbRow);
 
+    // 自动曝光
+    auto* autoExpRow = new QHBoxLayout();
+    auto* autoExpLabel = new QLabel(QStringLiteral("Auto Exposure:"), camGroup);
+    autoExpLabel->setFixedWidth(100);
+    m_autoExposureCheckBox = new QCheckBox(QStringLiteral("Auto"), camGroup);
+    m_autoExposureCheckBox->setChecked(true);
+    m_autoExposureCheckBox->setStyleSheet(
+        "QCheckBox { color: #e0e0e0; font-size: 13px; spacing: 6px; }"
+        "QCheckBox::indicator { width: 20px; height: 20px; }"
+        "QCheckBox::indicator:unchecked { "
+        "  border: 2px solid #7f8c8d; border-radius: 3px; background: #16213e; }"
+        "QCheckBox::indicator:checked { "
+        "  border: 2px solid #3498db; border-radius: 3px; background: #3498db; }");
+    autoExpRow->addWidget(autoExpLabel);
+    autoExpRow->addWidget(m_autoExposureCheckBox);
+    autoExpRow->addStretch();
+    camLayout->addLayout(autoExpRow);
+
+    // 手动曝光值
+    auto* expRow = new QHBoxLayout();
+    auto* expLabel = new QLabel(QStringLiteral("Exposure:"), camGroup);
+    expLabel->setFixedWidth(100);
+    m_exposureSlider = new QSlider(Qt::Horizontal, camGroup);
+    m_exposureSlider->setRange(1, 5000);
+    m_exposureSlider->setValue(312);
+    m_exposureSlider->setEnabled(false);  // 自动曝光开启时禁用
+    m_exposureSlider->setStyleSheet(sliderStyle);
+    m_exposureValue = new QLabel(QStringLiteral("312"), camGroup);
+    m_exposureValue->setFixedWidth(60);
+    m_exposureValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    expRow->addWidget(expLabel);
+    expRow->addWidget(m_exposureSlider, 1);
+    expRow->addWidget(m_exposureValue);
+    camLayout->addLayout(expRow);
+
     // 帧率
     auto* fpsRow = new QHBoxLayout();
     auto* fpsLabel = new QLabel(QStringLiteral("Framerate:"), camGroup);
@@ -791,6 +828,53 @@ void CameraGUI::setAutoWhiteBalance(bool enabled) {
     m_autoWbCheckBox->setChecked(enabled);
     m_autoWbCheckBox->blockSignals(false);
     m_wbSlider->setEnabled(!enabled);
+}
+
+void CameraGUI::setExposureRange(int min, int max, int step, int value) {
+    m_exposureInfo = {min, max, step, value, value};
+
+    m_exposureSlider->blockSignals(true);
+    m_exposureSlider->setRange(min, max);
+    m_exposureSlider->setSingleStep(step);
+    m_exposureSlider->setPageStep(step * 10);
+    m_exposureSlider->setValue(value);
+    m_exposureSlider->blockSignals(false);
+    m_exposureValue->setText(QString::number(value));
+}
+
+void CameraGUI::setAutoExposure(bool enabled) {
+    m_autoExposureDefault = enabled;
+    m_autoExposureCheckBox->blockSignals(true);
+    m_autoExposureCheckBox->setChecked(enabled);
+    m_autoExposureCheckBox->blockSignals(false);
+    m_exposureSlider->setEnabled(!enabled);
+}
+
+void CameraGUI::onAutoExposureChanged(int state) {
+    bool autoExp = (state == Qt::Checked);
+    m_exposureSlider->setEnabled(!autoExp);
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO),
+                          autoExp ? 3 : 1);  // 3=auto(Aperture Priority), 1=manual
+    }
+    // 切换到手动模式时，写入当前滑块值
+    if (!autoExp) {
+        int val = m_exposureSlider->value();
+        m_exposureInfo.current = val;
+        if (m_onCameraControl) {
+            m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE), val);
+        }
+    }
+    qDebug() << "[GUI] Auto Exposure changed:" << (autoExp ? "ON" : "OFF");
+}
+
+void CameraGUI::onExposureChanged(int value) {
+    m_exposureValue->setText(QString::number(value));
+    m_exposureInfo.current = value;
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE), value);
+    }
+    qDebug() << "[GUI] Exposure changed:" << value;
 }
 
 void CameraGUI::setFramerateRange(int minFps, int maxFps, int currentFps) {
@@ -904,6 +988,19 @@ void CameraGUI::onResetDefaults() {
                           m_autoWbDefault ? 1 : 0);
         m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_WHITE_BALANCE_TEMPERATURE),
                           m_wbInfo.def);
+    }
+
+    // 恢复曝光
+    m_autoExposureCheckBox->setChecked(m_autoExposureDefault);
+    m_exposureSlider->setValue(m_exposureInfo.def);
+    m_exposureValue->setText(QString::number(m_exposureInfo.def));
+    m_exposureInfo.current = m_exposureInfo.def;
+    m_exposureSlider->setEnabled(!m_autoExposureDefault);
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO),
+                          m_autoExposureDefault ? 3 : 1);
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
+                          m_exposureInfo.def);
     }
 
     // 恢复帧率（停止防抖计时器，直接执行，避免重复触发）

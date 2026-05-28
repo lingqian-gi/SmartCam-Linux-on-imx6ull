@@ -81,6 +81,10 @@ public:
     void setWhiteBalanceRange(int min, int max, int step, int value);
     void setAutoWhiteBalance(bool enabled);
 
+    // ---- 曝光控制 ----
+    void setExposureRange(int min, int max, int step, int value);
+    void setAutoExposure(bool enabled);
+
     // ---- 帧率设置 ----
     void setFramerateRange(int minFps, int maxFps, int currentFps);
 
@@ -113,6 +117,8 @@ private slots:
     void onResetDefaults();
     void onFramerateSliderChanged(int value);
     void onFramerateDebounced();        // 防抖后真正执行帧率变更
+    void onAutoExposureChanged(int state);
+    void onExposureChanged(int value);
 
 private:
     void buildUI();
@@ -152,6 +158,10 @@ private:
     QSlider*     m_wbSlider         = nullptr;
     QLabel*      m_wbValueLabel     = nullptr;
     QCheckBox*   m_autoWbCheckBox   = nullptr;
+    // 曝光控制
+    QSlider*     m_exposureSlider   = nullptr;
+    QLabel*      m_exposureValue    = nullptr;
+    QCheckBox*   m_autoExposureCheckBox = nullptr;
     QPushButton* m_btnResetDefaults = nullptr;
 
     // 帧率控制
@@ -173,6 +183,8 @@ private:
     ControlInfo m_contrastInfo;
     ControlInfo m_wbInfo;
     bool        m_autoWbDefault       = true;
+    ControlInfo m_exposureInfo;         // 手动曝光参数
+    bool        m_autoExposureDefault = true;
     bool        m_cameraControlsAvailable = false;
 
     // 帧率控制参数

@@ -389,39 +389,37 @@ int main(int argc, char* argv[]) {
                 LOG_INF("Auto WB: cur=%d", val);
             }
 
-            // 自动曝光 → 强制手动模式，防止低光环境下摄像头降帧率
-            // 同时设置合理的固定曝光值，避免画面变暗
+            // 自动曝光 → 查询并设置 GUI，同时强制手动模式防帧率下降
             {
                 int expMin, expMax, expStep, expDef, expVal;
                 if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO,
                                            expMin, expMax, expStep, expDef) == 0) {
                     capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO, expVal);
                     LOG_INF("Auto Exposure: cur=%d (1=manual, 3=auto)", expVal);
-                    // V4L2_EXPOSURE_MANUAL = 1，强制手动模式
+                    // V4L2_EXPOSURE_MANUAL = 1，强制手动模式以保持帧率
                     if (expVal != 1) {
                         capture->setControl(
                             static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO), 1);
-                        LOG_INF("Auto Exposure disabled (set to manual mode) to preserve framerate");
+                        LOG_INF("Auto Exposure disabled (set to manual) to preserve framerate");
                     }
-                    // 设置固定曝光值，保证画面亮度
-                    // 曝光单位通常为 100μs，312 = 31.2ms ≈ 1/32s（适合30fps）
-                    int absMin, absMax, absStep, absDef, absCur;
-                    if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
-                                               absMin, absMax, absStep, absDef) == 0) {
-                        capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
-                        // 目标曝光值：取当前值 或 默认值 或 312（~1/32s）
-                        int targetExposure = (absCur > 0) ? absCur : (absDef > 0 ? absDef : 312);
-                        // clamp 到有效范围并确保不超过帧间隔（33ms ≈ 330）
-                        if (targetExposure < absMin) targetExposure = absMin;
-                        if (targetExposure > absMax) targetExposure = absMax;
-                        // 30fps 要求曝光 < 33ms，保守取 300（30ms）
-                        if (targetExposure > 300) targetExposure = 300;
-                        capture->setControl(
-                            static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
-                            targetExposure);
-                        LOG_INF("Exposure absolute set to %d (was %d, range [%d,%d])",
-                                 targetExposure, absCur, absMin, absMax);
-                    }
+                    gui.setAutoExposure(false);  // 初始默认关闭自动曝光
+                }
+
+                // 曝光绝对值
+                int absMin, absMax, absStep, absDef, absCur;
+                if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
+                                           absMin, absMax, absStep, absDef) == 0) {
+                    capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
+                    int targetExposure = (absCur > 0) ? absCur : (absDef > 0 ? absDef : 312);
+                    if (targetExposure < absMin) targetExposure = absMin;
+                    if (targetExposure > absMax) targetExposure = absMax;
+                    if (targetExposure > 300) targetExposure = 300;  // 30fps要求曝光<33ms
+                    capture->setControl(
+                        static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
+                        targetExposure);
+                    gui.setExposureRange(absMin, absMax, absStep, targetExposure);
+                    LOG_INF("Exposure: range=[%d,%d] step=%d, set to %d",
+                             absMin, absMax, absStep, targetExposure);
                 }
             }
 
