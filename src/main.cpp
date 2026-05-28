@@ -60,6 +60,7 @@ struct CaptureState {
     std::mutex              pauseMtx;        // 暂停同步锁
     std::condition_variable pauseCv;         // 暂停同步条件变量
     std::atomic<bool>       pausedAck{false}; // 采集线程已确认暂停
+    std::atomic<int>        targetFps{0};    // 用户设定的目标帧率（0=不限制，跟随硬件）
 };
 static CaptureState g_state;
 
@@ -449,21 +450,35 @@ int main(int argc, char* argv[]) {
                         [] { return g_state.pausedAck.load(); });
                 }
 
-                // 2. 停止采集流 → 设置帧率 → 重启采集流
+                // 2. 停止采集流 → 设置帧率 → 验证 → 重启采集流
                 capture->stopCapture();
                 int ret = capture->setFramerate(1, fps);
                 if (ret < 0) {
-                    LOG_WRN("setFramerate(%d) failed (ret=%d)", fps, ret);
+                    LOG_WRN("setFramerate(%d) failed (ret=%d), will use software throttle",
+                             fps, ret);
                 } else {
-                    LOG_INF("Framerate changed to %d fps", fps);
+                    // 验证：读回驱动实际设定的帧率
+                    int num = 1, den = 1;
+                    capture->getFramerate(num, den);
+                    int actualFps = (num > 0) ? (den / num) : 0;
+                    if (actualFps > 0 && actualFps != fps) {
+                        LOG_WRN("VIDIOC_S_PARM accepted but driver adjusted: "
+                                "requested=%d, actual=%d", fps, actualFps);
+                    } else if (actualFps == fps) {
+                        LOG_INF("Framerate changed to %d fps (hardware)", fps);
+                    }
                 }
                 capture->startCapture();
 
-                // 3. 恢复采集线程
+                // 3. 设置软件帧率节流目标（无论硬件是否真正生效，软件丢帧兜底）
+                g_state.targetFps = fps;
+                LOG_INF("Software framerate throttle set to %d fps", fps);
+
+                // 4. 恢复采集线程
                 g_state.paused = false;
                 g_state.pauseCv.notify_one();
 
-                // 4. 同步更新 RTSP 服务器的 SDP 和 RTP 时间戳
+                // 5. 同步更新 RTSP 服务器的 SDP 和 RTP 时间戳
                 if (rtspServer) {
                     Resolution res = capture->getCurrentResolution();
                     rtspServer->setStreamInfo(res.width, res.height, fps);
@@ -471,9 +486,9 @@ int main(int argc, char* argv[]) {
                              res.width, res.height, fps);
                 }
 
-                // 5. 更新显示定时器间隔，至少 10ms，最高 100ms (10fps)
+                // 6. 更新显示定时器间隔
                 if (displayTimer) {
-                    int intervalMs = std::max(10, std::min(100, 1000 / fps));
+                    int intervalMs = std::max(10, 1000 / fps);
                     displayTimer->setInterval(intervalMs);
                     LOG_INF("Display timer interval updated to %d ms (target %d fps)",
                              intervalMs, fps);
@@ -695,6 +710,9 @@ int main(int argc, char* argv[]) {
         captureThread = new std::thread([capture, mjpegServer, mjpegServerOk,
                                              rtspServer]() {
             FrameBuffer fb;
+            // 帧率节流：记录上次输出帧的时间戳
+            auto lastOutputTime = std::chrono::steady_clock::now();
+            int  throttleFps    = g_state.targetFps.load();
 
             while (g_state.running) {
                 // 暂停期间等待恢复（分辨率/格式切换中）
@@ -707,9 +725,29 @@ int main(int argc, char* argv[]) {
                 }
                 g_state.pausedAck = false;
 
+                // 读取用户设定的目标帧率（可能随时变化）
+                throttleFps = g_state.targetFps.load();
+
                 if (capture->getFrame(&fb, 1000) < 0) {
                     if (!g_state.running) break;
                     continue;  // 超时重试
+                }
+
+                // ---- 帧率节流 ----
+                // 当用户设定了目标帧率时，如果硬件实际出帧率高于目标，
+                // 通过丢帧来限制输出帧率
+                if (throttleFps > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsedMs = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(now - lastOutputTime).count();
+                    auto minIntervalMs = 1000 / throttleFps;
+
+                    if (elapsedMs < minIntervalMs) {
+                        // 距离上次输出帧的时间不够，跳过此帧（丢帧节流）
+                        capture->putFrame(&fb);
+                        continue;
+                    }
+                    lastOutputTime = now;
                 }
 
                 {
@@ -720,7 +758,7 @@ int main(int argc, char* argv[]) {
                     g_state.width  = fb.width;
                     g_state.height = fb.height;
                     g_state.format = fb.format;
-                    g_state.fps    = capture->getCurrentFPS();
+                    g_state.fps = capture->getCurrentFPS();
                 }
 
                 // === 推送帧到 HTTP / RTSP 流服务器 ===
