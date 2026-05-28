@@ -231,6 +231,8 @@ public:
     static constexpr uint32_t V4L2_CID_CONTRAST                 = 0x00980901;
     static constexpr uint32_t V4L2_CID_AUTO_WHITE_BALANCE       = 0x0098090C;
     static constexpr uint32_t V4L2_CID_WHITE_BALANCE_TEMPERATURE = 0x0098090A;
+    static constexpr uint32_t V4L2_CID_EXPOSURE_AUTO            = 0x009a0901;
+    static constexpr uint32_t V4L2_CID_EXPOSURE_ABSOLUTE        = 0x009a0902;
 
 private:
     // ============================================================
