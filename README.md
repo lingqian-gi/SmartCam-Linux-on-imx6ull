@@ -69,26 +69,7 @@ SmartCam 提供两种交叉编译方式，根据你的开发环境选择：
 
 ---
 
-**方式一：Docker 本地交叉编译（推荐，宿主机直通 GitHub）**
-
-适用于 x86 宿主机可直接访问 GitHub 的场景。
-
-```bash
-cd SmartCam-Linux-on-imx6ull
-
-# 构建镜像（仅首次，约 5 分钟）
-docker build -f Dockerfile.arm -t smartcam-cross .
-
-# 编译（每次源码变更后执行）
-docker run --rm -v $(pwd):/workspace smartcam-cross
-# 产物: build/arm/smartcam
-```
-
-> ⚠️ `Dockerfile.arm` 基于 Ubuntu 22.04（glibc 2.35）。如果开发板系统较旧（Debian 10/11，glibc ≤ 2.31），运行时会报 `GLIBC_2.33 not found`。此时请改用**方式二**。
-
----
-
-**方式二：Docker sysroot 交叉编译（GitHub 中转，适配老旧板子系统）**
+**方式一：Docker sysroot 交叉编译（GitHub 中转，适配老旧板子系统）**
 
 适用于远程开发（如 CNB 云端环境）无法直连开发板，或板子系统库版本与 Docker 不匹配的场景。核心思路：通过 **GitHub 仓库** 中转，把开发板的根文件系统（sysroot）传到编译环境。
 
@@ -150,7 +131,7 @@ docker run --rm -v $(pwd):/workspace smartcam-cross-sysroot
 
 ---
 
-**方式三：宿主机直接编译（无需 Docker）**
+**方式二：宿主机直接编译（无需 Docker）**
 
 ```bash
 # 安装交叉编译器
