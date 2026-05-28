@@ -456,18 +456,9 @@ int main(int argc, char* argv[]) {
                 if (ret < 0) {
                     LOG_WRN("setFramerate(%d) failed (ret=%d), will use software throttle",
                              fps, ret);
-                } else {
-                    // 验证：读回驱动实际设定的帧率
-                    int num = 1, den = 1;
-                    capture->getFramerate(num, den);
-                    int actualFps = (num > 0) ? (den / num) : 0;
-                    if (actualFps > 0 && actualFps != fps) {
-                        LOG_WRN("VIDIOC_S_PARM accepted but driver adjusted: "
-                                "requested=%d, actual=%d", fps, actualFps);
-                    } else if (actualFps == fps) {
-                        LOG_INF("Framerate changed to %d fps (hardware)", fps);
-                    }
                 }
+                // 注意：即使 setFramerate 返回成功，驱动可能已调整帧率为硬件实际支持的值
+                // （setFramerate 内部会输出调整日志）。软件节流会兜底保证目标帧率。
                 capture->startCapture();
 
                 // 3. 设置软件帧率节流目标（无论硬件是否真正生效，软件丢帧兜底）
@@ -761,28 +752,36 @@ int main(int argc, char* argv[]) {
                     g_state.fps = capture->getCurrentFPS();
                 }
 
+                // === 立即归还 V4L2 缓冲区 ===
+                // 拷贝完成后马上归还，让硬件可以写入下一帧，避免缓冲区耗尽导致丢帧
+                capture->putFrame(&fb);
+
                 // === 推送帧到 HTTP / RTSP 流服务器 ===
+                // 注意：此时 fb.data 已不可用（已归还V4L2），推流使用 g_state.frameData
                 //
-                // MJPEG 模式：摄像头硬件直出 JPEG — 零拷贝，直接推流
+                // MJPEG 模式：从共享缓冲区推流
                 // YUYV 模式：libjpeg-turbo 软编码为 JPEG 一次，复用给两个流
                 //
-                bool needEncode = (fb.format == PixelFormat::FMT_YUYV) &&
+                bool needEncode = (g_state.format == PixelFormat::FMT_YUYV) &&
                                   (mjpegServerOk || rtspServer);
                 uint8_t*      jpeg_out = nullptr;
                 unsigned long jpeg_len = 0;
 
                 if (needEncode) {
 #ifdef HAS_LIBJPEG
+                    std::lock_guard<std::mutex> lock(g_state.mtx);
                     VideoProcessor::encodeYUYVtoJPEG(
-                        fb.data, fb.width, fb.height,
+                        g_state.frameData.data(),
+                        g_state.width, g_state.height,
                         80, &jpeg_out, &jpeg_len);
 #endif
                 }
 
                 if (mjpegServerOk) {
-                    if (fb.format == PixelFormat::FMT_MJPEG) {
-                        mjpegServer->updateFrame(fb.data,
-                            static_cast<size_t>(fb.length));
+                    if (g_state.format == PixelFormat::FMT_MJPEG) {
+                        std::lock_guard<std::mutex> lock(g_state.mtx);
+                        mjpegServer->updateFrame(g_state.frameData.data(),
+                            static_cast<size_t>(g_state.frameData.size()));
                     } else if (jpeg_out && jpeg_len > 0) {
                         mjpegServer->updateFrame(jpeg_out,
                             static_cast<size_t>(jpeg_len));
@@ -790,26 +789,26 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (rtspServer) {
-                    if (fb.format == PixelFormat::FMT_MJPEG) {
-                        rtspServer->feedFrame(fb.data,
-                            static_cast<size_t>(fb.length),
-                            fb.width, fb.height);
+                    if (g_state.format == PixelFormat::FMT_MJPEG) {
+                        std::lock_guard<std::mutex> lock(g_state.mtx);
+                        rtspServer->feedFrame(g_state.frameData.data(),
+                            static_cast<size_t>(g_state.frameData.size()),
+                            g_state.width, g_state.height);
                     } else if (jpeg_out && jpeg_len > 0) {
                         rtspServer->feedFrame(jpeg_out,
                             static_cast<size_t>(jpeg_len),
-                            fb.width, fb.height);
+                            g_state.width, g_state.height);
                     }
                 }
 
                 if (jpeg_out) free(jpeg_out);
 
                 // 如果正在录像且格式为 MJPEG，写入帧到 AVI 文件
-                if (g_recording && fb.format == PixelFormat::FMT_MJPEG && g_storage) {
-                    g_storage->writeRecordFrame(fb.data, fb.length);
+                if (g_recording && g_state.format == PixelFormat::FMT_MJPEG && g_storage) {
+                    std::lock_guard<std::mutex> lock(g_state.mtx);
+                    g_storage->writeRecordFrame(g_state.frameData.data(),
+                        static_cast<int>(g_state.frameData.size()));
                 }
-
-                // 归还缓冲区到 V4L2 队列
-                capture->putFrame(&fb);
             }
         });
 

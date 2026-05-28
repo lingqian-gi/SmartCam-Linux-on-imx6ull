@@ -223,9 +223,19 @@ int CameraCapture::setFramerate(int numerator, int denominator) {
         return -errno;
     }
 
-    LOG_INF("Framerate set: %d/%d fps",
-             parm.parm.capture.timeperframe.denominator,
-             parm.parm.capture.timeperframe.numerator);
+    // 驱动可能在 ioctl 返回后调整 timeperframe 值（修正为硬件实际支持的帧率）
+    int reqFps = (numerator > 0) ? (denominator / numerator) : 0;
+    int actFps = (parm.parm.capture.timeperframe.numerator > 0)
+                     ? (static_cast<int>(parm.parm.capture.timeperframe.denominator) /
+                        static_cast<int>(parm.parm.capture.timeperframe.numerator))
+                     : 0;
+
+    if (actFps != reqFps) {
+        LOG_WRN("VIDIOC_S_PARM: requested %d fps, driver adjusted to %d fps",
+                 reqFps, actFps);
+    } else {
+        LOG_INF("Framerate set to %d fps", actFps);
+    }
     return 0;
 }
 
