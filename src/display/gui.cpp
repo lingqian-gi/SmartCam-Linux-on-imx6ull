@@ -735,6 +735,12 @@ void CameraGUI::buildSettingsDialog() {
 
     // ---- 关闭按钮连接 ----
     connect(btnClose, &QPushButton::clicked, m_settingsDialog, &QDialog::close);
+
+    // ---- 帧率防抖计时器 ----
+    m_framerateDebounceTimer = new QTimer(this);
+    m_framerateDebounceTimer->setSingleShot(true);  // 单次触发
+    connect(m_framerateDebounceTimer, &QTimer::timeout,
+            this, &CameraGUI::onFramerateDebounced);
 }
 
 // ============================================================
@@ -849,12 +855,21 @@ void CameraGUI::onWbChanged(int value) {
 }
 
 void CameraGUI::onFramerateSliderChanged(int value) {
+    // 立即更新标签（视觉反馈），延迟触发实际帧率变更
     m_framerateValue->setText(QString("%1 fps").arg(value));
+    m_framerateInfo.current = value;
+    // 重启防抖计时器：300ms 内无新变化才真正执行
+    m_framerateDebounceTimer->start(300);
+}
+
+void CameraGUI::onFramerateDebounced() {
+    // 防抖结束后，用滑块最终停留的值触发回调
+    int value = m_framerateSlider->value();
     m_framerateInfo.current = value;
     if (m_onFramerate) {
         m_onFramerate(value);
     }
-    qDebug() << "[GUI] Framerate changed:" << value;
+    qDebug() << "[GUI] Framerate changed (debounced):" << value;
 }
 
 void CameraGUI::onResetDefaults() {
@@ -891,7 +906,8 @@ void CameraGUI::onResetDefaults() {
                           m_wbInfo.def);
     }
 
-    // 恢复帧率
+    // 恢复帧率（停止防抖计时器，直接执行，避免重复触发）
+    m_framerateDebounceTimer->stop();
     m_framerateSlider->setValue(m_framerateInfo.def);
     m_framerateValue->setText(QString("%1 fps").arg(m_framerateInfo.def));
     m_framerateInfo.current = m_framerateInfo.def;

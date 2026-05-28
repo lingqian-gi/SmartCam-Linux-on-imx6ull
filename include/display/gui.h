@@ -112,6 +112,7 @@ private slots:
     void onWbChanged(int value);
     void onResetDefaults();
     void onFramerateSliderChanged(int value);
+    void onFramerateDebounced();        // 防抖后真正执行帧率变更
 
 private:
     void buildUI();
@@ -156,6 +157,7 @@ private:
     // 帧率控制
     QSlider*     m_framerateSlider  = nullptr;
     QLabel*      m_framerateValue   = nullptr;
+    QTimer*      m_framerateDebounceTimer = nullptr;  // 帧率防抖计时器
 
     // ====== 数据 ======
     FrameBuffer  m_currentFrame;
