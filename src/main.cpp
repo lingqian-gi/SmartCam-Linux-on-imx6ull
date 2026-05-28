@@ -435,18 +435,35 @@ int main(int argc, char* argv[]) {
                 }
             });
 
-            // 注册帧率变更回调：滑块变化 → V4L2 setFramerate + 更新 RTSP + 更新显示定时器
+            // 注册帧率变更回调：滑块变化 → 暂停采集 → 停止流 → 设置帧率 → 重启流 → 恢复采集
+            // VIDIOC_S_PARM 在 STREAMON 期间返回 EBUSY，必须先停止流再设置帧率
             gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
                 if (fps <= 0) return;
 
+                // 1. 暂停采集线程，防止 stopCapture 时采集线程还在使用 mmap 缓冲区
+                g_state.paused = true;
+                {
+                    std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+                    g_state.pauseCv.wait_until(lk,
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+                        [] { return g_state.pausedAck.load(); });
+                }
+
+                // 2. 停止采集流 → 设置帧率 → 重启采集流
+                capture->stopCapture();
                 int ret = capture->setFramerate(1, fps);
                 if (ret < 0) {
                     LOG_WRN("setFramerate(%d) failed (ret=%d)", fps, ret);
                 } else {
                     LOG_INF("Framerate changed to %d fps", fps);
                 }
+                capture->startCapture();
 
-                // 同步更新 RTSP 服务器的 SDP 和 RTP 时间戳
+                // 3. 恢复采集线程
+                g_state.paused = false;
+                g_state.pauseCv.notify_one();
+
+                // 4. 同步更新 RTSP 服务器的 SDP 和 RTP 时间戳
                 if (rtspServer) {
                     Resolution res = capture->getCurrentResolution();
                     rtspServer->setStreamInfo(res.width, res.height, fps);
@@ -454,7 +471,7 @@ int main(int argc, char* argv[]) {
                              res.width, res.height, fps);
                 }
 
-                // 更新显示定时器间隔，至少 10ms，最高 100ms (10fps)
+                // 5. 更新显示定时器间隔，至少 10ms，最高 100ms (10fps)
                 if (displayTimer) {
                     int intervalMs = std::max(10, std::min(100, 1000 / fps));
                     displayTimer->setInterval(intervalMs);
