@@ -4,6 +4,7 @@
 > **创建日期**：2026-05-23
 > **状态**：✅ 已实现，语法检查通过
 > **依赖**：C++17、POSIX（statvfs/dirent）、单线程 safe（mutex 保护）
+> **最后更新**：2026-05-29 — v0.6 新增 `getTotalSpaceMB()`
 
 ---
 
@@ -123,6 +124,7 @@ public:
 
     // ---- 空间管理 ----
     int getFreeSpaceMB(const std::string& path = "");
+    int getTotalSpaceMB(const std::string& path = "");  // v0.6 新增
     int autoCleanup(int keep_mb = 100);
 
     // ---- 配置 ----
@@ -392,7 +394,41 @@ int StorageManager::getFreeSpaceMB(const std::string& path) {
 }
 ```
 
-### 8.2 `autoCleanup(keep_mb)`
+### 8.2 `getTotalSpaceMB()` (v0.6 新增)
+
+```cpp
+int StorageManager::getTotalSpaceMB(const std::string& path) {
+    std::string checkPath = path.empty() ? m_videoDir : path;
+
+    struct statvfs vfs;
+    statvfs(checkPath.c_str(), &vfs);
+    unsigned long long totalBytes =
+        (unsigned long long)vfs.f_bsize * vfs.f_blocks;
+    return (int)(totalBytes / (1024 * 1024));
+}
+```
+
+与 `getFreeSpaceMB()` 配对使用，计算文件系统总容量。两者的 `statvfs` 调用可合并为一次以提升性能：
+
+| 字段 | 含义 | 用途 |
+|------|------|------|
+| `f_blocks` | 文件系统总块数 | `getTotalSpaceMB()` |
+| `f_bavail` | 非特权用户可用块数 | `getFreeSpaceMB()` |
+| `f_bsize` | 块大小（字节） | 两者共用 |
+
+**与 Gallery 存储状态栏的集成**：
+
+```cpp
+// PhotoGallery::updateStorageInfo() 中
+int freeMB  = storage->getFreeSpaceMB();   // 剩余
+int totalMB = storage->getTotalSpaceMB();  // 总容量
+int usedMB  = totalMB - freeMB;            // 已用
+// → 显示 "Storage: 2.3 / 8.0 GB"
+```
+
+`statvfs` 是 POSIX 系统调用（非 `df` 命令），无子进程开销，在 iMX6ULL 上单次调用耗时 < 1ms，适合嵌入式场景。
+
+### 8.3 `autoCleanup(keep_mb)`
 
 1. `opendir()` 遍历 `photoDir` 和 `videoDir` 下的日期子目录 (`YYYYMMDD/`)
 2. 对每个 `d_type == DT_REG` 文件，`stat()` 获取 `st_mtime`
@@ -617,3 +653,4 @@ class ConfigManager {
 |------|----------|
 | 2026-05-23 | 文档创建：StorageManager 类设计、AVI 容器格式、空间管理、面试要点 |
 | 2026-05-27 | v0.5：持久化存储路径 — Settings 面板 Store 选择器、ConfigManager 写入支持、用户级配置 fallback |
+| 2026-05-29 | v0.6：新增 `getTotalSpaceMB()` — 与 `getFreeSpaceMB()` 配对，为 Gallery 存储空间状态栏提供总容量数据；基于 `statvfs.f_blocks` |

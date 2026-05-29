@@ -1,6 +1,6 @@
 # SmartCam 相册模块 — 实现文档
 
-> 版本: v1.0 | 日期: 2026-05-24 | 作者: SmartCam Team
+> 版本: v1.1 | 日期: 2026-05-29 | 作者: SmartCam Team
 
 ---
 
@@ -22,6 +22,7 @@
 | 返回 | 全屏→网格→实时预览，三级导航 |
 | 空相册提示 | 无媒体时显示 "No photos yet — Tap Capture to take one!" |
 | 自动刷新 | 删除后自动刷新列表，回到正确位置 |
+| 存储空间状态栏 | 顶栏右侧实时显示已用/总空间，<5% 红色警报，<15% 橙色警告 |
 
 ---
 
@@ -29,10 +30,10 @@
 
 | 文件 | 操作 | 行数变化 | 说明 |
 |------|------|----------|------|
-| `include/display/gallery.h` | **新增** | +90 行 | `PhotoGallery` 类声明 |
-| `src/display/gallery.cpp` | **新增** | +430 行 | `PhotoGallery` 完整实现（含视频支持） |
-| `include/storage/manager.h` | **修改** | +80 行 | `PhotoInfo` 新增 `isVideo` 字段；新增 `VideoDayGroup` 别名 + 6 个新方法声明 |
-| `src/storage/manager.cpp` | **修改** | +360 行 | 实现 `listPhotos()`/`deletePhoto()`/`readJpegSize()`/`getPhotoCount()` + `listVideos()`/`deleteVideo()`/`getVideoCount()` |
+| `include/display/gallery.h` | **新增** | +90 行→~105 行 | `PhotoGallery` 类声明（含 v0.6 `m_storageInfoLabel`） |
+| `src/display/gallery.cpp` | **新增** | +430 行→~500 行 | `PhotoGallery` 完整实现（含视频支持 + v0.6 存储空间状态栏） |
+| `include/storage/manager.h` | **修改** | +80 行→~97 行 | `PhotoInfo` 新增 `isVideo` 字段；新增 `VideoDayGroup` 别名 + 6 个新方法声明；v0.6 新增 `getTotalSpaceMB()` |
+| `src/storage/manager.cpp` | **修改** | +360 行→~380 行 | 实现 `listPhotos()`/`deletePhoto()`/`readJpegSize()`/`getPhotoCount()` + `listVideos()`/`deleteVideo()`/`getVideoCount()` + v0.6 `getTotalSpaceMB()` |
 | `include/display/gui.h` | **修改** | +20 行 | 新增 QStackedWidget、Gallery 按钮、PhotoGallery 成员及 3 个公开方法 |
 | `src/display/gui.cpp` | **修改** | +90 行 | 布局重组 + Gallery 按钮/信号 + showGallery/showLivePreview/setGalleryStorage |
 | `src/main.cpp` | **修改** | +3 行 | 调用 `gui.setGalleryStorage(&storage)` 绑定存储到相册 |
@@ -291,7 +292,8 @@ PhotoGallery : public QWidget
     ├── createThumbnailFromJpegData() — v0.4 新增：内存 JPEG → 缩略图
     ├── createVideoThumbnail()        — v0.4 新增：AVI → 首帧 → 缩略图
     ├── stopVideoPlayback()           — v0.4 新增：停止当前视频播放
-    └── updateFullscreenDisplay()     — 刷新全屏 (v0.4: 切换 照片/视频 子页面)
+    ├── updateFullscreenDisplay()     — 刷新全屏 (v0.4: 切换 照片/视频 子页面)
+    └── updateStorageInfo()           — v0.6 新增：更新存储空间状态栏
 ```
 
 ### 5.2 网格视图 (`buildGalleryView`)
@@ -301,7 +303,8 @@ PhotoGallery : public QWidget
 QVBoxLayout
 ├── QHBoxLayout (顶部导航栏)
 │   ├── ← Back 按钮 → 发射 backToLive() 信号
-│   └── QLabel "Gallery (N photos)"
+│   ├── QLabel "Gallery (N photos, M videos)"  ← 标题
+│   └── QLabel "Storage: 2.3 / 8.0 GB"         ← v0.6 存储空间状态栏
 ├── QScrollArea (可滚动缩略图区域)
 │   └── QWidget
 │       └── QGridLayout (3 列)
@@ -575,6 +578,137 @@ if (info.isVideo) {
 - 典型耗时：文件打开 ~1ms + AVI 头解析 ~2ms + JPEG 读取 ~1ms + 解码 ~5ms = **~10ms/视频**
 - 对于数十个视频项，首次加载延迟可感知但可接受（< 1 秒）
 - 后续可优化为缓存缩略图文件（如 `.thumb.jpg`）
+
+### 5.9 存储空间状态栏 (v0.6 新增)
+
+进入 Gallery 时，顶部导航栏右侧实时显示设备的存储空间使用情况，帮助用户感知存储容量状态，避免在内存不足时反复拍摄导致保存失败。
+
+#### 5.9.1 视觉设计
+
+存储信息以紧凑格式显示在 Gallery 标题右侧，与标题栏视觉一致：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  [← Back]  Gallery (12 photos, 3 videos)     Storage: 2.3/8.0 GB│
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| 空间占比 | 颜色 | 文字 | 样式 |
+|----------|------|------|------|
+| < 5% | 红色 `#e74c3c` | `Storage: 0.2/8.0 GB LOW!` | `font-weight: bold` |
+| 5% — 15% | 橙色 `#f39c12` | `Storage: 1.0/8.0 GB` | 常规 |
+| > 15% | 灰色 `#7f8c8d` | `Storage: 2.3/8.0 GB` | 常规 |
+
+**格式自适应**：
+- 总空间 ≥ 1 GB 时：显示 `X.X / X.X GB`（1 位小数）
+- 总空间 < 1 GB 时：降级显示 `X / X MB`（整数）
+
+#### 5.9.2 实现
+
+**存储层 — `StorageManager::getTotalSpaceMB()`**：
+
+`storage/manager.cpp` 中新增方法，通过 `statvfs()` 系统调用的 `f_blocks * f_bsize` 计算文件系统总容量（与已有的 `getFreeSpaceMB()` 配对）：
+
+```cpp
+int StorageManager::getTotalSpaceMB(const std::string& path) {
+    std::string checkPath = path.empty() ? m_videoDir : path;
+
+    struct statvfs vfs;
+    if (statvfs(checkPath.c_str(), &vfs) < 0) {
+        LOG_ERR_("getTotalSpaceMB: statvfs(%s) failed: %s",
+                 checkPath.c_str(), strerror(errno));
+        return -1;
+    }
+
+    unsigned long long totalBytes =
+        static_cast<unsigned long long>(vfs.f_bsize) *
+        static_cast<unsigned long long>(vfs.f_blocks);
+    return static_cast<int>(totalBytes / (1024 * 1024));
+}
+```
+
+**展示层 — `PhotoGallery::updateStorageInfo()`**：
+
+`display/gallery.cpp` 中新增方法，在 Gallery 可见时按需调用，将存储信息渲染到顶栏右侧标签：
+
+```cpp
+void PhotoGallery::updateStorageInfo() {
+    if (!m_storage || !m_storageInfoLabel) return;
+
+    int freeMB  = m_storage->getFreeSpaceMB();
+    int totalMB = m_storage->getTotalSpaceMB();
+
+    if (freeMB < 0 || totalMB < 0) {
+        m_storageInfoLabel->setText("Storage: N/A");
+        return;
+    }
+
+    int usedMB = totalMB - freeMB;
+    QString text;
+
+    if (totalMB >= 1024) {
+        double totalGB = totalMB / 1024.0;
+        double usedGB  = usedMB  / 1024.0;
+        text = QString("Storage: %1 / %2 GB")
+                   .arg(usedGB, 0, 'f', 1)
+                   .arg(totalGB, 0, 'f', 1);
+    } else {
+        text = QString("Storage: %1 / %2 MB").arg(usedMB).arg(totalMB);
+    }
+
+    // 空间不足时颜色+文字警告
+    double freeRatio = (totalMB > 0) ? (double)freeMB / totalMB : 0.0;
+    if (freeRatio < 0.05) {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #e74c3c; padding: 2px 6px;"
+            "font-weight: bold;");
+        text += "  \u26A0 LOW!";
+    } else if (freeRatio < 0.15) {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #f39c12; padding: 2px 6px;");
+    } else {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
+    }
+
+    m_storageInfoLabel->setText(text);
+}
+```
+
+#### 5.9.3 更新时机
+
+存储信息在以下时机自动刷新，保证实时准确：
+
+| 触发点 | 方法 | 说明 |
+|--------|------|------|
+| 首次进入 Gallery | `reset()` → `refresh()` → `updateStorageInfo()` | 用户点击 Gallery 按钮时 |
+| 删除照片/视频后 | `onDeletePhoto()` → `refresh()` → `updateStorageInfo()` | 删除文件释放空间后即时更新 |
+| 从全屏返回网格 | `onBackToGallery()` → `loadVisibleThumbnails()` | 返回时数据自动保持同步 |
+
+`refresh()` 在末尾统一调用 `updateStorageInfo()`，因此所有触发 `refresh()` 的操作（包括删除、切换存储路径等）都会自动更新状态栏。**无需额外手动调用**。
+
+#### 5.9.4 新增成员与文件变更摘要
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `include/storage/manager.h` | +4 行 | 新增 `getTotalSpaceMB()` 声明 |
+| `src/storage/manager.cpp` | +15 行 | 实现 `getTotalSpaceMB()`：`statvfs` 读取总空间 |
+| `include/display/gallery.h` | +2 行 | 新增 `QLabel* m_storageInfoLabel` 成员 + `updateStorageInfo()` 声明 |
+| `src/display/gallery.cpp` | +55 行 | 顶栏增加标签布局 + `updateStorageInfo()` 完整实现 + 3 处调用点集成 |
+
+#### 5.9.5 设计考量
+
+**为何在 Gallery 页显示而不是主界面全局显示？**
+
+主界面（实时预览）核心任务是视频流的低延迟渲染，额外 `statvfs()` 调用会引入 I/O 开销。Gallery 页面是静态浏览场景，`statvfs` 的性能开销可忽略（<1ms）。在用户查看已拍摄媒体的自然场景中提醒存储容量，比在实时拍摄流中打断体验更合理。
+
+**为何不通过定时器自动轮询？**
+
+嵌入式设备（iMX6ULL）上，持续的磁盘 I/O 轮询会引入抖动并增加功耗。当前方案采用"事件驱动"模式：只在用户进入 Gallery 或删除文件时才刷新，足够应对使用场景需求。
+
+**空间不足时为何不在主界面也警告？**
+
+后续迭代计划：当 `freeRatio < 5%` 时，`updateStorageInfo()` 可发射一个 Qt 信号通知 `CameraGUI` 在主界面的状态栏显示警告提示。当前 v0.6 版本只在 Gallery 内展示，保持实现简洁。
 
 ---
 
@@ -1019,6 +1153,7 @@ set(DISPLAY_SOURCES
 | VideoPlayer idx1 索引表（300 帧） | 300 × 16 字节 | ~4.8 KB |
 | 视频单帧解码缓冲（RGB24） | 640×480×3 | ~0.9 MB |
 | AVI 提取首帧 JPEG 缓冲 | ~50 KB | ~50 KB |
+| 存储状态栏标签（QLabel） | 1 个控件 | ~1 KB |
 | **峰值合计** | | **~3.4 MB** |
 
 在 iMX6ULL 512MB RAM 上仍有充足余量。
@@ -1174,3 +1309,4 @@ rm -rf /tmp/smartcam/photos/*
 | 2026-05-24 | 修复编译错误：移除头文件中未实现的 `onThumbnailClicked()` slot 声明 |
 | 2026-05-26 | **v0.4**：视频缩略图 + 播放支持。新增 `extractAviThumbnail()` 从 AVI 提取第一帧 JPEG 作封面；新增 `VideoPlayer` 轻量 AVI 播放器；`PhotoGallery` 全屏集成视频播放 |
 | 2026-05-27 | **v0.5**：Settings 面板增加 Store 下拉框（tmpfs/eMMC 存储路径切换）；ConfigManager 写支持；配置加载三级优先级；解决开发板重启后照片丢失问题 |
+| 2026-05-29 | **v0.6**：Gallery 顶栏右侧新增存储空间状态栏（`m_storageInfoLabel` + `updateStorageInfo()`）；`StorageManager` 新增 `getTotalSpaceMB()`；<5% 空间显示红色 LOW 警告，<15% 橙色提示；进入/刷新/删除后自动更新 |

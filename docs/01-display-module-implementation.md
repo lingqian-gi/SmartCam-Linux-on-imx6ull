@@ -29,7 +29,8 @@
 | 录像指示 | ✅ |
 | YUYV → RGB565 转换 (16-bit LCD) | ✅ |
 | Mock 模式 (无硬件可运行) | ✅ |
-| 回调接口 (onCaptureRequest/onRecordToggle/onResolutionChanged/onFormatChanged) | ✅ |
+| Gallery 存储空间状态栏 (<5% 红色警报) | ✅ v0.6 |
+| 回掉接口 (onCaptureRequest/onRecordToggle/onResolutionChanged/onFormatChanged) | ✅ |
 | Qt 信号 (供外部监听) | ✅ |
 
 ---
@@ -270,3 +271,4 @@ offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 | 2026-05-20 | 初始实现：CameraGUI 类、Mock 模式、YUYV→RGB 转换、CMake 构建、编译通过 |
 | 2026-05-23 | **MJPEG 解码支持**：`frameToQImage()` 新增 `FMT_MJPEG` 分支，使用 libjpeg-turbo 自定义错误处理器静默坏帧警告。`setFrame()` 改为深拷贝（`m_frameBuffer.assign`），修复采集线程与 GUI 线程间的悬垂指针数据竞争。新增 `onCaptureRequest`/`onRecordToggle` 等回调注入接口。 |
 | 2026-05-24 | **systemd 服务完善**：`smartcam.service` 改为 `Type=simple`，新增 `ConditionPathExists=/dev/video0`、`Environment` 环境变量、`ProtectSystem=full` 加固等。`ExecStop` 不再使用不存在的 `smartcam stop` 子命令。 |
+| 2026-05-29 | **存储空间状态栏 (v0.6)**：Gallery 顶栏右侧新增存储用量显示（已用/总容量），`StorageManager` 新增 `getTotalSpaceMB()`，`PhotoGallery` 新增 `updateStorageInfo()`；剩余 <5% 红色 LOW 警告，<15% 橙色提示；进入/刷新/删除后自动更新 |
