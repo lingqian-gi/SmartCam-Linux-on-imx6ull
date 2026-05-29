@@ -58,6 +58,7 @@ private:
     void buildGalleryView();
     void buildFullscreenView();
     void loadVisibleThumbnails();     // 懒加载可见区域缩略图
+    void updateStorageInfo();         // 更新存储空间状态栏
 
     // ---- 辅助 ----
     bool createThumbnail(const std::string& jpegPath,
@@ -86,6 +87,7 @@ private:
     QGridLayout*  m_gridLayout      = nullptr;
     QLabel*       m_galleryTitle    = nullptr;
     QLabel*       m_galleryEmpty    = nullptr;   // 空相册提示
+    QLabel*       m_storageInfoLabel = nullptr;  // 存储空间状态栏
 
     static constexpr int THUMB_COLS = 3;
     static constexpr int THUMB_W    = 170;

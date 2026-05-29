@@ -94,6 +94,7 @@ void PhotoGallery::refresh() {
     }
 
     loadVisibleThumbnails();
+    updateStorageInfo();
 }
 
 void PhotoGallery::reset() {
@@ -130,9 +131,14 @@ void PhotoGallery::buildGalleryView() {
         "font-size: 15px; font-weight: bold; color: #e0e0e0;"
         "padding: 2px 10px;");
 
+    m_storageInfoLabel = new QLabel(this);
+    m_storageInfoLabel->setStyleSheet(
+        "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
+
     topBar->addWidget(btnBack);
     topBar->addWidget(m_galleryTitle);
     topBar->addStretch();
+    topBar->addWidget(m_storageInfoLabel);
     layout->addLayout(topBar);
 
     // ---- 滚动区域 ----
@@ -286,6 +292,49 @@ bool PhotoGallery::createVideoThumbnail(const std::string& aviPath,
         return false;
 
     return createThumbnailFromJpegData(jpegData, thumbW, thumbH, out);
+}
+
+// ============================================================
+// 存储空间状态
+// ============================================================
+
+void PhotoGallery::updateStorageInfo() {
+    if (!m_storage || !m_storageInfoLabel) return;
+
+    int freeMB = m_storage->getFreeSpaceMB();
+    int totalMB = m_storage->getTotalSpaceMB();
+
+    if (freeMB < 0 || totalMB < 0) {
+        m_storageInfoLabel->setText("Storage: N/A");
+        return;
+    }
+
+    int usedMB = totalMB - freeMB;
+    QString text;
+
+    if (totalMB >= 1024) {
+        double totalGB = totalMB / 1024.0;
+        double usedGB = usedMB / 1024.0;
+        text = QString("Storage: %1 / %2 GB").arg(usedGB, 0, 'f', 1).arg(totalGB, 0, 'f', 1);
+    } else {
+        text = QString("Storage: %1 / %2 MB").arg(usedMB).arg(totalMB);
+    }
+
+    // 空间不足时用红色警告
+    double freeRatio = (totalMB > 0) ? static_cast<double>(freeMB) / totalMB : 0.0;
+    if (freeRatio < 0.05) {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #e74c3c; padding: 2px 6px; font-weight: bold;");
+        text += "  LOW!";
+    } else if (freeRatio < 0.15) {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #f39c12; padding: 2px 6px;");
+    } else {
+        m_storageInfoLabel->setStyleSheet(
+            "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
+    }
+
+    m_storageInfoLabel->setText(text);
 }
 
 // ============================================================

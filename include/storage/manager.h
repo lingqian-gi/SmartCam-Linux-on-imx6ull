@@ -211,6 +211,13 @@ public:
     int getFreeSpaceMB(const std::string& path = "");
 
     /**
+     * @brief 获取指定路径的总空间
+     * @param path  路径，默认使用 videoDir
+     * @return 总空间（MB），失败返回 -1
+     */
+    int getTotalSpaceMB(const std::string& path = "");
+
+    /**
      * @brief 自动清理旧文件，释放空间到指定阈值
      *
      * 按文件修改时间升序删除（最旧的先删），

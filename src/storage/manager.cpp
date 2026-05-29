@@ -482,6 +482,22 @@ int StorageManager::getFreeSpaceMB(const std::string& path) {
     return static_cast<int>(freeBytes / (1024 * 1024));
 }
 
+int StorageManager::getTotalSpaceMB(const std::string& path) {
+    std::string checkPath = path.empty() ? m_videoDir : path;
+
+    struct statvfs vfs;
+    if (statvfs(checkPath.c_str(), &vfs) < 0) {
+        LOG_ERR_("getTotalSpaceMB: statvfs(%s) failed: %s",
+                 checkPath.c_str(), strerror(errno));
+        return -1;
+    }
+
+    unsigned long long totalBytes =
+        static_cast<unsigned long long>(vfs.f_bsize) *
+        static_cast<unsigned long long>(vfs.f_blocks);
+    return static_cast<int>(totalBytes / (1024 * 1024));
+}
+
 int StorageManager::autoCleanup(int keep_mb) {
     // 收集两个目录中所有照片和视频文件
     struct FileEntry {
