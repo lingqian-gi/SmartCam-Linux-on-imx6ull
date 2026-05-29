@@ -783,14 +783,25 @@ void PhotoGallery::onDeletePhoto() {
     const auto& info = m_flatPhotos[static_cast<size_t>(m_currentIndex)];
 
     QString typeStr = info.isVideo ? "video" : "photo";
-    auto reply = QMessageBox::question(
-        this, QString("Delete %1").arg(typeStr),
-        QString("Delete this %1?\n\n%2")
-            .arg(typeStr, QString::fromStdString(info.filename)),
-        QMessageBox::Cancel | QMessageBox::Yes,
-        QMessageBox::Cancel);
 
-    if (reply != QMessageBox::Yes) return;
+    QMessageBox msgBox(this);
+    msgBox.setIcon(QMessageBox::Warning);
+    msgBox.setWindowTitle(QString("Delete %1").arg(typeStr));
+    msgBox.setText(QString("Delete this %1?").arg(typeStr));
+    msgBox.setInformativeText(QString::fromStdString(info.filename));
+    msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+    msgBox.setDefaultButton(QMessageBox::Cancel);
+    msgBox.setStyleSheet(
+        "QMessageBox { background-color: #2c3e50; }"
+        "QMessageBox { border: 2px solid #e74c3c; }"
+        "QLabel { color: #ecf0f1; font-size: 14px; }"
+        "QPushButton { background-color: #34495e; color: #ecf0f1;"
+        "  border: 1px solid #5a6c7d; border-radius: 4px;"
+        "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
+        "QPushButton:hover { background-color: #4a6785; }"
+        "QPushButton:pressed { background-color: #1a252f; }");
+
+    if (msgBox.exec() != QMessageBox::Yes) return;
 
     int result = info.isVideo
         ? m_storage->deleteVideo(info.path)
@@ -907,14 +918,25 @@ void PhotoGallery::onDeleteSelected() {
     if (m_selectedIndices.isEmpty()) return;
 
     int count = m_selectedIndices.size();
-    auto reply = QMessageBox::question(
-        this, "Delete Selected",
-        QString("Delete %1 selected item(s)?\n\nThis cannot be undone.")
-            .arg(count),
-        QMessageBox::Cancel | QMessageBox::Yes,
-        QMessageBox::Cancel);
 
-    if (reply != QMessageBox::Yes) return;
+    QMessageBox msgBox(this);
+    msgBox.setIcon(QMessageBox::Warning);
+    msgBox.setWindowTitle("Delete Selected");
+    msgBox.setText(QString("Delete %1 selected item(s)?").arg(count));
+    msgBox.setInformativeText("This cannot be undone.");
+    msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+    msgBox.setDefaultButton(QMessageBox::Cancel);
+    msgBox.setStyleSheet(
+        "QMessageBox { background-color: #2c3e50; }"
+        "QMessageBox { border: 2px solid #e74c3c; }"
+        "QLabel { color: #ecf0f1; font-size: 14px; }"
+        "QPushButton { background-color: #34495e; color: #ecf0f1;"
+        "  border: 1px solid #5a6c7d; border-radius: 4px;"
+        "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
+        "QPushButton:hover { background-color: #4a6785; }"
+        "QPushButton:pressed { background-color: #1a252f; }");
+
+    if (msgBox.exec() != QMessageBox::Yes) return;
 
     // 收集要删除的路径
     QStringList failedItems;
@@ -936,10 +958,22 @@ void PhotoGallery::onDeleteSelected() {
     }
 
     if (!failedItems.isEmpty()) {
-        QMessageBox::warning(this, "Delete Partially Failed",
-            QString("Deleted %1 item(s).\n\nFailed to delete:\n%2")
-                .arg(deletedCount)
-                .arg(failedItems.join("\n")));
+        QMessageBox msgBox(this);
+        msgBox.setIcon(QMessageBox::Critical);
+        msgBox.setWindowTitle("Delete Partially Failed");
+        msgBox.setText(QString("Deleted %1 item(s).").arg(deletedCount));
+        msgBox.setInformativeText(QString("Failed to delete:\n%1").arg(failedItems.join("\n")));
+        msgBox.setStandardButtons(QMessageBox::Ok);
+        msgBox.setStyleSheet(
+            "QMessageBox { background-color: #2c3e50; }"
+            "QMessageBox { border: 2px solid #e67e22; }"
+            "QLabel { color: #ecf0f1; font-size: 14px; }"
+            "QPushButton { background-color: #34495e; color: #ecf0f1;"
+            "  border: 1px solid #5a6c7d; border-radius: 4px;"
+            "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
+            "QPushButton:hover { background-color: #4a6785; }"
+            "QPushButton:pressed { background-color: #1a252f; }");
+        msgBox.exec();
     }
 
     // 退出多选模式并刷新
