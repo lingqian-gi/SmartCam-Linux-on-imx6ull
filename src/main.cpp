@@ -746,11 +746,6 @@ int main(int argc, char* argv[]) {
             // 帧率节流：记录上次输出帧的时间戳
             auto lastOutputTime = std::chrono::steady_clock::now();
             int  throttleFps    = g_state.targetFps.load();
-            // 诊断：记录实际帧间隔用于定位硬件帧率
-            auto  diagLastTime  = std::chrono::steady_clock::now();
-            int   diagFrameCount = 0;
-            double diagMinInterval = 9999.0, diagMaxInterval = 0.0;
-
             while (g_state.running) {
                 // 暂停期间等待恢复（分辨率/格式切换中）
                 if (g_state.paused) {
@@ -782,32 +777,6 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
                     lastOutputTime = now;
-                }
-
-                // 诊断：测量实际帧间隔（每 100 帧输出一次）
-                {
-                    auto now = std::chrono::steady_clock::now();
-                    double interval = std::chrono::duration<double>(now - diagLastTime).count();
-                    if (interval < diagMinInterval) diagMinInterval = interval;
-                    if (interval > diagMaxInterval) diagMaxInterval = interval;
-                    diagLastTime = now;
-                    diagFrameCount++;
-
-                    if (diagFrameCount % 100 == 0) {
-                        double avgMs = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(g_state.mtx);
-                            avgMs = (g_state.fps > 0) ? 1000.0 / g_state.fps : 0;
-                        }
-                        LOG_INF("[FPS Diag] avg=%.1f fps (%.1f ms/frame), "
-                                "raw interval: min=%.1f ms, max=%.1f ms, "
-                                "frame size=%d bytes, throttle=%d fps",
-                                (avgMs > 0 ? 1000.0/avgMs : 0), avgMs,
-                                diagMinInterval * 1000.0, diagMaxInterval * 1000.0,
-                                fb.length, throttleFps);
-                        diagMinInterval = 9999.0;
-                        diagMaxInterval = 0.0;
-                    }
                 }
 
                 // 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
