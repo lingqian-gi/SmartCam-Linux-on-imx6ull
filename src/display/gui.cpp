@@ -100,10 +100,16 @@ CameraGUI::CameraGUI(QWidget* parent)
 
     // 初始状态
     m_labelStreaming->setText(QStringLiteral("IDLE"));
-    m_labelStreaming->setStyleSheet("color: gray;");
+    m_labelStreaming->setStyleSheet(
+        "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+        "background: #1A1D24; border: 1px solid #2D333B;"
+        "border-radius: 12px; color: #484F58;");
     m_labelClients->setText(QStringLiteral("Clients: 0"));
     m_labelRecording->setText(QStringLiteral("REC"));
-    m_labelRecording->setStyleSheet("color: gray;");
+    m_labelRecording->setStyleSheet(
+        "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+        "background: #1A1D24; border: 1px solid #2D333B;"
+        "border-radius: 12px; color: #484F58;");
 }
 
 CameraGUI::~CameraGUI() = default;
@@ -131,10 +137,10 @@ void CameraGUI::buildUI() {
     m_videoDisplay->setAlignment(Qt::AlignCenter);
     m_videoDisplay->setMinimumSize(640, 360);
     m_videoDisplay->setStyleSheet(
-        "background-color: #1a1a2e;"
-        "border: 2px solid #0f3460;"
-        "border-radius: 4px;"
-        "color: #4a4a6a;"
+        "background-color: #0D1117;"
+        "border: 2px solid #30363D;"
+        "border-radius: 8px;"
+        "color: #484F58;"
     );
     m_videoDisplay->setText(QStringLiteral("Waiting camera..."));
     m_videoDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -161,8 +167,9 @@ void CameraGUI::buildUI() {
     m_labelClients = new QLabel(QStringLiteral("Clients: 0"), this);
     m_labelRecording = new QLabel(QStringLiteral("REC"), this);
 
-    QString statusStyle = "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-                          "background: #16213e; border-radius: 3px; color: #e0e0e0;";
+    QString statusStyle = "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+                          "background: #1A1D24; border: 1px solid #2D333B;"
+                          "border-radius: 12px; color: #8B949E;";
     m_labelFPS->setStyleSheet(statusStyle);
     m_labelStreaming->setStyleSheet(statusStyle);
     m_labelClients->setStyleSheet(statusStyle);
@@ -181,8 +188,8 @@ void CameraGUI::buildUI() {
 
     QString btnBaseStyle =
         "QPushButton {"
-        "  font-size: 14px; font-weight: bold; padding: 8px 16px;"
-        "  min-width: 80px;"
+        "  font-size: 14px; font-weight: 700; padding: 8px 18px;"
+        "  min-width: 84px; border-radius: 8px;"
         "}";
 
     m_btnCapture = new QPushButton(QStringLiteral("Capture"), this);
@@ -190,32 +197,29 @@ void CameraGUI::buildUI() {
     m_btnGallery = new QPushButton(QStringLiteral("Gallery"), this);
     m_btnSettings = new QPushButton(QStringLiteral("Settings"), this);
 
-    // 使用亮色 + 实线边框，确保 linuxfb 下按钮清晰可见
+    // Capture — 主色蓝
     m_btnCapture->setStyleSheet(btnBaseStyle +
         "QPushButton {"
-        "  background-color: #1a6fb5; color: white;"
-        "  border: 2px solid #5aa9e6; border-radius: 4px;"
+        "  background-color: #4493F8; color: #FFFFFF;"
+        "  border: 2px solid #58A6FF;"
         "}"
-        "QPushButton:pressed { background-color: #0d4a7a; }");
+        "QPushButton:pressed { background-color: #1F6FEB; }");
+    // Record — 紫色
     m_btnRecord->setStyleSheet(btnBaseStyle +
         "QPushButton {"
-        "  background-color: #8e44ad; color: white;"
-        "  border: 2px solid #c084d6; border-radius: 4px;"
+        "  background-color: #A371F7; color: #FFFFFF;"
+        "  border: 2px solid #B892F9;"
         "}"
-        "QPushButton:pressed { background-color: #5e3370; }");
-    m_btnSettings->setStyleSheet(btnBaseStyle +
+        "QPushButton:pressed { background-color: #7C3AED; }");
+    // Gallery & Settings — 中性深灰
+    QString secondaryBtnStyle = btnBaseStyle +
         "QPushButton {"
-        "  background-color: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #7f8c8d; border-radius: 4px;"
+        "  background-color: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D;"
         "}"
-        "QPushButton:pressed { background-color: #1a252f; }");
-
-    m_btnGallery->setStyleSheet(btnBaseStyle +
-        "QPushButton {"
-        "  background-color: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #7f8c8d; border-radius: 4px;"
-        "}"
-        "QPushButton:pressed { background-color: #1a252f; }");
+        "QPushButton:pressed { background-color: #161B22; }";
+    m_btnGallery->setStyleSheet(secondaryBtnStyle);
+    m_btnSettings->setStyleSheet(secondaryBtnStyle);
 
     btnLayout->addWidget(m_btnCapture);
     btnLayout->addWidget(m_btnRecord);
@@ -227,7 +231,7 @@ void CameraGUI::buildUI() {
     buildSettingsDialog();
 
     // --- 整体配色 ---
-    setStyleSheet("background-color: #0a0a1a;");
+    setStyleSheet("background-color: #0F1117;");
 }
 
 // ============================================================
@@ -345,24 +349,28 @@ void CameraGUI::onRecord() {
         m_btnRecord->setText(QStringLiteral("Stop"));
         m_btnRecord->setStyleSheet(
             "QPushButton {"
-            "  background-color: #c0392b; color: white;"
-            "  border: 2px solid #e74c3c; border-radius: 4px;"
-            "  font-size: 14px; font-weight: bold; padding: 8px 16px; min-width: 80px;"
-            "}");
+            "  background-color: #F85149; color: #FFFFFF;"
+            "  border: 2px solid #FF6B61; border-radius: 8px;"
+            "  font-size: 14px; font-weight: 700; padding: 8px 18px; min-width: 84px;"
+            "}"
+            "QPushButton:pressed { background-color: #DA3633; }");
         m_labelRecording->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: #e74c3c;");
+            "font-size: 12px; font-weight: 700; padding: 4px 10px;"
+            "background: #2C1518; border: 1px solid #F85149;"
+            "border-radius: 12px; color: #F85149;");
     } else {
         m_btnRecord->setText(QStringLiteral("Record"));
         m_btnRecord->setStyleSheet(
             "QPushButton {"
-            "  background-color: #8e44ad; color: white;"
-            "  border: 2px solid #c084d6; border-radius: 4px;"
-            "  font-size: 14px; font-weight: bold; padding: 8px 16px; min-width: 80px;"
-            "}");
+            "  background-color: #A371F7; color: #FFFFFF;"
+            "  border: 2px solid #B892F9; border-radius: 8px;"
+            "  font-size: 14px; font-weight: 700; padding: 8px 18px; min-width: 84px;"
+            "}"
+            "QPushButton:pressed { background-color: #7C3AED; }");
         m_labelRecording->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: gray;");
+            "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+            "background: #1A1D24; border: 1px solid #2D333B;"
+            "border-radius: 12px; color: #484F58;");
     }
 
     emit recordToggled(m_isRecording);
@@ -478,12 +486,14 @@ void CameraGUI::setClientCount(int count) {
 void CameraGUI::setRecordingStatus(bool recording) {
     if (recording) {
         m_labelRecording->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: #e74c3c;");
+            "font-size: 12px; font-weight: 700; padding: 4px 10px;"
+            "background: #2C1518; border: 1px solid #F85149;"
+            "border-radius: 12px; color: #F85149;");
     } else {
         m_labelRecording->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: gray;");
+            "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+            "background: #1A1D24; border: 1px solid #2D333B;"
+            "border-radius: 12px; color: #484F58;");
     }
 }
 
@@ -491,13 +501,15 @@ void CameraGUI::setStreamingStatus(bool streaming) {
     if (streaming) {
         m_labelStreaming->setText(QStringLiteral("LIVE"));
         m_labelStreaming->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: #2ecc71;");
+            "font-size: 12px; font-weight: 700; padding: 4px 10px;"
+            "background: #15261A; border: 1px solid #3FB950;"
+            "border-radius: 12px; color: #3FB950;");
     } else {
         m_labelStreaming->setText(QStringLiteral("IDLE"));
         m_labelStreaming->setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-            "background: #16213e; border-radius: 3px; color: #e0e0e0;");
+            "font-size: 12px; font-weight: 600; padding: 4px 10px;"
+            "background: #1A1D24; border: 1px solid #2D333B;"
+            "border-radius: 12px; color: #8B949E;");
     }
 }
 
@@ -540,11 +552,11 @@ void CameraGUI::buildSettingsDialog() {
 
     // 深色主题
     m_settingsDialog->setStyleSheet(
-        "QDialog { background-color: #0a0a1a; }"
-        "QLabel { color: #e0e0e0; font-size: 13px; }"
-        "QGroupBox { color: #e0e0e0; font-size: 14px; font-weight: bold; "
-        "  border: 1px solid #0f3460; border-radius: 4px; margin-top: 12px; padding-top: 16px; }"
-        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }"
+        "QDialog { background-color: #0F1117; }"
+        "QLabel { color: #E6EDF3; font-size: 13px; }"
+        "QGroupBox { color: #E6EDF3; font-size: 14px; font-weight: bold; "
+        "  border: 1px solid #30363D; border-radius: 8px; margin-top: 14px; padding-top: 18px; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }"
     );
 
     auto* mainLayout = new QVBoxLayout(m_settingsDialog);
@@ -553,22 +565,21 @@ void CameraGUI::buildSettingsDialog() {
 
     // ---- 样式定义 ----
     QString comboStyle =
-        "QComboBox { font-size: 13px; padding: 4px 8px;"
-        "  background: #16213e; color: #e0e0e0; border: 1px solid #0f3460;"
-        "  border-radius: 4px; min-width: 160px; }"
+        "QComboBox { font-size: 13px; padding: 6px 10px;"
+        "  background: #1A1D24; color: #E6EDF3; border: 1px solid #30363D;"
+        "  border-radius: 6px; min-width: 160px; }"
         "QComboBox::drop-down { border: none; }"
         "QComboBox QAbstractItemView {"
-        "  background: #16213e; color: #e0e0e0;"
-        "  selection-background-color: #0f3460; }";
+        "  background: #1A1D24; color: #E6EDF3;"
+        "  selection-background-color: #388BFD; selection-color: #FFFFFF; }";
 
     QString sliderStyle =
         "QSlider::groove:horizontal {"
-        "  border: 1px solid #0f3460; height: 6px; background: #16213e;"
-        "  border-radius: 3px; }"
+        "  border: none; height: 6px; background: #21262D; border-radius: 3px; }"
         "QSlider::handle:horizontal {"
-        "  background: #3498db; border: 1px solid #2980b9; width: 18px;"
-        "  margin: -7px 0; border-radius: 9px; }"
-        "QSlider::sub-page:horizontal { background: #2980b9; border-radius: 3px; }";
+        "  background: #4493F8; border: 2px solid #58A6FF; width: 20px;"
+        "  margin: -8px 0; border-radius: 10px; }"
+        "QSlider::sub-page:horizontal { background: #4493F8; border-radius: 3px; }";
 
     // ================================================================
     // (1) 视频设置分组
@@ -662,12 +673,12 @@ void CameraGUI::buildSettingsDialog() {
     m_autoWbCheckBox = new QCheckBox(QStringLiteral("Auto"), camGroup);
     m_autoWbCheckBox->setChecked(true);
     m_autoWbCheckBox->setStyleSheet(
-        "QCheckBox { color: #e0e0e0; font-size: 13px; spacing: 6px; }"
-        "QCheckBox::indicator { width: 20px; height: 20px; }"
+        "QCheckBox { color: #E6EDF3; font-size: 13px; spacing: 8px; }"
+        "QCheckBox::indicator { width: 22px; height: 22px; }"
         "QCheckBox::indicator:unchecked { "
-        "  border: 2px solid #7f8c8d; border-radius: 3px; background: #16213e; }"
+        "  border: 2px solid #30363D; border-radius: 4px; background: #1A1D24; }"
         "QCheckBox::indicator:checked { "
-        "  border: 2px solid #3498db; border-radius: 3px; background: #3498db; }");
+        "  border: 2px solid #4493F8; border-radius: 4px; background: #4493F8; }");
     autoWbRow->addWidget(autoWbLabel);
     autoWbRow->addWidget(m_autoWbCheckBox);
     autoWbRow->addStretch();
@@ -697,12 +708,12 @@ void CameraGUI::buildSettingsDialog() {
     m_autoExposureCheckBox = new QCheckBox(QStringLiteral("Auto"), camGroup);
     m_autoExposureCheckBox->setChecked(true);
     m_autoExposureCheckBox->setStyleSheet(
-        "QCheckBox { color: #e0e0e0; font-size: 13px; spacing: 6px; }"
-        "QCheckBox::indicator { width: 20px; height: 20px; }"
+        "QCheckBox { color: #E6EDF3; font-size: 13px; spacing: 8px; }"
+        "QCheckBox::indicator { width: 22px; height: 22px; }"
         "QCheckBox::indicator:unchecked { "
-        "  border: 2px solid #7f8c8d; border-radius: 3px; background: #16213e; }"
+        "  border: 2px solid #30363D; border-radius: 4px; background: #1A1D24; }"
         "QCheckBox::indicator:checked { "
-        "  border: 2px solid #3498db; border-radius: 3px; background: #3498db; }");
+        "  border: 2px solid #4493F8; border-radius: 4px; background: #4493F8; }");
     autoExpRow->addWidget(autoExpLabel);
     autoExpRow->addWidget(m_autoExposureCheckBox);
     autoExpRow->addStretch();
@@ -753,17 +764,17 @@ void CameraGUI::buildSettingsDialog() {
 
     m_btnResetDefaults = new QPushButton(QStringLiteral("Reset Defaults"), m_settingsDialog);
     m_btnResetDefaults->setStyleSheet(
-        "QPushButton { font-size: 13px; font-weight: bold; padding: 8px 16px;"
-        "  background-color: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #7f8c8d; border-radius: 4px; }"
-        "QPushButton:pressed { background-color: #1a252f; }");
+        "QPushButton { font-size: 13px; font-weight: 600; padding: 8px 18px;"
+        "  background-color: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D; border-radius: 8px; }"
+        "QPushButton:pressed { background-color: #161B22; }");
 
     auto* btnClose = new QPushButton(QStringLiteral("Close"), m_settingsDialog);
     btnClose->setStyleSheet(
-        "QPushButton { font-size: 13px; font-weight: bold; padding: 8px 24px;"
-        "  background-color: #1a6fb5; color: white;"
-        "  border: 2px solid #5aa9e6; border-radius: 4px; }"
-        "QPushButton:pressed { background-color: #0d4a7a; }");
+        "QPushButton { font-size: 13px; font-weight: 700; padding: 8px 26px;"
+        "  background-color: #4493F8; color: #FFFFFF;"
+        "  border: 2px solid #58A6FF; border-radius: 8px; }"
+        "QPushButton:pressed { background-color: #1F6FEB; }");
 
     btnRow->addWidget(m_btnResetDefaults);
     btnRow->addSpacing(12);
@@ -1066,8 +1077,9 @@ void CameraGUI::enterMockMode() {
     m_labelFPS->setText(QStringLiteral("FPS: 30.0"));
     m_labelStreaming->setText(QStringLiteral("MOCK"));
     m_labelStreaming->setStyleSheet(
-        "font-size: 13px; font-weight: bold; padding: 2px 6px;"
-        "background: #16213e; border-radius: 3px; color: #f39c12;");
+        "font-size: 12px; font-weight: 700; padding: 4px 10px;"
+        "background: #272115; border: 1px solid #D29922;"
+        "border-radius: 12px; color: #D29922;");
 
     qDebug() << "[GUI] Entering Mock mode:" << w << "x" << h;
 }

@@ -31,7 +31,7 @@ PhotoGallery::PhotoGallery(StorageManager* storage, QWidget* parent)
     , m_storage(storage)
 {
     setMinimumSize(700, 400);
-    setStyleSheet("background-color: #0a0a1a;");
+    setStyleSheet("background-color: #0F1117;");
 
     // ---- 视图栈 ----
     m_stack = new QStackedWidget(this);
@@ -106,9 +106,9 @@ void PhotoGallery::reset() {
         m_btnSelectToggle->setText("Select");
         m_btnSelectToggle->setStyleSheet(
             "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
-            "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-            "QPushButton:pressed { background: #1a252f; }");
+            "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
+            "  border: 2px solid #30363D; border-radius: 4px; }"
+            "QPushButton:pressed { background: #161B22; }");
         m_selectToolBar->hide();
     }
     m_stack->setCurrentIndex(0);
@@ -132,27 +132,27 @@ void PhotoGallery::buildGalleryView() {
     auto* btnBack = new QPushButton("\u2190 Back", this);   // ←
     btnBack->setStyleSheet(
         "QPushButton { font-size: 14px; font-weight: bold;"
-        "  padding: 6px 14px; background: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-        "QPushButton:pressed { background: #1a252f; }");
+        "  padding: 6px 14px; background: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D; border-radius: 4px; }"
+        "QPushButton:pressed { background: #161B22; }");
     btnBack->setFixedHeight(34);
     connect(btnBack, &QPushButton::clicked, this, &PhotoGallery::backToLive);
 
     m_galleryTitle = new QLabel("Gallery", this);
     m_galleryTitle->setStyleSheet(
-        "font-size: 15px; font-weight: bold; color: #e0e0e0;"
+        "font-size: 15px; font-weight: bold; color: #E6EDF3;"
         "padding: 2px 10px;");
 
     m_storageInfoLabel = new QLabel(this);
     m_storageInfoLabel->setStyleSheet(
-        "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
+        "font-size: 12px; color: #484F58; padding: 2px 6px;");
 
     m_btnSelectToggle = new QPushButton("Select", this);
     m_btnSelectToggle->setStyleSheet(
         "QPushButton { font-size: 13px; font-weight: bold;"
-        "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-        "QPushButton:pressed { background: #1a252f; }");
+        "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D; border-radius: 4px; }"
+        "QPushButton:pressed { background: #161B22; }");
     m_btnSelectToggle->setFixedHeight(34);
     connect(m_btnSelectToggle, &QPushButton::clicked,
             this, &PhotoGallery::onToggleSelectMode);
@@ -166,7 +166,7 @@ void PhotoGallery::buildGalleryView() {
 
     // ---- 多选操作工具栏（默认隐藏） ----
     m_selectToolBar = new QWidget(this);
-    m_selectToolBar->setStyleSheet("background: #16213e; border-radius: 4px;");
+    m_selectToolBar->setStyleSheet("background: #1A1D24; border-radius: 4px;");
     auto* selLayout = new QHBoxLayout(m_selectToolBar);
     selLayout->setContentsMargins(8, 4, 8, 4);
     selLayout->setSpacing(8);
@@ -174,7 +174,7 @@ void PhotoGallery::buildGalleryView() {
     m_btnSelectAll = new QPushButton("Select All", this);
     m_btnSelectAll->setStyleSheet(
         "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #2980b9; color: white; border: 1px solid #5aa9e6;"
+        "  background: #1F6FEB; color: white; border: 1px solid #58A6FF;"
         "  border-radius: 3px; }"
         "QPushButton:pressed { background: #1c6ea4; }");
     connect(m_btnSelectAll, &QPushButton::clicked,
@@ -183,7 +183,7 @@ void PhotoGallery::buildGalleryView() {
     QPushButton* btnDeselectAll = new QPushButton("Deselect All", this);
     btnDeselectAll->setStyleSheet(
         "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #7f8c8d; color: white; border: 1px solid #95a5a6;"
+        "  background: #484F58; color: white; border: 1px solid #484F58;"
         "  border-radius: 3px; }"
         "QPushButton:pressed { background: #6c7a7d; }");
     connect(btnDeselectAll, &QPushButton::clicked,
@@ -192,7 +192,7 @@ void PhotoGallery::buildGalleryView() {
     m_btnDeleteSelected = new QPushButton("Delete (0)", this);
     m_btnDeleteSelected->setStyleSheet(
         "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #c0392b; color: white; border: 1px solid #e74c3c;"
+        "  background: #F85149; color: white; border: 1px solid #F85149;"
         "  border-radius: 3px; }"
         "QPushButton:pressed { background: #962d22; }"
         "QPushButton:disabled { background: #5a2d28; color: #7a5a58;"
@@ -212,13 +212,13 @@ void PhotoGallery::buildGalleryView() {
     m_scrollArea = new QScrollArea(this);
     m_scrollArea->setWidgetResizable(true);
     m_scrollArea->setStyleSheet(
-        "QScrollArea { border: none; background: #0a0a1a; }"
-        "QScrollBar:vertical { width: 8px; background: #16213e; }"
-        "QScrollBar::handle:vertical { background: #0f3460;"
+        "QScrollArea { border: none; background: #0F1117; }"
+        "QScrollBar:vertical { width: 8px; background: #1A1D24; }"
+        "QScrollBar::handle:vertical { background: #30363D;"
         "  border-radius: 4px; min-height: 20px; }");
 
     auto* scrollWidget = new QWidget();
-    scrollWidget->setStyleSheet("background: #0a0a1a;");
+    scrollWidget->setStyleSheet("background: #0F1117;");
     m_gridLayout = new QGridLayout(scrollWidget);
     m_gridLayout->setContentsMargins(4, 4, 4, 4);
     m_gridLayout->setSpacing(THUMB_SPACING);
@@ -391,14 +391,14 @@ void PhotoGallery::updateStorageInfo() {
     double freeRatio = (totalMB > 0) ? static_cast<double>(freeMB) / totalMB : 0.0;
     if (freeRatio < 0.05) {
         m_storageInfoLabel->setStyleSheet(
-            "font-size: 12px; color: #e74c3c; padding: 2px 6px; font-weight: bold;");
+            "font-size: 12px; color: #F85149; padding: 2px 6px; font-weight: bold;");
         text += "  LOW!";
     } else if (freeRatio < 0.15) {
         m_storageInfoLabel->setStyleSheet(
             "font-size: 12px; color: #f39c12; padding: 2px 6px;");
     } else {
         m_storageInfoLabel->setStyleSheet(
-            "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
+            "font-size: 12px; color: #484F58; padding: 2px 6px;");
     }
 
     m_storageInfoLabel->setText(text);
@@ -457,7 +457,7 @@ void PhotoGallery::loadVisibleThumbnails() {
                 QString("  \u2014\u2014  %1  \u2014\u2014")
                     .arg(QString::fromStdString(info.dateStr)), this);
             dateLabel->setStyleSheet(
-                "font-size: 12px; color: #5a6c7d; padding: 4px 8px;");
+                "font-size: 12px; color: #484F58; padding: 4px 8px;");
             dateLabel->setAlignment(Qt::AlignCenter);
             m_gridLayout->addWidget(dateLabel, row, 0, 1, THUMB_COLS);
             row++;
@@ -468,13 +468,13 @@ void PhotoGallery::loadVisibleThumbnails() {
         btn->setFixedSize(THUMB_W, THUMB_H);
         btn->setStyleSheet(
             "QPushButton {"
-            "  background: #16213e;"
-            "  border: 2px solid #0f3460;"
+            "  background: #1A1D24;"
+            "  border: 2px solid #30363D;"
             "  border-radius: 4px;"
             "  padding: 2px;"
             "}"
             "QPushButton:pressed {"
-            "  border-color: #1a6fb5;"
+            "  border-color: #4493F8;"
             "}");
 
         if (info.isVideo) {
@@ -498,7 +498,7 @@ void PhotoGallery::loadVisibleThumbnails() {
             } else {
                 btn->setText("?");
                 btn->setStyleSheet(btn->styleSheet() +
-                    " color: #5a6c7d; font-size: 24px;");
+                    " color: #484F58; font-size: 24px;");
             }
         }
 
@@ -539,17 +539,17 @@ void PhotoGallery::loadVisibleThumbnails() {
         auto* infoLabel = new QLabel(detail, this);
         infoLabel->setAlignment(Qt::AlignCenter);
         infoLabel->setStyleSheet(
-            "font-size: 11px; color: #7f8c8d; padding: 2px;");
+            "font-size: 11px; color: #484F58; padding: 2px;");
 
         // 多选复选框（覆盖在缩略图左上角）
         auto* checkBox = new QCheckBox(this);
         checkBox->setStyleSheet(
             "QCheckBox { spacing: 0; }"
             "QCheckBox::indicator { width: 22px; height: 22px;"
-            "  border: 2px solid #5a6c7d; border-radius: 3px;"
+            "  border: 2px solid #30363D; border-radius: 3px;"
             "  background: rgba(10,10,26,180); }"
             "QCheckBox::indicator:checked {"
-            "  background: #2980b9; border-color: #5aa9e6; }");
+            "  background: #1F6FEB; border-color: #58A6FF; }");
         checkBox->setChecked(m_selectedIndices.contains(idx));
         checkBox->setVisible(m_selectMode);
         connect(checkBox, &QCheckBox::toggled, this, [this, idx](bool checked) {
@@ -603,9 +603,9 @@ void PhotoGallery::buildFullscreenView() {
     m_btnBackGal = new QPushButton("\u2190 Gallery", this);
     m_btnBackGal->setStyleSheet(
         "QPushButton { font-size: 14px; font-weight: bold;"
-        "  padding: 6px 14px; background: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-        "QPushButton:pressed { background: #1a252f; }");
+        "  padding: 6px 14px; background: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D; border-radius: 4px; }"
+        "QPushButton:pressed { background: #161B22; }");
     m_btnBackGal->setFixedHeight(34);
     connect(m_btnBackGal, &QPushButton::clicked,
             this, &PhotoGallery::onBackToGallery);
@@ -621,12 +621,12 @@ void PhotoGallery::buildFullscreenView() {
 
     // ---- 媒体显示区（QStackedWidget: [0]照片 / [1]视频播放器） ----
     m_fullMediaStack = new QStackedWidget(this);
-    m_fullMediaStack->setStyleSheet("background-color: #0a0a1a; border: none;");
+    m_fullMediaStack->setStyleSheet("background-color: #0F1117; border: none;");
 
     m_fullPhotoDisplay = new QLabel(this);
     m_fullPhotoDisplay->setAlignment(Qt::AlignCenter);
     m_fullPhotoDisplay->setStyleSheet(
-        "background-color: #0a0a1a; border: none;");
+        "background-color: #0F1117; border: none;");
     m_fullPhotoDisplay->setScaledContents(false);
     m_fullPhotoDisplay->setSizePolicy(
         QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -651,23 +651,23 @@ void PhotoGallery::buildFullscreenView() {
             "  border: 2px solid %1; background-color: %2;"
             "  min-width: 80px; }"
             "QPushButton:pressed { background-color: %3; }")
-            .arg(border, bg, bg == "#2980b9"   ? "#1c6ea4" :
-                              bg == "#c0392b"   ? "#962d22" :
-                              bg == "#27ae60"   ? "#1e8449" : "#1a252f");
+            .arg(border, bg, bg == "#1F6FEB"   ? "#1c6ea4" :
+                              bg == "#F85149"   ? "#962d22" :
+                              bg == "#27ae60"   ? "#1e8449" : "#161B22");
     };
 
     m_btnPrev = new QPushButton("\u25C0 Prev", this);
-    m_btnPrev->setStyleSheet(btnStyle("#2980b9", "#5aa9e6"));
+    m_btnPrev->setStyleSheet(btnStyle("#4493F8", "#58A6FF"));
     m_btnPrev->setFixedHeight(36);
     connect(m_btnPrev, &QPushButton::clicked, this, &PhotoGallery::onPrevPhoto);
 
     m_btnNext = new QPushButton("Next \u25B6", this);
-    m_btnNext->setStyleSheet(btnStyle("#2980b9", "#5aa9e6"));
+    m_btnNext->setStyleSheet(btnStyle("#4493F8", "#58A6FF"));
     m_btnNext->setFixedHeight(36);
     connect(m_btnNext, &QPushButton::clicked, this, &PhotoGallery::onNextPhoto);
 
     m_btnDelete = new QPushButton("\u2672 Delete", this);
-    m_btnDelete->setStyleSheet(btnStyle("#c0392b", "#e74c3c"));
+    m_btnDelete->setStyleSheet(btnStyle("#F85149", "#FF6B61"));
     m_btnDelete->setFixedHeight(36);
     connect(m_btnDelete, &QPushButton::clicked,
             this, &PhotoGallery::onDeletePhoto);
@@ -727,8 +727,8 @@ void PhotoGallery::updateFullscreenDisplay() {
                     .arg(QString::fromStdString(info.filename))
                     .arg(sizeStr));
             m_fullPhotoDisplay->setStyleSheet(
-                "font-size: 18px; color: #e74c3c;"
-                "background-color: #0a0a1a; border: none;"
+                "font-size: 18px; color: #F85149;"
+                "background-color: #0F1117; border: none;"
                 "padding: 40px;");
             m_fullMediaStack->setCurrentIndex(0);
         }
@@ -741,12 +741,12 @@ void PhotoGallery::updateFullscreenDisplay() {
                 660, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation));
             m_fullPhotoDisplay->setPixmap(pix);
             m_fullPhotoDisplay->setStyleSheet(
-                "background-color: #0a0a1a; border: none;");
+                "background-color: #0F1117; border: none;");
         } else {
             m_fullPhotoDisplay->setText("Failed to load image");
             m_fullPhotoDisplay->setStyleSheet(
-                "font-size: 18px; color: #e74c3c;"
-                "background-color: #0a0a1a; border: none;"
+                "font-size: 18px; color: #F85149;"
+                "background-color: #0F1117; border: none;"
                 "padding: 40px;");
         }
     }
@@ -792,14 +792,14 @@ void PhotoGallery::onDeletePhoto() {
     msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
     msgBox.setDefaultButton(QMessageBox::Cancel);
     msgBox.setStyleSheet(
-        "QMessageBox { background-color: #2c3e50; }"
-        "QMessageBox { border: 2px solid #e74c3c; }"
-        "QLabel { color: #ecf0f1; font-size: 14px; }"
-        "QPushButton { background-color: #34495e; color: #ecf0f1;"
-        "  border: 1px solid #5a6c7d; border-radius: 4px;"
+        "QMessageBox { background-color: #21262D; }"
+        "QMessageBox { border: 2px solid #FF6B61; }"
+        "QLabel { color: #E6EDF3; font-size: 14px; }"
+        "QPushButton { background-color: #30363D; color: #E6EDF3;"
+        "  border: 1px solid #30363D; border-radius: 4px;"
         "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
         "QPushButton:hover { background-color: #4a6785; }"
-        "QPushButton:pressed { background-color: #1a252f; }");
+        "QPushButton:pressed { background-color: #161B22; }");
 
     if (msgBox.exec() != QMessageBox::Yes) return;
 
@@ -857,8 +857,8 @@ void PhotoGallery::onToggleSelectMode() {
         m_btnSelectToggle->setText("Cancel");
         m_btnSelectToggle->setStyleSheet(
             "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #c0392b; color: #ecf0f1;"
-            "  border: 2px solid #e74c3c; border-radius: 4px; }"
+            "  padding: 6px 12px; background: #F85149; color: #E6EDF3;"
+            "  border: 2px solid #FF6B61; border-radius: 4px; }"
             "QPushButton:pressed { background: #962d22; }");
         m_selectToolBar->show();
         m_selectedIndices.clear();
@@ -868,9 +868,9 @@ void PhotoGallery::onToggleSelectMode() {
         m_btnSelectToggle->setText("Select");
         m_btnSelectToggle->setStyleSheet(
             "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
-            "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-            "QPushButton:pressed { background: #1a252f; }");
+            "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
+            "  border: 2px solid #30363D; border-radius: 4px; }"
+            "QPushButton:pressed { background: #161B22; }");
         m_selectToolBar->hide();
         m_selectedIndices.clear();
     }
@@ -927,14 +927,14 @@ void PhotoGallery::onDeleteSelected() {
     msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
     msgBox.setDefaultButton(QMessageBox::Cancel);
     msgBox.setStyleSheet(
-        "QMessageBox { background-color: #2c3e50; }"
-        "QMessageBox { border: 2px solid #e74c3c; }"
-        "QLabel { color: #ecf0f1; font-size: 14px; }"
-        "QPushButton { background-color: #34495e; color: #ecf0f1;"
-        "  border: 1px solid #5a6c7d; border-radius: 4px;"
+        "QMessageBox { background-color: #21262D; }"
+        "QMessageBox { border: 2px solid #FF6B61; }"
+        "QLabel { color: #E6EDF3; font-size: 14px; }"
+        "QPushButton { background-color: #30363D; color: #E6EDF3;"
+        "  border: 1px solid #30363D; border-radius: 4px;"
         "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
         "QPushButton:hover { background-color: #4a6785; }"
-        "QPushButton:pressed { background-color: #1a252f; }");
+        "QPushButton:pressed { background-color: #161B22; }");
 
     if (msgBox.exec() != QMessageBox::Yes) return;
 
@@ -965,14 +965,14 @@ void PhotoGallery::onDeleteSelected() {
         msgBox.setInformativeText(QString("Failed to delete:\n%1").arg(failedItems.join("\n")));
         msgBox.setStandardButtons(QMessageBox::Ok);
         msgBox.setStyleSheet(
-            "QMessageBox { background-color: #2c3e50; }"
+            "QMessageBox { background-color: #21262D; }"
             "QMessageBox { border: 2px solid #e67e22; }"
-            "QLabel { color: #ecf0f1; font-size: 14px; }"
-            "QPushButton { background-color: #34495e; color: #ecf0f1;"
-            "  border: 1px solid #5a6c7d; border-radius: 4px;"
+            "QLabel { color: #E6EDF3; font-size: 14px; }"
+            "QPushButton { background-color: #30363D; color: #E6EDF3;"
+            "  border: 1px solid #30363D; border-radius: 4px;"
             "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
             "QPushButton:hover { background-color: #4a6785; }"
-            "QPushButton:pressed { background-color: #1a252f; }");
+            "QPushButton:pressed { background-color: #161B22; }");
         msgBox.exec();
     }
 
@@ -981,9 +981,9 @@ void PhotoGallery::onDeleteSelected() {
     m_btnSelectToggle->setText("Select");
     m_btnSelectToggle->setStyleSheet(
         "QPushButton { font-size: 13px; font-weight: bold;"
-        "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
-        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
-        "QPushButton:pressed { background: #1a252f; }");
+        "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
+        "  border: 2px solid #30363D; border-radius: 4px; }"
+        "QPushButton:pressed { background: #161B22; }");
     m_selectToolBar->hide();
     m_selectedIndices.clear();
 

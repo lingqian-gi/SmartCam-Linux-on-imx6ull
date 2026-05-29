@@ -49,7 +49,7 @@ void VideoPlayer::buildUI() {
     m_videoLabel = new QLabel(this);
     m_videoLabel->setAlignment(Qt::AlignCenter);
     m_videoLabel->setStyleSheet(
-        "background-color: #0a0a1a; border: none; color: #4a4a6a;"
+        "background-color: #0F1117; border: none; color: #484F58;"
     );
     m_videoLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     m_videoLabel->setMinimumSize(320, 240);
@@ -67,10 +67,10 @@ void VideoPlayer::buildUI() {
     m_btnPlayPause->setStyleSheet(
         "QPushButton {"
         "  font-size: 16px; font-weight: bold;"
-        "  background-color: #2980b9; color: white;"
+        "  background-color: #4493F8; color: white;"
         "  border: 2px solid #5aa9e6; border-radius: 18px;"
         "}"
-        "QPushButton:pressed { background-color: #1c6ea4; }");
+        "QPushButton:pressed { background-color: #1F6FEB; }");
     connect(m_btnPlayPause, &QPushButton::clicked, this, [this]() {
         if (m_playing) pause();
         else           play();
@@ -79,7 +79,7 @@ void VideoPlayer::buildUI() {
     // 帧信息标签
     m_frameInfo = new QLabel("0 / 0", this);
     m_frameInfo->setStyleSheet(
-        "font-size: 12px; color: #7f8c8d; padding: 2px 8px;");
+        "font-size: 12px; color: #484F58; padding: 2px 8px;");
 
     // 进度条
     m_progressBar = new QSlider(Qt::Horizontal, this);
@@ -87,14 +87,14 @@ void VideoPlayer::buildUI() {
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(
         "QSlider::groove:horizontal {"
-        "  background: #16213e; height: 6px; border-radius: 3px;"
+        "  background: #1A1D24; height: 6px; border-radius: 3px;"
         "}"
         "QSlider::handle:horizontal {"
-        "  background: #2ecc71; width: 14px; height: 14px;"
+        "  background: #3FB950; width: 14px; height: 14px;"
         "  margin: -4px 0; border-radius: 7px;"
         "}"
         "QSlider::sub-page:horizontal {"
-        "  background: #2ecc71; border-radius: 3px;"
+        "  background: #3FB950; border-radius: 3px;"
         "}");
 
     // 拖拽进度条时允许 seek
@@ -192,10 +192,10 @@ void VideoPlayer::play() {
     m_btnPlayPause->setStyleSheet(
         "QPushButton {"
         "  font-size: 16px; font-weight: bold;"
-        "  background-color: #f39c12; color: white;"
-        "  border: 2px solid #f1c40f; border-radius: 18px;"
+        "  background-color: #D29922; color: white;"
+        "  border: 2px solid #D29922; border-radius: 18px;"
         "}"
-        "QPushButton:pressed { background-color: #d68910; }");
+        "QPushButton:pressed { background-color: #B0881A; }");
 
     int interval = static_cast<int>(1000.0 / m_fps);
     if (interval < 1) interval = 1;
@@ -210,10 +210,10 @@ void VideoPlayer::pause() {
     m_btnPlayPause->setStyleSheet(
         "QPushButton {"
         "  font-size: 16px; font-weight: bold;"
-        "  background-color: #2980b9; color: white;"
+        "  background-color: #4493F8; color: white;"
         "  border: 2px solid #5aa9e6; border-radius: 18px;"
         "}"
-        "QPushButton:pressed { background-color: #1c6ea4; }");
+        "QPushButton:pressed { background-color: #1F6FEB; }");
 }
 
 void VideoPlayer::stop() {
@@ -238,10 +238,10 @@ void VideoPlayer::stop() {
     m_btnPlayPause->setStyleSheet(
         "QPushButton {"
         "  font-size: 16px; font-weight: bold;"
-        "  background-color: #2980b9; color: white;"
+        "  background-color: #4493F8; color: white;"
         "  border: 2px solid #5aa9e6; border-radius: 18px;"
         "}"
-        "QPushButton:pressed { background-color: #1c6ea4; }");
+        "QPushButton:pressed { background-color: #1F6FEB; }");
 }
 
 // ============================================================
