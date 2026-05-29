@@ -669,12 +669,53 @@ cmake ../.. && make -j$(nproc)
 
 ---
 
-## 8. 未来扩展
+## 8. 后续扩展
+
+### 8.1 曝光控制实现
+
+> 参见 `docs/11-framerate-control-implementation.md` §9.7 — 曝光控制面板完整实现。
+
+在 Camera Controls 分组中新增了曝光控制行（Auto Exposure 复选框 + Exposure 滑块），实现逻辑与白平衡控制对称：
+
+**UI 控件**：
+```
+| Auto Exposure: | QCheckBox "Auto"            | 弹性空白     |
+| Exposure:       | QSlider(Horizontal)         | QLabel "312" |
+```
+
+**互锁机制**：Auto Exposure 勾选 → Exposure 滑块禁用（`mode=3`, Aperture Priority）；取消勾选 → Exposure 滑块启用 + 写入当前滑块值（`mode=1`, Manual）。
+
+**V4L2 控制 ID**（`capture.h` 新增）：
+```cpp
+static constexpr uint32_t V4L2_CID_EXPOSURE_AUTO     = 0x009a0901;
+static constexpr uint32_t V4L2_CID_EXPOSURE_ABSOLUTE = 0x009a0902;
+```
+
+**关键槽函数**：`onAutoExposureChanged(int state)` — 联动滑块启用状态 + 写入 V4L2；`onExposureChanged(int value)` — 写入曝光绝对值。
+
+**初始化强策略**（`main.cpp`）：启动时强制设为手动模式 (`mode=1`) 并将曝光值上限限制为 300，防止自动曝光在暗光下拉长曝光时间导致帧率骤降（30fps → ~10fps）。
+
+**涉及文件**：`include/camera/capture.h`、`include/display/gui.h`、`src/display/gui.cpp`、`src/main.cpp`
+
+### 8.2 帧率控制引用
+
+> 参见 `docs/11-framerate-control-implementation.md` — 帧率控制完整设计与调试验证。
+
+Settings 弹窗的 Camera Controls 分组末尾新增 Framerate 滑块，运行时动态调整 V4L2 采集帧率。核心交互：
+
+- `onFramerateSliderChanged(int value)` — 立即更新标签，启动 300ms 防抖计时器
+- `onFramerateDebounced()` — 防抖结束后通过回调执行：`paused → stop → VIDIOC_S_PARM → start → resume`
+- `onResetDefaults()` — 停止防抖计时器，直接执行帧率恢复
+
+与曝光控制的协同：帧率控制依赖曝光处于手动模式（§8.1），否则自动曝光会覆盖 `VIDIOC_S_PARM` 的效果。
+
+**涉及文件**：`include/display/gui.h`、`src/display/gui.cpp`、`src/main.cpp`
+
+### 8.3 未来扩展
 
 | 方向 | 描述 |
 |------|------|
 | 饱和度控制 | 增加 `V4L2_CID_SATURATION` 滑块，与亮度/对比度并列。实现方式完全相同 |
 | 锐度控制 | 增加 `V4L2_CID_SHARPNESS` 滑块 |
-| 曝光控制 | 增加 `V4L2_CID_EXPOSURE_AUTO` 复选框 + `V4L2_CID_EXPOSURE_ABSOLUTE` 滑块 |
 | 配置持久化 | 将相机控制参数写入 `smartcam.conf`，下次启动时恢复 |
 | 触摸手势 | 滑块区域支持双指快速调整（适合小屏操作） |

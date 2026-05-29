@@ -617,7 +617,342 @@ Mock 模式下 `capture == nullptr`，帧率查询代码块和回调注册在 `i
 
 ---
 
-## 9. 未来扩展
+## 9. 开发板调试验证与改进
+
+> 在 i.MX6ULL + USB UVC 摄像头开发板上实际测试后，发现并修复了以下问题。每个子问题按"现象→根因分析→解决代码→涉及文件"格式记录。
+
+---
+
+### 9.1 帧率滑块卡死（仅枚举到单个离散帧率）
+
+**现象**：部分 UVC 摄像头 `VIDIOC_ENUM_FRAMEINTERVALS` 只报告一个离散帧间隔（如 30fps），导致 `minFps == maxFps`，滑块被锁定在唯一值上，完全无法拖动。
+
+**根因分析**：许多 UVC 固件只报告一个名义帧率，但实际的 `VIDIOC_S_PARM` 仍可接受其他值（驱动做近似）。原始代码直接将 `minFps`/`maxFps` 都设为同一值，`QSlider::setRange(min, max)` 在 `min==max` 时导致滑块无法移动。
+
+**解决代码**：（`src/main.cpp`）
+
+```cpp
+// 帧率范围初始化中，检测单离散帧率场景
+if (minFps == maxFps) {
+    LOG_INF("Framerate: only one discrete rate (%d fps) enumerated, "
+            "falling back to safe range 1-60", minFps);
+    minFps = 1;
+    maxFps = 60;
+}
+```
+
+**涉及文件**：`src/main.cpp`
+
+---
+
+### 9.2 stepwise 帧率枚举的 min/max 语义反转
+
+**现象**：摄像头以 `V4L2_FRMIVAL_TYPE_STEPWISE` 报告帧间隔时，滑块范围出现异常（低帧率在高位、高帧率在低位），拖动方向与预期相反。
+
+**根因分析**：V4L2 帧间隔（frame interval）的 `stepwise.min` = **最短时间间隔**（最高帧率），`stepwise.max` = **最长时间间隔**（最低帧率）。原始代码将 `min → minFps`、`max → maxFps` 理解为帧率的最小/最大值，正好颠倒了语义。
+
+| V4L2 字段 | 物理含义 | 原始错误理解 | 修正后理解 |
+|-----------|----------|:---:|:---:|
+| `stepwise.min` | {1,30} → 1/30s = **30fps** | minFps=30 | **highFps**=30 |
+| `stepwise.max` | {1,5} → 1/5s = **5fps** | maxFps=5 | **lowFps**=5 |
+
+**解决代码**：（`src/camera/capture.cpp` — `enumFrameRates()`）
+
+```cpp
+// 修复前：
+int minFps = stepwise.min.denominator / stepwise.min.numerator;  // 30
+int maxFps = stepwise.max.denominator / stepwise.max.numerator;  // 5
+for (int f = minFps; f <= maxFps; f += stepFps)  // 30 ≤ 5 → 循环不执行！
+
+// 修复后：
+int highFps = stepwise.min.denominator / stepwise.min.numerator;  // 30
+int lowFps  = stepwise.max.denominator / stepwise.max.numerator;  // 5
+if (lowFps > highFps) std::swap(lowFps, highFps);
+for (int f = lowFps; f <= highFps; f += stepFps)  // 5 → 30 ✓
+```
+
+**涉及文件**：`src/camera/capture.cpp`
+
+---
+
+### 9.3 VIDIOC_S_PARM 在流开启期间返回 EBUSY
+
+**现象**：拖动帧率滑块后日志输出 `setFramerate(15) failed: Device or resource busy`，帧率实际未改变，滑块数值与画面帧率不一致。
+
+**根因分析**：V4L2 规范中 `VIDIOC_S_PARM` 在 `STREAMON` 期间对多数设备返回 `-EBUSY`。原始帧率回调直接调用 `capture->setFramerate()`，当时采集流正在运行，ioctl 被驱动拒绝。
+
+**解决代码**：（`src/main.cpp` — 帧率回调 lambda）
+
+```cpp
+gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
+    if (fps <= 0) return;
+
+    // 1. 暂停采集线程——防止 stopCapture 时采集线程还在使用 mmap 缓冲区
+    g_state.paused = true;
+    { /* wait for pause ack with 1.1s timeout */ }
+
+    // 2. 停止流 → 设置帧率（此时无 EBUSY） → 重启流
+    capture->stopCapture();
+    int ret = capture->setFramerate(1, fps);  // VIDIOC_S_PARM ✓
+    capture->startCapture();
+
+    // 3. 设置软件帧率节流目标（无论硬件是否生效，软件丢帧兜底）
+    g_state.targetFps = fps;
+
+    // 4. 恢复采集线程
+    g_state.paused = false;
+    g_state.pauseCv.notify_one();
+
+    // 5. 同步 RTSP 参数
+    rtspServer->setStreamInfo(res.width, res.height, fps);
+
+    // 6. 更新显示定时器
+    displayTimer->setInterval(std::max(10, 1000 / fps));
+});
+```
+
+**新增软件帧率节流**（`src/main.cpp` 采集线程）：
+
+```cpp
+// 采集线程循环内
+if (throttleFps > 0) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastOutputTime).count();
+    auto minIntervalMs = 1000 / throttleFps;
+    if (elapsedMs < minIntervalMs) {
+        capture->putFrame(&fb);  // 归还缓冲区 → 丢弃此帧
+        continue;
+    }
+    lastOutputTime = now;
+}
+```
+
+软件节流作为兜底：即使驱动 `VIDIOC_S_PARM` 失败或调整了实际帧率值，采集线程也会按目标帧率丢弃多余帧，保证输出帧率匹配用户设定。
+
+**涉及文件**：`src/main.cpp`（回调重构 + 采集线程节流 + `g_state.targetFps`）
+
+---
+
+### 9.4 帧率滑块防抖优化
+
+**现象**：快速拖动帧率滑块时，每经过一个整数值都触发完整的 `stop→set→start→resume` 流程，导致视频流在 1 秒内可能中断 5~10 次，画面剧烈闪烁。
+
+**根因分析**：`QSlider::valueChanged` 信号在拖动过程中高频触发（每经过 1 step 就 emit），而 `onFramerateSliderChanged` 槽直接连接回调，没有任何防抖机制。每次回调触发完整的 `paused→stop→start→resume` 大约需 1~1.1 秒（含 1.1s pause wait），快速拖动时上一个流程还未结束，下一个已触发，造成流状态混乱。
+
+**解决代码**：
+
+**gui.h 新增：**
+```cpp
+QTimer* m_framerateDebounceTimer = nullptr;   // 帧率防抖计时器
+void onFramerateDebounced();                  // 防抖后真正执行帧率变更
+```
+
+**gui.cpp — `buildSettingsDialog()` 初始化：**
+```cpp
+m_framerateDebounceTimer = new QTimer(this);
+m_framerateDebounceTimer->setSingleShot(true);  // 单次触发
+connect(m_framerateDebounceTimer, &QTimer::timeout,
+        this, &CameraGUI::onFramerateDebounced);
+```
+
+**gui.cpp — `onFramerateSliderChanged()`：**
+```cpp
+void CameraGUI::onFramerateSliderChanged(int value) {
+    m_framerateValue->setText(QString("%1 fps").arg(value));  // 即时视觉反馈
+    m_framerateInfo.current = value;
+    m_framerateDebounceTimer->start(300);  // 300ms 防抖窗口
+}
+```
+
+**gui.cpp — `onFramerateDebounced()`：**
+```cpp
+void CameraGUI::onFramerateDebounced() {
+    int value = m_framerateSlider->value();
+    m_framerateInfo.current = value;
+    if (m_onFramerate) m_onFramerate(value);
+}
+```
+
+**gui.cpp — `onResetDefaults()` 特殊处理：**
+```cpp
+m_framerateDebounceTimer->stop();              // 停止防抖，立即执行
+m_framerateSlider->setValue(m_framerateInfo.def);
+// ... 直接调用 m_onFramerate
+```
+
+**设计要点**：标签即时更新（拖拽反馈）+ 防抖窗口 300ms（滑动停止后才真正执行）→ 用户体验流畅，不会因 restream 导致闪烁。
+
+**涉及文件**：`include/display/gui.h`、`src/display/gui.cpp`
+
+---
+
+### 9.5 自动曝光导致帧率从 30fps 骤降至 ~10fps
+
+**现象**：开发板启动后日志显示 `setFramerate=30fps` 设置成功，但实际帧率仅 ~10fps（`raw interval: min=98ms`），画面严重卡顿、不流畅。
+
+**根因分析**：摄像头默认运行在**自动曝光 Aperture Priority 模式**（`V4L2_EXPOSURE_APERTURE_PRIORITY = 3`）。在室内暗光环境下，该模式自动将曝光时间拉长至 ~100ms（远超 30fps 所需的 ≤33ms），导致传感器每 100ms 才产出一帧，帧率自然掉到 ~10fps。
+
+```
+自动曝光模式 (mode=3) → 暗光场景
+  └─ 曝光时间 = 100ms → 帧间隔 ≥ 100ms → 实际帧率 ≤ 10fps ← 与 VIDIOC_S_PARM 设定无关
+```
+
+**解决代码**：（`src/main.cpp`）
+
+```cpp
+// 曝光自动模式 → 强制手动以保持帧率
+int expMin, expMax, expStep, expDef, expVal;
+if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO,
+                           expMin, expMax, expStep, expDef) == 0) {
+    capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO, expVal);
+    // V4L2_EXPOSURE_MANUAL = 1
+    if (expVal != 1) {
+        capture->setControl(
+            static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO), 1);
+        LOG_INF("Auto Exposure disabled (set to manual) to preserve framerate");
+    }
+    gui.setAutoExposure(false);  // GUI 复选框同步为手动模式
+}
+
+// 曝光绝对值 → 限制 ≤300 确保 30fps 时间预算
+if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
+                           absMin, absMax, absStep, absDef) == 0) {
+    capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
+    int targetExposure = (absCur > 0) ? absCur : (absDef > 0 ? absDef : 312);
+    if (targetExposure < absMin) targetExposure = absMin;
+    if (targetExposure > absMax) targetExposure = absMax;
+    if (targetExposure > 300) targetExposure = 300;  // 30fps 要求 <33ms
+    capture->setControl(
+        static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
+        targetExposure);
+    gui.setExposureRange(absMin, absMax, absStep, targetExposure);
+}
+```
+
+**涉及文件**：`src/main.cpp`（V4L2 初始化曝光控制）、`include/camera/capture.h`（新增常量）
+
+---
+
+### 9.6 暗光下手动曝光致画面模糊
+
+**现象**：强制手动曝光后（9.5），暗光环境下画面非常暗、几乎不可见。若用户通过曝光面板调大曝光值，画面亮度改善但出现明显的运动拖影（motion blur）。
+
+**根因分析**：这是传感器灵敏度 + 镜头光圈 + 室内照度的硬件限制导致的固有矛盾：
+
+| 场景 | 曝光时间 | 帧率 | 画面效果 |
+|------|:---:|:---:|------|
+| 短曝光 | ≤33ms | ✅ 30fps | 画面暗 |
+| 长曝光 | >33ms | ❌ <30fps | 画面亮但拖影 |
+
+**解决方式**：通过**曝光控制面板**（见 9.7）将控制权交给用户，让用户根据实际场景在帧率与亮度之间自主权衡：
+
+- **Auto Exposure 复选框** — 可切换回自动曝光模式（接受帧率下降换取自动亮度）
+- **Exposure 滑块** — 手动模式下精细调节曝光值，找到可接受帧率范围内的最优亮度
+- **默认值 300** — 初始化时取上限以保证 30fps
+
+这不是一个"修复"，而是通过暴露控制面板承认硬件限制并赋予用户调节能力。
+
+**涉及文件**：与 9.5 / 9.7 相同
+
+---
+
+### 9.7 曝光控制面板实现
+
+**现象**：Settings 弹窗中没有曝光控制选项，用户无法调节曝光参数。结合 9.5/9.6，曝光控制是保证帧率的关键手段。
+
+**根因分析**：原始 Settings 弹窗只实现了亮度/对比度/白平衡，未涵盖 V4L2 曝光控制（`V4L2_CID_EXPOSURE_AUTO` + `V4L2_CID_EXPOSURE_ABSOLUTE`）。
+
+**解决代码**：
+
+**1) V4L2 常量**（`include/camera/capture.h`）：
+```cpp
+static constexpr uint32_t V4L2_CID_EXPOSURE_AUTO     = 0x009a0901;
+static constexpr uint32_t V4L2_CID_EXPOSURE_ABSOLUTE = 0x009a0902;
+```
+
+**2) GUI 成员变量**（`include/display/gui.h`）：
+```cpp
+QSlider*   m_exposureSlider        = nullptr;
+QLabel*    m_exposureValue         = nullptr;
+QCheckBox* m_autoExposureCheckBox  = nullptr;
+ControlInfo m_exposureInfo;
+bool       m_autoExposureDefault   = true;
+```
+
+**3) GUI 公共方法**（`include/display/gui.h`）：
+```cpp
+void setExposureRange(int min, int max, int step, int value);
+void setAutoExposure(bool enabled);
+```
+
+**4) UI 构建**（`src/display/gui.cpp` — `buildSettingsDialog()`）：
+```cpp
+// 自动曝光行
+auto* autoExpRow = new QHBoxLayout();
+auto* autoExpLabel = new QLabel("Auto Exposure:", camGroup);
+autoExpLabel->setFixedWidth(100);
+m_autoExposureCheckBox = new QCheckBox("Auto", camGroup);
+m_autoExposureCheckBox->setChecked(true);
+// ... 样式 ...
+autoExpRow->addWidget(autoExpLabel);
+autoExpRow->addWidget(m_autoExposureCheckBox);
+autoExpRow->addStretch();
+camLayout->addLayout(autoExpRow);
+
+// 手动曝光值行
+auto* expRow = new QHBoxLayout();
+auto* expLabel = new QLabel("Exposure:", camGroup);
+expLabel->setFixedWidth(100);
+m_exposureSlider = new QSlider(Qt::Horizontal, camGroup);
+m_exposureSlider->setRange(1, 5000);       // 占位范围
+m_exposureSlider->setValue(312);
+m_exposureSlider->setEnabled(false);       // 默认自动曝光 → 禁用
+m_exposureValue = new QLabel("312", camGroup);
+m_exposureValue->setFixedWidth(60);
+// ... 添加到布局 ...
+```
+
+**5) 槽函数**（`src/display/gui.cpp`）：
+```cpp
+void CameraGUI::onAutoExposureChanged(int state) {
+    bool autoExp = (state == Qt::Checked);
+    m_exposureSlider->setEnabled(!autoExp);
+    int mode = autoExp ? 3 : 1;  // 3=Aperture Priority, 1=Manual
+    if (m_onCameraControl)
+        m_onCameraControl(V4L2_CID_EXPOSURE_AUTO, mode);
+    // 切换到手动模式时，写入当前滑块值
+    if (!autoExp && m_onCameraControl)
+        m_onCameraControl(V4L2_CID_EXPOSURE_ABSOLUTE, m_exposureSlider->value());
+}
+
+void CameraGUI::onExposureChanged(int value) {
+    m_exposureValue->setText(QString::number(value));
+    m_exposureInfo.current = value;
+    if (m_onCameraControl)
+        m_onCameraControl(V4L2_CID_EXPOSURE_ABSOLUTE, value);
+}
+```
+
+**6) Reset Defaults 扩展**（`src/display/gui.cpp` — `onResetDefaults()`）：
+```cpp
+// 恢复曝光
+m_autoExposureCheckBox->setChecked(m_autoExposureDefault);
+m_exposureSlider->setValue(m_exposureInfo.def);
+m_exposureValue->setText(QString::number(m_exposureInfo.def));
+m_exposureInfo.current = m_exposureInfo.def;
+m_exposureSlider->setEnabled(!m_autoExposureDefault);
+if (m_onCameraControl) {
+    m_onCameraControl(V4L2_CID_EXPOSURE_AUTO, m_autoExposureDefault ? 3 : 1);
+    m_onCameraControl(V4L2_CID_EXPOSURE_ABSOLUTE, m_exposureInfo.def);
+}
+```
+
+**涉及文件**：`include/camera/capture.h`、`include/display/gui.h`、`src/display/gui.cpp`、`src/main.cpp`
+
+---
+
+## 10. 未来扩展
 
 | 方向 | 描述 |
 |------|------|

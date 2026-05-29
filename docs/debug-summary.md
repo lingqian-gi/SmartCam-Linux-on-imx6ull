@@ -999,3 +999,321 @@ i.MX6ULL 开发板的 Buildroot/Yocto 默认 rootfs 配置中：
 | `src/main.cpp` | 🆕 配置加载优先级 + 存储路径变更回调 |
 | `configs/smartcam.conf` | 📝 添加存储路径注释 |
 
+---
+
+## 17. 帧率滑块卡死（仅枚举到单帧率 → minFps==maxFps）✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/main.cpp` — 帧率范围初始化逻辑 |
+| **现象** | 部分 UVC 摄像头（如某些 USB 摄像头）`enumFrameRates()` 只返回一个离散帧率（如仅 30fps），导致 `minFps == maxFps == 30`，滑块 min=30/max=30，拖动无任何效果，完全卡死在 30fps |
+| **严重程度** | ❌ 严重 — 帧率不可调 |
+
+### 原因
+
+许多 UVC 摄像头的固件通过 `VIDIOC_ENUM_FRAMEINTERVALS` 只报告一个离散帧间隔（通常为 30fps），但实际的 `VIDIOC_S_PARM` 仍可接受其他帧率值（驱动内部做近似/适配）。原始代码直接将枚举到的唯一值设为滑块 `[min, max]` 范围，导致滑块被锁定在单一值。
+
+### 解决
+
+在 `main.cpp` 帧率初始化代码中，当 `enumFrameRates()` 返回成功但仅有一个离散帧率时（`minFps == maxFps`），回退到安全范围 1~60fps，并输出提示日志：
+
+```cpp
+if (minFps == maxFps) {
+    LOG_INF("Framerate: only one discrete rate (%d fps) enumerated, "
+            "falling back to safe range 1-60", minFps);
+    minFps = 1;
+    maxFps = 60;
+}
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/main.cpp` | 帧率范围初始化中新增 `minFps == maxFps` 检测，回退到 1~60 |
+
+---
+
+## 18. stepwise 帧率枚举的 min/max 语义反转 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/camera/capture.cpp` — `enumFrameRates()` |
+| **现象** | 部分摄像头以 stepwise 类型报告帧间隔时，滑块范围颠倒（如低帧率在高位、高帧率在低位），导致滑块初始位置错误 |
+| **严重程度** | ⚠️ 中等 — 功能可用但滑块行为异常 |
+
+### 原因
+
+V4L2 `V4L2_FRMIVAL_TYPE_STEPWISE` 中的语义：
+
+- `stepwise.min` = **最短帧间隔**（1/最高帧率），如 `{1, 30}` → 1/30s → **30fps**
+- `stepwise.max` = **最长帧间隔**（1/最低帧率），如 `{1, 5}` → 1/5s → **5fps**
+
+原始代码直接按 `min → minFps`、`max → maxFps` 理解，将 30fps 当成了最小值、5fps 当成了最大值。这是一个语义层面的误区：帧间隔的"最小"对应帧率的"最大"。
+
+### 修复
+
+```cpp
+// 修复前（错误）：
+int minFps = static_cast<int>(frmival.stepwise.min.denominator) /
+             static_cast<int>(frmival.stepwise.min.numerator);  // 30 → 当成 minFps
+int maxFps = static_cast<int>(frmival.stepwise.max.denominator) /
+             static_cast<int>(frmival.stepwise.max.numerator);  // 5  → 当成 maxFps
+
+// 修复后（正确）：
+int highFps = static_cast<int>(frmival.stepwise.min.denominator) /
+              static_cast<int>(frmival.stepwise.min.numerator);  // 30 → highFps
+int lowFps  = static_cast<int>(frmival.stepwise.max.denominator) /
+              static_cast<int>(frmival.stepwise.max.numerator);  // 5  → lowFps
+// 确保 lowFps <= highFps
+if (lowFps > highFps) std::swap(lowFps, highFps);
+// 从 lowFps 迭代到 highFps
+for (int f = lowFps; f <= highFps && count < 20; f += stepFps) { ... }
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/camera/capture.cpp`—`enumFrameRates()` | stepwise 分支：`min`→`highFps`，`max`→`lowFps`，添加 swap 保护 |
+
+---
+
+## 19. VIDIOC_S_PARM 在 STREAMON 期间返回 EBUSY ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/main.cpp` — 帧率回调 lambda |
+| **现象** | 拖动帧率滑块后日志输出 `setFramerate(XX) failed: Device or resource busy`，帧率实际未改变 |
+| **严重程度** | ❌ 严重 — 帧率调整完全失效 |
+
+### 原因
+
+V4L2 规范要求 `VIDIOC_S_PARM` 在流开启（`STREAMON`）期间对某些设备是不可用的，驱动返回 `-EBUSY`。原始帧率回调直接调用 `capture->setFramerate()`，未先停止流，导致 ioctl 被驱动拒绝。
+
+### 解决
+
+帧率回调重构为以下流程（`stop → set → start`）：
+
+```cpp
+// 1. 暂停采集线程（避免采集线程在 stopCapture 时使用 mmap 缓冲区）
+g_state.paused = true;
+/* wait for pause ack with 1.1s timeout */
+
+// 2. 停止采集流 → 设置帧率 → 重启采集流
+capture->stopCapture();
+capture->setFramerate(1, fps);   // ← 此时无 EBUSY
+capture->startCapture();
+
+// 3. 设置软件帧率节流目标（兜底）
+g_state.targetFps = fps;
+
+// 4. 恢复采集线程
+g_state.paused = false;
+g_state.pauseCv.notify_one();
+```
+
+同时新增**软件帧率节流**作为兜底机制：即使硬件 `VIDIOC_S_PARM` 成功，采集线程也会按 `targetFps` 丢帧以确保实际输出帧率匹配用户设定。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/main.cpp` | 帧率回调重构：增加 pause→stop→set→start→resume 流程 + 软件节流 |
+| `src/main.cpp` (g_state) | 新增 `targetFps` 原子变量 |
+| `src/main.cpp` (采集线程) | 新增基于 `targetFps` 的帧率节流逻辑（以 `steady_clock` 控制帧间隔） |
+
+---
+
+## 20. 帧率滑块快速拖拽导致流频繁中断（防抖优化）✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `include/display/gui.h` / `src/display/gui.cpp` |
+| **现象** | 快速拖动帧率滑块时，每经过一个整数值都触发 stop→set→start 完整流程，导致视频流频繁中断（1秒内可能 stop/start 5~10 次），画面闪烁 |
+| **严重程度** | ⚠️ 中等 — 功能可用但用户体验差 |
+
+### 原因
+
+原始 `onFramerateSliderChanged(int value)` 槽函数直接调用回调，没有任何防抖机制。`QSlider` 的 `valueChanged` 信号在拖动过程中高频触发（每经过一个 step 就 emit 一次），每次触发都执行完整的流停止/帧率设置/流启动流程。
+
+### 解决
+
+使用 `QTimer::singleShot` 实现 300ms 防抖窗口：
+
+```cpp
+// gui.h 新增成员
+QTimer* m_framerateDebounceTimer = nullptr;
+
+// gui.cpp — buildSettingsDialog() 中初始化
+m_framerateDebounceTimer = new QTimer(this);
+m_framerateDebounceTimer->setSingleShot(true);
+connect(m_framerateDebounceTimer, &QTimer::timeout,
+        this, &CameraGUI::onFramerateDebounced);
+
+// onFramerateSliderChanged — 立即更新标签，重启防抖计时器
+void CameraGUI::onFramerateSliderChanged(int value) {
+    m_framerateValue->setText(QString("%1 fps").arg(value));  // 即时视觉反馈
+    m_framerateInfo.current = value;
+    m_framerateDebounceTimer->start(300);   // 300ms 内无新变化才触发
+}
+
+// onFramerateDebounced — 防抖结束时真正执行
+void CameraGUI::onFramerateDebounced() {
+    int value = m_framerateSlider->value();
+    m_framerateInfo.current = value;
+    if (m_onFramerate) m_onFramerate(value);
+}
+```
+
+关键设计：
+- **标签即时更新**：滑块值变化立即反映到 UI（`"XX fps"`），用户有拖拽反馈
+- **实际变更延迟**：300ms 内连续拖拽只触发最后一次的 `onFramerateDebounced`
+- **Reset Defaults 特殊处理**：恢复默认帧率时停止防抖计时器，直接执行，避免延迟
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `include/display/gui.h` | 新增 `m_framerateDebounceTimer` 成员、`onFramerateDebounced` slot |
+| `src/display/gui.cpp` | `buildSettingsDialog()` — 防抖计时器初始化；`onFramerateSliderChanged()` — 仅更新标签 + 重启计时器；`onFramerateDebounced()` — 新 slot；`onResetDefaults()` — 停止防抖直接执行 |
+
+---
+
+## 21. 自动曝光导致帧率从 30fps 掉到 ~10fps ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/main.cpp` — V4L2 初始化时曝光控制 |
+| **现象** | 开发板上设为 30fps，实际采集帧率仅 ~10fps（日志：`avg=10.2 fps, raw interval min=98ms`），画面严重卡顿 |
+| **严重程度** | ❌ 严重 — 帧率无法达到标称值，影响实时预览和推流 |
+
+### 原因
+
+摄像头的**自动曝光（Auto Exposure Aperture Priority mode, V4L2_EXPOSURE_APERTURE_PRIORITY=3）**在室内暗光环境下自动增加曝光时间以提高画面亮度。典型情况：曝光时间增大到 ~100ms（远超 33ms），摄像头每 100ms 才产出一帧，导致帧率自然掉到 ~10fps。
+
+```
+自动曝光模式 (模式3) → 暗光场景 → 曝光时间自动拉长 → 帧间隔增大 → 实际帧率骤降
+                                                100ms → 10fps
+                                                <= 33ms → 30fps
+```
+
+### 解决
+
+在 `main.cpp` 的 V4L2 初始化阶段，**强制切换到手动曝光模式**（`V4L2_EXPOSURE_MANUAL = 1`），并将曝光值限制在 ≤300（对应 V4L2 曝光绝对值单位，确保 <33ms/帧）：
+
+```cpp
+// 自动曝光 → 查询并强制手动模式以保持帧率
+if (capture->queryControl(V4L2_CID_EXPOSURE_AUTO, ...) == 0) {
+    capture->getControl(V4L2_CID_EXPOSURE_AUTO, expVal);
+    if (expVal != 1) {  // 1 = V4L2_EXPOSURE_MANUAL
+        capture->setControl(V4L2_CID_EXPOSURE_AUTO, 1);
+        LOG_INF("Auto Exposure disabled (set to manual) to preserve framerate");
+    }
+}
+
+// 曝光绝对值 → 限制 ≤300 保证 30fps 的时间预算
+if (capture->queryControl(V4L2_CID_EXPOSURE_ABSOLUTE, ...) == 0) {
+    capture->getControl(V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
+    int targetExposure = (absCur > 0) ? absCur : (absDef > 0 ? absDef : 312);
+    if (targetExposure > 300) targetExposure = 300;
+    capture->setControl(V4L2_CID_EXPOSURE_ABSOLUTE, targetExposure);
+}
+```
+
+同时为暴露控制查询设置 GUI → 见问题 #23。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/main.cpp` | V4L2 初始化阶段新增曝光控制查询 + 手动模式强制设置 |
+| `include/camera/capture.h` | 新增 `V4L2_CID_EXPOSURE_AUTO`、`V4L2_CID_EXPOSURE_ABSOLUTE` 常量 |
+
+---
+
+## 22. 暗光下手动曝光导致画面模糊 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `src/main.cpp` + GUI 曝光面板（与 #21、#23 联动） |
+| **现象** | 强制手动曝光后（#21），暗光环境下画面非常暗，用户不可见；若手动调大曝光值则产生严重拖影 |
+| **严重程度** | 🟡 次要 — 画面可用但暗光场景画质受限 |
+
+### 原因
+
+手动曝光模式下，曝光时间是固定值。室内暗光需要更长曝光时间才能获得可接受的亮度，但曝光时间超过帧间隔（>33ms）会导致：
+- **帧率下降**（与 #21 同一根因）
+- **运动拖影**（物体在曝光窗口内移动）
+
+这是硬件限制（传感器灵敏度 + 镜头光圈 + 室内照度）的固有矛盾：
+- 短曝光 → 帧率高 → 画面暗
+- 长曝光 → 帧率低 → 画面亮但有拖影
+
+### 解决
+
+通过**曝光面板**（#23）让用户能自主在帧率和亮度之间权衡：
+
+1. **Auto Exposure 复选框** — 用户可切换回自动曝光模式（接受帧率下降换取自动亮度调节）
+2. **Exposure 滑块** — 手动模式下精细调节曝光值，在可接受的帧率范围内找到最优亮度
+3. **默认值** — 初始化时将曝光设为 300（上限，保证 30fps 的前提下尽可能亮）
+
+这不是一个"彻底解决"型的修复，而是通过**曝光面板暴露控制权**让用户根据实际场景自主选择。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| 与 #21、#23 相同 | 曝光控制的初始化和 GUI |
+
+---
+
+## 23. 曝光控制面板（GUI 新增 Auto Exposure + Exposure 滑块）✅ 已实现
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | `include/display/gui.h` / `src/display/gui.cpp` / `include/camera/capture.h` / `src/main.cpp` |
+| **现象** | 设置面板中没有任何曝光控制选项，用户无法调节曝光参数 |
+| **严重程度** | 🟡 次要 — 功能缺口 |
+
+### 实现
+
+在 Settings 弹窗的 "Camera Controls" 分组中新增曝光控制行，与白平衡控制行结构对称：
+
+**UI 控件：**
+```
+| Auto Exposure: | QCheckBox "Auto" | 弹性空白                    |
+| Exposure:       | QSlider(H)       | QLabel "312" (60px 右对齐) |
+```
+
+**互锁逻辑（与 Auto WB 一致）：**
+- Auto Exposure 勾选 → Exposure 滑块禁用 → `V4L2_CID_EXPOSURE_AUTO = 3`（Aperture Priority）
+- Auto Exposure 取消 → Exposure 滑块启用 → `V4L2_CID_EXPOSURE_AUTO = 1`（Manual），同时写入当前滑块值到 `V4L2_CID_EXPOSURE_ABSOLUTE`
+
+**V4L2 控制 ID 常量（capture.h 新增）：**
+```cpp
+static constexpr uint32_t V4L2_CID_EXPOSURE_AUTO     = 0x009a0901;
+static constexpr uint32_t V4L2_CID_EXPOSURE_ABSOLUTE = 0x009a0902;
+```
+
+**GUI 新增方法：**
+```cpp
+void setExposureRange(int min, int max, int step, int value);
+void setAutoExposure(bool enabled);
+```
+
+**槽函数：**
+- `onAutoExposureChanged(int state)` — 切换 manual/auto + 联动滑块启用状态
+- `onExposureChanged(int value)` — 写入 `V4L2_CID_EXPOSURE_ABSOLUTE`
+
+**Reset Defaults 扩展：** 恢复曝光参数到 V4L2 默认值
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `include/camera/capture.h` | 🆕 `V4L2_CID_EXPOSURE_AUTO`、`V4L2_CID_EXPOSURE_ABSOLUTE` 常量 |
+| `include/display/gui.h` | 🆕 `m_exposureSlider`、`m_exposureValue`、`m_autoExposureCheckBox`、`m_exposureInfo`、`setExposureRange()`、`setAutoExposure()`、`onAutoExposureChanged`、`onExposureChanged` |
+| `src/display/gui.cpp` | 🆕 `buildSettingsDialog()` 曝光行 UI；`setExposureRange()`、`setAutoExposure()`；`onAutoExposureChanged()`、`onExposureChanged()` 槽函数；`connectSignals()` 连接；`onResetDefaults()` 曝光恢复 |
+| `src/main.cpp` | 🆕 V4L2 初始化阶段曝光控制查询 + 手动模式强制设置
+
