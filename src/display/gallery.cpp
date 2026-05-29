@@ -99,6 +99,18 @@ void PhotoGallery::refresh() {
 
 void PhotoGallery::reset() {
     m_currentIndex = -1;
+    // 退出多选模式
+    if (m_selectMode) {
+        m_selectMode = false;
+        m_selectedIndices.clear();
+        m_btnSelectToggle->setText("Select");
+        m_btnSelectToggle->setStyleSheet(
+            "QPushButton { font-size: 13px; font-weight: bold;"
+            "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
+            "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+            "QPushButton:pressed { background: #1a252f; }");
+        m_selectToolBar->hide();
+    }
     m_stack->setCurrentIndex(0);
     refresh();
 }
@@ -135,11 +147,66 @@ void PhotoGallery::buildGalleryView() {
     m_storageInfoLabel->setStyleSheet(
         "font-size: 12px; color: #7f8c8d; padding: 2px 6px;");
 
+    m_btnSelectToggle = new QPushButton("Select", this);
+    m_btnSelectToggle->setStyleSheet(
+        "QPushButton { font-size: 13px; font-weight: bold;"
+        "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+        "QPushButton:pressed { background: #1a252f; }");
+    m_btnSelectToggle->setFixedHeight(34);
+    connect(m_btnSelectToggle, &QPushButton::clicked,
+            this, &PhotoGallery::onToggleSelectMode);
+
     topBar->addWidget(btnBack);
     topBar->addWidget(m_galleryTitle);
     topBar->addStretch();
+    topBar->addWidget(m_btnSelectToggle);
     topBar->addWidget(m_storageInfoLabel);
     layout->addLayout(topBar);
+
+    // ---- 多选操作工具栏（默认隐藏） ----
+    m_selectToolBar = new QWidget(this);
+    m_selectToolBar->setStyleSheet("background: #16213e; border-radius: 4px;");
+    auto* selLayout = new QHBoxLayout(m_selectToolBar);
+    selLayout->setContentsMargins(8, 4, 8, 4);
+    selLayout->setSpacing(8);
+
+    m_btnSelectAll = new QPushButton("Select All", this);
+    m_btnSelectAll->setStyleSheet(
+        "QPushButton { font-size: 12px; padding: 4px 10px;"
+        "  background: #2980b9; color: white; border: 1px solid #5aa9e6;"
+        "  border-radius: 3px; }"
+        "QPushButton:pressed { background: #1c6ea4; }");
+    connect(m_btnSelectAll, &QPushButton::clicked,
+            this, &PhotoGallery::onSelectAll);
+
+    QPushButton* btnDeselectAll = new QPushButton("Deselect All", this);
+    btnDeselectAll->setStyleSheet(
+        "QPushButton { font-size: 12px; padding: 4px 10px;"
+        "  background: #7f8c8d; color: white; border: 1px solid #95a5a6;"
+        "  border-radius: 3px; }"
+        "QPushButton:pressed { background: #6c7a7d; }");
+    connect(btnDeselectAll, &QPushButton::clicked,
+            this, &PhotoGallery::onDeselectAll);
+
+    m_btnDeleteSelected = new QPushButton("Delete (0)", this);
+    m_btnDeleteSelected->setStyleSheet(
+        "QPushButton { font-size: 12px; padding: 4px 10px;"
+        "  background: #c0392b; color: white; border: 1px solid #e74c3c;"
+        "  border-radius: 3px; }"
+        "QPushButton:pressed { background: #962d22; }"
+        "QPushButton:disabled { background: #5a2d28; color: #7a5a58;"
+        "  border-color: #6a3a38; }");
+    m_btnDeleteSelected->setEnabled(false);
+    connect(m_btnDeleteSelected, &QPushButton::clicked,
+            this, &PhotoGallery::onDeleteSelected);
+
+    selLayout->addWidget(m_btnSelectAll);
+    selLayout->addWidget(btnDeselectAll);
+    selLayout->addStretch();
+    selLayout->addWidget(m_btnDeleteSelected);
+    m_selectToolBar->hide();
+    layout->addWidget(m_selectToolBar);
 
     // ---- 滚动区域 ----
     m_scrollArea = new QScrollArea(this);
@@ -344,6 +411,7 @@ void PhotoGallery::updateStorageInfo() {
 void PhotoGallery::clearThumbnails() {
     // 清空网格中所有子控件
     if (!m_gridLayout) return;
+    m_checkBoxes.clear();
     QLayoutItem* item;
     while ((item = m_gridLayout->takeAt(0)) != nullptr) {
         if (item->widget()) {
@@ -437,6 +505,20 @@ void PhotoGallery::loadVisibleThumbnails() {
         // 点击 → 全屏（用 lambda 捕获索引）
         int idx = static_cast<int>(i);
         connect(btn, &QPushButton::clicked, this, [this, idx]() {
+            if (m_selectMode) {
+                // 多选模式下点击缩略图切换勾选
+                if (m_selectedIndices.contains(idx)) {
+                    m_selectedIndices.remove(idx);
+                } else {
+                    m_selectedIndices.insert(idx);
+                }
+                // 同步对应 checkbox
+                if (idx < m_checkBoxes.size() && m_checkBoxes[idx]) {
+                    m_checkBoxes[idx]->setChecked(m_selectedIndices.contains(idx));
+                }
+                updateDeleteSelectedButton();
+                return;
+            }
             m_currentIndex = idx;
             updateFullscreenDisplay();
             m_stack->setCurrentIndex(1);
@@ -459,12 +541,42 @@ void PhotoGallery::loadVisibleThumbnails() {
         infoLabel->setStyleSheet(
             "font-size: 11px; color: #7f8c8d; padding: 2px;");
 
-        // 按钮 + 标签放入一个容器
+        // 多选复选框（覆盖在缩略图左上角）
+        auto* checkBox = new QCheckBox(this);
+        checkBox->setStyleSheet(
+            "QCheckBox { spacing: 0; }"
+            "QCheckBox::indicator { width: 22px; height: 22px;"
+            "  border: 2px solid #5a6c7d; border-radius: 3px;"
+            "  background: rgba(10,10,26,180); }"
+            "QCheckBox::indicator:checked {"
+            "  background: #2980b9; border-color: #5aa9e6; }");
+        checkBox->setChecked(m_selectedIndices.contains(idx));
+        checkBox->setVisible(m_selectMode);
+        connect(checkBox, &QCheckBox::toggled, this, [this, idx](bool checked) {
+            onItemSelectionChanged(idx, checked);
+        });
+        m_checkBoxes.push_back(checkBox);
+
+        // 按钮 + 复选框 + 标签放入一个容器
         auto* cellWidget = new QWidget(this);
+        cellWidget->setStyleSheet("position: relative;");
         auto* cellLayout = new QVBoxLayout(cellWidget);
         cellLayout->setContentsMargins(0, 0, 0, 0);
         cellLayout->setSpacing(2);
-        cellLayout->addWidget(btn, 0, Qt::AlignCenter);
+
+        // 缩略图 + 复选框叠放
+        auto* thumbStack = new QWidget(this);
+        auto* thumbStackLayout = new QVBoxLayout(thumbStack);
+        thumbStackLayout->setContentsMargins(0, 0, 0, 0);
+        thumbStackLayout->setSpacing(0);
+        thumbStackLayout->addWidget(btn, 0, Qt::AlignCenter);
+
+        // 绝对定位复选框在缩略图左上角
+        checkBox->setParent(btn);
+        checkBox->move(4, 4);
+        checkBox->raise();
+
+        cellLayout->addWidget(thumbStack, 0, Qt::AlignCenter);
         cellLayout->addWidget(infoLabel, 0, Qt::AlignCenter);
 
         int col = static_cast<int>(i) % THUMB_COLS;
@@ -720,6 +832,128 @@ void PhotoGallery::onVideoPlaybackFinished() {
     // 视频播放到末尾，保持暂停状态（显示最后一帧）
     // 用户可以点击 Prev/Next 切换
     qDebug() << "[Gallery] Video playback finished, index:" << m_currentIndex;
+}
+
+// ============================================================
+// 多选模式
+// ============================================================
+
+void PhotoGallery::onToggleSelectMode() {
+    m_selectMode = !m_selectMode;
+
+    if (m_selectMode) {
+        // 进入多选模式
+        m_btnSelectToggle->setText("Cancel");
+        m_btnSelectToggle->setStyleSheet(
+            "QPushButton { font-size: 13px; font-weight: bold;"
+            "  padding: 6px 12px; background: #c0392b; color: #ecf0f1;"
+            "  border: 2px solid #e74c3c; border-radius: 4px; }"
+            "QPushButton:pressed { background: #962d22; }");
+        m_selectToolBar->show();
+        m_selectedIndices.clear();
+        updateDeleteSelectedButton();
+    } else {
+        // 退出多选模式
+        m_btnSelectToggle->setText("Select");
+        m_btnSelectToggle->setStyleSheet(
+            "QPushButton { font-size: 13px; font-weight: bold;"
+            "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
+            "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+            "QPushButton:pressed { background: #1a252f; }");
+        m_selectToolBar->hide();
+        m_selectedIndices.clear();
+    }
+
+    // 刷新缩略图以显示/隐藏复选框
+    loadVisibleThumbnails();
+}
+
+void PhotoGallery::onSelectAll() {
+    m_selectedIndices.clear();
+    for (int i = 0; i < static_cast<int>(m_flatPhotos.size()); ++i) {
+        m_selectedIndices.insert(i);
+    }
+    // 同步所有 checkbox
+    for (int i = 0; i < m_checkBoxes.size() && i < static_cast<int>(m_flatPhotos.size()); ++i) {
+        if (m_checkBoxes[i]) m_checkBoxes[i]->setChecked(true);
+    }
+    updateDeleteSelectedButton();
+}
+
+void PhotoGallery::onDeselectAll() {
+    m_selectedIndices.clear();
+    for (int i = 0; i < m_checkBoxes.size(); ++i) {
+        if (m_checkBoxes[i]) m_checkBoxes[i]->setChecked(false);
+    }
+    updateDeleteSelectedButton();
+}
+
+void PhotoGallery::onItemSelectionChanged(int flatIndex, bool checked) {
+    if (checked) {
+        m_selectedIndices.insert(flatIndex);
+    } else {
+        m_selectedIndices.remove(flatIndex);
+    }
+    updateDeleteSelectedButton();
+}
+
+void PhotoGallery::updateDeleteSelectedButton() {
+    int count = m_selectedIndices.size();
+    m_btnDeleteSelected->setText(QString("Delete (%1)").arg(count));
+    m_btnDeleteSelected->setEnabled(count > 0);
+}
+
+void PhotoGallery::onDeleteSelected() {
+    if (m_selectedIndices.isEmpty()) return;
+
+    int count = m_selectedIndices.size();
+    auto reply = QMessageBox::question(
+        this, "Delete Selected",
+        QString("Delete %1 selected item(s)?\n\nThis cannot be undone.")
+            .arg(count),
+        QMessageBox::Cancel | QMessageBox::Yes,
+        QMessageBox::Cancel);
+
+    if (reply != QMessageBox::Yes) return;
+
+    // 收集要删除的路径
+    QStringList failedItems;
+    int deletedCount = 0;
+
+    for (int idx : m_selectedIndices) {
+        if (idx < 0 || idx >= static_cast<int>(m_flatPhotos.size())) continue;
+
+        const auto& info = m_flatPhotos[static_cast<size_t>(idx)];
+        int result = info.isVideo
+            ? m_storage->deleteVideo(info.path)
+            : m_storage->deletePhoto(info.path);
+
+        if (result == 0) {
+            deletedCount++;
+        } else {
+            failedItems << QString::fromStdString(info.filename);
+        }
+    }
+
+    if (!failedItems.isEmpty()) {
+        QMessageBox::warning(this, "Delete Partially Failed",
+            QString("Deleted %1 item(s).\n\nFailed to delete:\n%2")
+                .arg(deletedCount)
+                .arg(failedItems.join("\n")));
+    }
+
+    // 退出多选模式并刷新
+    m_selectMode = false;
+    m_btnSelectToggle->setText("Select");
+    m_btnSelectToggle->setStyleSheet(
+        "QPushButton { font-size: 13px; font-weight: bold;"
+        "  padding: 6px 12px; background: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+        "QPushButton:pressed { background: #1a252f; }");
+    m_selectToolBar->hide();
+    m_selectedIndices.clear();
+
+    refresh();
 }
 
 // ============================================================
