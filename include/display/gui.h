@@ -52,7 +52,8 @@ public:
     /**
      * @brief 更新状态栏信息
      */
-    void setFPS(double fps);
+    void setFPS(double fps);              // 硬件（摄像头）FPS
+    void setDisplayFPS(double fps);        // 软件（屏幕显示）FPS
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -139,6 +140,7 @@ private:
 
     // 状态栏
     QLabel*      m_labelFPS       = nullptr;
+    QLabel*      m_labelDisplayFPS = nullptr;  // 软件（显示）FPS
     QLabel*      m_labelStreaming = nullptr;
     QLabel*      m_labelClients   = nullptr;
     QLabel*      m_labelRecording = nullptr;

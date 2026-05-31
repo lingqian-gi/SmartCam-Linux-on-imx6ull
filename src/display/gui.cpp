@@ -162,7 +162,8 @@ void CameraGUI::buildUI() {
     auto* statusLayout = new QHBoxLayout();
     statusLayout->setSpacing(12);
 
-    m_labelFPS = new QLabel(QStringLiteral("FPS: 0.0"), this);
+    m_labelFPS = new QLabel(QStringLiteral("HW_FPS: 0.0"), this);
+    m_labelDisplayFPS = new QLabel(QStringLiteral("SW_FPS: 0.0"), this);
     m_labelStreaming = new QLabel(QStringLiteral("IDLE"), this);
     m_labelClients = new QLabel(QStringLiteral("Clients: 0"), this);
     m_labelRecording = new QLabel(QStringLiteral("REC"), this);
@@ -171,11 +172,13 @@ void CameraGUI::buildUI() {
                           "background: #1A1D24; border: 1px solid #2D333B;"
                           "border-radius: 12px; color: #8B949E;";
     m_labelFPS->setStyleSheet(statusStyle);
+    m_labelDisplayFPS->setStyleSheet(statusStyle);
     m_labelStreaming->setStyleSheet(statusStyle);
     m_labelClients->setStyleSheet(statusStyle);
     m_labelRecording->setStyleSheet(statusStyle);
 
     statusLayout->addWidget(m_labelFPS);
+    statusLayout->addWidget(m_labelDisplayFPS);
     statusLayout->addWidget(m_labelStreaming);
     statusLayout->addWidget(m_labelClients);
     statusLayout->addWidget(m_labelRecording);
@@ -476,7 +479,11 @@ void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat
 }
 
 void CameraGUI::setFPS(double fps) {
-    m_labelFPS->setText(QString("FPS: %1").arg(fps, 0, 'f', 1));
+    m_labelFPS->setText(QString("HW_FPS: %1").arg(fps, 0, 'f', 1));
+}
+
+void CameraGUI::setDisplayFPS(double fps) {
+    m_labelDisplayFPS->setText(QString("SW_FPS: %1").arg(fps, 0, 'f', 1));
 }
 
 void CameraGUI::setClientCount(int count) {
@@ -1074,7 +1081,8 @@ void CameraGUI::enterMockMode() {
     std::memcpy(m_mockBuffer.data(), buf.data(), buf.size());
     m_currentFrame.data = m_mockBuffer.data();
 
-    m_labelFPS->setText(QStringLiteral("FPS: 30.0"));
+    m_labelFPS->setText(QStringLiteral("HW_FPS: 30.0"));
+    m_labelDisplayFPS->setText(QStringLiteral("SW_FPS: 30.0"));
     m_labelStreaming->setText(QStringLiteral("MOCK"));
     m_labelStreaming->setStyleSheet(
         "font-size: 12px; font-weight: 700; padding: 4px 10px;"

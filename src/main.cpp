@@ -883,9 +883,15 @@ int main(int argc, char* argv[]) {
         // ============================================================
         // 显示定时器（Qt 主线程，33ms ≈ 30fps）
         // ============================================================
+        // 显示帧率统计变量
+        int         dispFrameCount    = 0;
+        double      dispLastTime      = 0.0;
+        double      dispCurrentFps    = 0.0;
+
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
-        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
+        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer,
+                             &dispFrameCount, &dispLastTime, &dispCurrentFps]() {
             std::lock_guard<std::mutex> lock(g_state.mtx);
             if (g_state.frameData.empty()) return;
 
@@ -896,7 +902,26 @@ int main(int argc, char* argv[]) {
                          g_state.width, g_state.height,
                          g_state.format);
 
+            // 硬件（摄像头）FPS
             gui.setFPS(g_state.fps);
+
+            // 软件（显示）FPS — 每 30 次刷新计算一次平均帧率
+            dispFrameCount++;
+            double now = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+            if (dispFrameCount >= 30) {
+                double elapsed = now - dispLastTime;
+                if (elapsed > 0.0 && dispLastTime > 0.0) {
+                    dispCurrentFps = dispFrameCount / elapsed;
+                }
+                dispLastTime = now;
+                dispFrameCount = 0;
+            } else if (dispLastTime <= 0.0) {
+                dispLastTime = now;   // 首次初始化时间戳
+            }
+            gui.setDisplayFPS(dispCurrentFps);
+
             gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
