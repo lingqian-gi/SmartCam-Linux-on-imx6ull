@@ -23,7 +23,7 @@
 | 录像按钮 (toggle) | ✅ |
 | 分辨率选择 (640x480 / 320x240 / 1280x720) | ✅ |
 | 格式选择 (YUV / MJPEG) | ✅ |
-| FPS 实时显示 | ✅ |
+| FPS 实时显示（硬件 + 软件双 FPS） | ✅ |
 | 推流状态指示 | ✅ |
 | 客户端计数 | ✅ |
 | 录像指示 | ✅ |
@@ -107,7 +107,8 @@ public:
 
     // ---- 数据输入 ----
     void setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
-    void setFPS(double fps);
+    void setFPS(double fps);              // 硬件帧率 (HW_FPS)
+    void setDisplayFPS(double fps);        // 软件/显示帧率 (SW_FPS)
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -271,4 +272,4 @@ offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 | 2026-05-20 | 初始实现：CameraGUI 类、Mock 模式、YUYV→RGB 转换、CMake 构建、编译通过 |
 | 2026-05-23 | **MJPEG 解码支持**：`frameToQImage()` 新增 `FMT_MJPEG` 分支，使用 libjpeg-turbo 自定义错误处理器静默坏帧警告。`setFrame()` 改为深拷贝（`m_frameBuffer.assign`），修复采集线程与 GUI 线程间的悬垂指针数据竞争。新增 `onCaptureRequest`/`onRecordToggle` 等回调注入接口。 |
 | 2026-05-24 | **systemd 服务完善**：`smartcam.service` 改为 `Type=simple`，新增 `ConditionPathExists=/dev/video0`、`Environment` 环境变量、`ProtectSystem=full` 加固等。`ExecStop` 不再使用不存在的 `smartcam stop` 子命令。 |
-| 2026-05-29 | **存储空间状态栏 (v0.6)**：Gallery 顶栏右侧新增存储用量显示（已用/总容量），`StorageManager` 新增 `getTotalSpaceMB()`，`PhotoGallery` 新增 `updateStorageInfo()`；剩余 <5% 红色 LOW 警告，<15% 橙色提示；进入/刷新/删除后自动更新 |
+| 2026-05-31 | **双 FPS 显示**：状态栏新增软件帧率(SW_FPS)标签，与硬件帧率(HW_FPS)并排显示。`HW_FPS` 来自 V4L2 实时测量，`SW_FPS` 来自显示定时器平均刷新率。差异可直观判断渲染瓶颈。 |

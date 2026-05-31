@@ -1,7 +1,7 @@
 # SmartCam 项目变更日志 — 2026-05-29
 
 > 本文记录本次会话中所有的代码修改，包含问题背景、解决方案、修改明细和影响范围。
-> 共 4 项变更：相册多选删除 | FPS 诊断日志移除 | 删除确认弹窗样式修复 | 全局 UI 现代化改造。
+> 共 5 项变更：相册多选删除 | FPS 诊断日志移除 | 删除确认弹窗样式修复 | 全局 UI 现代化改造 | 双 FPS 显示(HW/SW)。
 
 ---
 
@@ -302,3 +302,42 @@ SmartCam 运行在嵌入式 linuxfb（Qt for Embedded Linux，无 X11/Wayland）
 | `src/display/video_player.cpp` | ~10 处修改 | 配色同步 |
 | `.codebuddy/rules/ui-ux-pro-max.mdc` | 新增 | UI 设计规范 Skill |
 | `docs/changelog-2026-05-29.md` | 本文档 | 变更日志 |
+| `include/display/gui.h` | +2 行 | 新增 `setDisplayFPS()` / `m_labelDisplayFPS` |
+| `src/display/gui.cpp` | +8 行 | 双 FPS 标签 + `setDisplayFPS()` 实现 |
+| `src/main.cpp` | +20 行 | 显示定时器内计算软件帧率 |
+| `docs/01-display-module-implementation.md` | ~3 处 | 双 FPS 说明 |
+| `CODE_WALKTHROUGH.md` | ~3 处 | 双 FPS 说明 |
+| `docs/11-framerate-control-implementation.md` | ~1 处 | 三层帧率更新为四层 |
+
+---
+
+## 变更 5：双 FPS 显示 — 硬件帧率(HW_FPS) + 软件帧率(SW_FPS)
+
+### 1. 遇到的问题
+
+状态栏原先只显示一个 FPS 值，来自 `CameraCapture::getCurrentFPS()`（V4L2 层实时测量的摄像头出帧速度）。但屏幕实际刷新率（Qt 定时器驱动的 GUI 渲染频率）可能因帧处理延迟、渲染耗时等原因低于硬件帧率，用户无法直观判断瓶颈所在。
+
+### 2. 解决方案
+
+在状态栏新增第二个 FPS 标签，分别标记为 `HW_FPS`（硬件摄像头帧率）和 `SW_FPS`（软件显示帧率）：
+
+- **HW_FPS**：复用现有的 `setFPS()`，数据源来自 `CameraCapture::getCurrentFPS()`，每 30 帧由 V4L2 采集层测量一次
+- **SW_FPS**：在 `main.cpp` 显示定时器回调中新增滑动窗口计算（每 30 次刷新取一次平均），数据源来自显示定时器的实际触发频率
+
+### 3. 修改明细
+
+| 文件 | 修改内容 |
+|------|----------|
+| `include/display/gui.h` | 新增 `setDisplayFPS(double fps)` 方法声明 + `m_labelDisplayFPS` 成员 |
+| `src/display/gui.cpp` | 新增 `SW_FPS` 标签（默认值 `SW_FPS: 0.0`），实现 `setDisplayFPS()`；mock 模式同步 |
+| `src/main.cpp` | 显示定时器回调中新增 `dispFrameCount`/`dispLastTime`/`dispCurrentFps` 变量和 FPS 计算逻辑，调用 `gui.setDisplayFPS()` |
+
+### 4. 影响范围
+
+| 模块 | 影响 |
+|------|------|
+| GUI 模块 | 状态栏从 4 标签增加到 5 标签，无兼容性问题 |
+| 采集线程 | 无影响 |
+| 处理线程 | 无影响 |
+| 网路基站 (MJPEG/RTSP) | 无影响 |
+| Storage | 无影响 |

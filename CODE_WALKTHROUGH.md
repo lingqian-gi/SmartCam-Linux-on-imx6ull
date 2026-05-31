@@ -2281,7 +2281,8 @@ public:
     void setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
 
     // 状态更新
-    void setFPS(double fps);
+    void setFPS(double fps);           // 硬件帧率 (HW_FPS)
+    void setDisplayFPS(double fps);     // 软件/显示帧率 (SW_FPS)
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -3242,7 +3243,8 @@ int main(int argc, char* argv[]) {
         displayTimer->setInterval(33);  // 30fps
         QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
             gui.setFrame(g_state.frameData.data(), ...);
-            gui.setFPS(g_state.fps);
+            gui.setFPS(g_state.fps);           // HW_FPS
+            gui.setDisplayFPS(dispCurrentFps);  // SW_FPS
         });
     } else {
         // Mock 模式
@@ -3270,7 +3272,7 @@ int main(int argc, char* argv[]) {
 │  │  30fps   │  │ 按钮事件  │  │ Settings │  │  相册     │   │
 │  │  QTimer  │  │ 处理     │  │  对话框  │  │  浏览     │   │
 │  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘   │
-│       │ setFrame / setFPS                                  │
+│       │ setFrame / setFPS / setDisplayFPS                   │
 │       ▼                                                    │
 │  ┌─────────────────────────────────────────┐               │
 │  │  CameraGUI: m_frameBuffer (深拷贝)       │               │

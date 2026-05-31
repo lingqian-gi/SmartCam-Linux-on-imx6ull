@@ -539,19 +539,21 @@ gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
 
 ---
 
-## 6. 三层帧率统一
+## 6. 四层帧率说明
 
-> 这是本次实现的核心价值 —— 将项目中原先独立的三层帧率概念统一到用户可控的单一参数上。
+本项目涉及四个层级的帧率概念，实现后统一说明如下：
 
-| 层级 | 实现前 | 实现后 |
-|------|--------|--------|
-| **采集帧率** (V4L2) | 动态测量 `updateFPS()` 每 30 帧计算一次 | 用户通过滑块设置 → `VIDIOC_S_PARM` |
-| **GUI 刷新** (displayTimer) | 固定 `setInterval(33)` | 帧率变更 → `setInterval(1000/fps)` |
-| **RTSP SDP/RTP** | 硬编码 `setStreamInfo(640, 480, 30)` | 初始化读实际帧率 + 帧率变更同步 `setStreamInfo()` |
+| 层级 | 说明 |
+|------|------|
+| **采集帧率** (V4L2) | 动态测量 `updateFPS()` 每 30 帧计算一次 → 显示为 **HW_FPS** |
+| **显示帧率** (GUI) | 显示定时器实际刷新率，每 30 次刷新计算一次 → 显示为 **SW_FPS** |
+| **GUI 刷新间隔** (displayTimer) | 帧率变更 → `setInterval(1000/fps)` |
+| **RTSP SDP/RTP** | 初始化读实际帧率 + 帧率变更同步 `setStreamInfo()` |
 
 **注意事项**:
-- `CameraCapture::updateFPS()` 仍保留其动态测量机制（每 30 帧计算实际 FPS），用于状态栏显示和录像文件的 FPS 字段。
-- `updateFPS()` 测量的值与 `VIDIOC_S_PARM` 设定值可能略有偏差（V4L2 驱动修正、系统抖动等），建议以 `getCurrentFPS()` 返回值作为"实际帧率"参考。
+- `CameraCapture::updateFPS()` 仍保留其动态测量机制（每 30 帧计算实际 FPS），用于状态栏 HW_FPS 显示和录像文件的 FPS 字段。
+- `SW_FPS` 在 `main.cpp` 显示定时器回调中独立计算（同样的滑动窗口算法），反映屏幕实际渲染速度。
+- HW_FPS 与 SW_FPS 的差值可直接判断渲染瓶颈 — 若 HW 远高于 SW，说明帧处理或 Qt 渲染跟不上。
 
 ---
 
