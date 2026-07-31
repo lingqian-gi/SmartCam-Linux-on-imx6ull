@@ -145,10 +145,14 @@ install(FILES configs/smartcam.conf
 )
 
 # ============================================================
-# 测试 (后续添加)
+# 测试 (PC 构建启用; 交叉编译跳过, 需在目标板运行)
 # ============================================================
 
-# add_subdirectory(tests)
+if(NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_subdirectory(tests)
+    message(STATUS "✓ 单元测试已启用: 构建后运行 ctest")
+endif()
 
 # ============================================================
 # 打印构建摘要
