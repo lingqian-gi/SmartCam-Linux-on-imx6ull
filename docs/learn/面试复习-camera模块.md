@@ -1946,3 +1946,255 @@ int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
 ### 面试一句话总结
 
 > "YUYV→RGB→JPEG 是 YUYV 模式下的软编码兜底路径：本地显示只认 RGB，所以先做 YUYV→RGB 颜色空间转换（用 NEON 加速）；网络推流和拍照只认 JPEG，而 libjpeg-turbo 的标准输入恰好就是 RGB（`JCS_RGB`），所以再对 RGB 做 JPEG 编码。一次 RGB 转换 + 一次 JPEG 编码，产出的 JPEG 同时喂给 HTTP 推流、RTSP 推流和拍照存盘三个消费者，与 MJPEG 模式的硬件直出形成双路径互补，保证无论摄像头支持哪种格式，下游统一消费 JPEG。"
+
+---
+
+# 补充：YUYV→RGB→JPEG 的内存账与"能不能不拷贝"
+
+> 定位：三个连续的面试追问串成一条线——① 这条链路多占多少内存；② mmap 零拷贝 vs 深拷贝的区别；③ 能不能省掉拷贝直接转换。三者都围绕"内存与拷贝"这个嵌入式核心话题。
+
+## 10.1 多两次转换就要多提供 RGB 和 JPEG 缓冲区吗？
+
+**结论：是的，需要额外两份缓冲——一份 RGB 中间态、一份 JPEG 输出。** 看 `encodeYUYVtoJPEG` 的组合函数：
+
+```cpp
+int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
+                                     int quality, uint8_t** jpeg_out,
+                                     unsigned long* jpeg_len) {
+    // YUYV → RGB24 临时缓冲
+    std::vector<uint8_t> rgb(static_cast<size_t>(width * height * 3));
+    yuyvToRgb24(yuyv, rgb.data(), width, height);
+
+    return encodeRGBtoJPEG(rgb.data(), width, height, quality, jpeg_out, jpeg_len);
+}
+```
+
+### 每份缓冲的大小（640x480 为例）
+
+| 缓冲 | 大小 | 来源 | 生命周期 |
+|------|------|------|----------|
+| YUYV（输入） | 640×480×2 ≈ **614KB** | V4L2 帧数据 | main.cpp 拷贝到 g_state |
+| RGB（中间态） | 640×480×3 ≈ **922KB** | `std::vector<uint8_t> rgb(...)` 局部变量 | 函数返回即释放 |
+| JPEG（输出） | 压缩后约 **30~100KB** | `jpeg_mem_dest` 内部 malloc | 调用者 `free(jpeg_out)` |
+
+**为什么多出来的 RGB 缓冲"绕不开"**：libjpeg-turbo 的 API 输入约定是 `JCS_RGB`（见 `encodeRGBtoJPEG` 的 `cinfo.in_color_space = JCS_RGB`），它**不接受 YUYV 这种打包格式**。所以哪怕 JPEG 内部最终也转 YCbCr 再 DCT，库的入口就是 RGB，你必须先喂给它 RGB。这是"接口约束"造成的必经中间态。
+
+### 峰值内存
+
+```
+峰值 ≈ YUYV(614KB) + RGB(922KB) + JPEG(≤100KB) ≈ 1.6MB
+```
+
+这就是 YUYV 模式推流内存比 MJPEG 直出高的原因——MJPEG 模式是"摄像头直接给 JPEG，零中转"，没有 RGB 这份 922KB。
+
+### 两个可优化点
+
+1. **RGB 缓冲可跨路径复用**：`encodeYUYVtoJPEG` 每次调用都新建 `rgb`；若本地显示也走 YUYV→RGB，理想设计是"一次 YUYV→RGB，RGB 同时供显示和 JPEG 编码"。当前代码两条路径独立（显示在 GUI 线程转、推流在处理线程转），确实转了两遍。
+2. **JPEG 缓冲是"越转越小"**：RGB 922KB → JPEG 30~100KB，压缩率约 10~30 倍。JPEG 这份缓冲虽然"多出来了"，但是网络传输和存储的最小形态——没有它就要把 922KB 的 RGB 直接发出去，带宽和存储都爆炸。
+
+### 与 MJPEG 模式对比
+
+| 路径 | 缓冲 | 内存 | CPU |
+|------|------|------|-----|
+| MJPEG 硬件直出 | 只有 JPEG 一份 | ~100KB | <1ms |
+| YUYV 软编码 | YUYV + RGB + JPEG 三份 | ~1.6MB | ~30ms |
+
+## 10.2 mmap 零拷贝 vs "main.cpp 拷贝"：矛盾吗？
+
+**不矛盾——mmap 省的是"从内核 DMA 缓冲到用户态"的搬运，而 `g_state.frameData.assign()` 是一次额外的、应用主动做的深拷贝。** 看 `main.cpp:782-793` 采集线程：
+
+```cpp
+// 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
+{
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    g_state.frameData.assign(fb.data, fb.data + fb.length);  // ← 深拷贝在这里
+    ...
+}
+// 立即归还 V4L2 缓冲区，让硬件可以写入下一帧
+capture->putFrame(&fb);
+```
+
+### 完整链路拆开看（以 YUYV 为例）
+
+```
+摄像头 DMA → 内核驱动缓冲区（物理内存）
+   │  mmap 映射，没有拷贝 ← 零拷贝在这里
+   ▼
+用户态虚拟地址（mmap 到同一块物理内存）
+   │  getFrame 拿到的是 mmap 指针 fb.data
+   │
+   │  g_state.frameData.assign(fb.data, fb.data+len) ← ① 深拷贝（memcpy）
+   ▼
+g_state.frameData（应用堆内存，614KB）  ← 10.1 算的"YUYV 输入"就是这一份
+   │  putFrame 归还 mmap 缓冲区
+   ▼
+```
+
+**mmap 的"零拷贝"是指**：`DQBUF` 拿到 `fb.data` 时，它直接指向映射的内核 DMA 缓冲，**不需要 read() 那种"内核→用户态拷一份"**。没有 mmap 的话，用 read() 就得把帧数据从内核缓冲复制到用户缓冲。
+
+**但项目里仍然 `assign()` 深拷贝**，原因注释写得很清楚：**"V4L2 mmap 内存不能长期持有"**。因为缓冲池只有 4 个槽位，`putFrame` 归还后硬件会覆盖这块内存。所以：采集线程拿到 mmap 指针 → 立刻深拷贝到 `g_state.frameData` → 马上 `putFrame` 归还，让硬件写下一帧。
+
+### 内存账归属
+
+| 部分 | 归属 | 是否算应用内存 |
+|------|------|---------------|
+| mmap 内核 DMA 缓冲（4 槽 × 614KB ≈ 2.4MB） | 驱动/内核 | 不算用户态内存（但占物理内存） |
+| `g_state.frameData`（1 份 × 614KB） | main.cpp 堆 | **算** ← 这就是"YUYV 输入" |
+| RGB 中间态（922KB） | 编码函数内 | 算 |
+| JPEG 输出（30~100KB） | 编码函数内 | 算 |
+
+### 补充：MJPEG 模式推流也不是"零拷贝直连 mmap"
+
+`mjpegServer->updateFrame()` 传的是 `g_state.frameData`，同样是深拷贝副本。真正的"零拷贝"（完全不拷）只存在于 V4L2 mmap 层的取帧动作本身；应用层为了**多路消费（GUI/HTTP/RTSP/存储）+ 线程安全**，统一深拷贝是刻意的工程取舍。
+
+## 10.3 能不能不拷贝，直接把 YUYV 转成 RGB？
+
+**结论：可以省输入端 YUYV 拷贝，但输出端 RGB 内存绕不开；且要不要省取决于 RGB 给谁用。**
+
+### 先澄清一个关键点
+
+"把 YUYV 转成 RGB"包含两部分：
+- **输入端**：YUYV 数据（当前是 mmap 指针，被拷贝一份到 `g_state.frameData`）
+- **输出端**：RGB 数据（**必须**有一块应用内存来装转换结果）
+
+能省的是**输入端**那份 YUYV 拷贝；但**输出端 RGB 无论如何都要分配**——你不可能把 RGB 写回 mmap 缓冲区（那块内存是摄像头 DMA 用的，大小按 YUYV 帧分配，归还后会被下一帧覆盖）。
+
+### 当前代码其实"拷了两次 YUYV"
+
+```
+① 采集线程：mmap → g_state.frameData（拷贝 #1）
+② 处理线程：g_state → localFrame（拷贝 #2，为快速释放锁）
+   然后才 encodeYUYVtoJPEG → 内部转 RGB
+```
+
+### 为什么当前设计坚持拷贝（不直接在 mmap 上转）
+
+**① 缓冲池租借模型（最根本）**：V4L2 只有 4 个 mmap 槽位，且 DMA 异步。如果"持有 mmap 指针做转换"（NEON 转 922KB 要 ~5ms），期间缓冲不能 `putFrame` 归还 → 4 帧后槽位耗尽 → `DQBUF` 永久阻塞 → 掉帧。所以"尽快归还"是第一原则，拷贝换来了缓冲占用时间极短。
+
+**② 一帧多路消费**：同一帧要给 GUI（转 RGB）、HTTP（编 JPEG）、RTSP（编 JPEG）、存储（写 AVI）。如果只在 mmap 上转一次得到 RGB，这 RGB 只能服务一路（比如显示），其他路仍需 YUYV 去编码。共享同一份 RGB 需要引用计数管理生命周期，复杂度远高于"拷贝"。
+
+**③ 线程安全**：mmap 缓冲由采集线程 dqbuf/qbuf 管理。若转换发生在别的线程，要么持有锁（阻塞采集），要么冒"转换中缓冲被硬件覆盖"的风险。深拷贝后数据完全归应用所有，无锁分发。
+
+### 如果真的想省，有两条可行路径
+
+**路径 A：转换结果直写应用 RGB，省 YUYV 拷贝（推荐方向）**
+
+```cpp
+// 采集线程：不拷 YUYV，直接在 mmap 上转成 RGB 存到 g_state
+std::vector<uint8_t> rgb(w*h*3);                        // 输出端内存还是要的
+VideoProcessor::yuyvToRgb24(fb.data, rgb.data(), w, h); // 从 mmap 直接读
+g_state.frameData = std::move(rgb);                     // 只存 RGB，不再存 YUYV
+putFrame(&fb);                                          // 归还
+```
+
+省掉的是 614KB YUYV 拷贝；代价是采集线程要扛 ~5ms 转换，且 RGB 只够显示用（推流/录像还得另编码 JPEG，即"显示 vs 推流"分流时转两遍）。
+
+**路径 B：真正的硬件零拷贝——PXP 直出**
+
+i.MX6ULL 的 PXP 能在摄像头缓冲和 LCD 之间做 YUV→RGB + 缩放 + 合成，**完全绕过 CPU 和用户态拷贝**。这才是"不拷贝、直接转"的终极形态——代价是要配 `imx_pxp` 驱动、DMA 同步，且 PXP 结果只服务显示，推流路径依然独立。
+
+### 核心权衡
+
+> 用一次 memcpy（几十微秒）换"缓冲占用极短 + 无锁多路消费 + 生命周期确定"。在 792MHz 单核上，614KB 的 `assign()` 约几十微秒，而 NEON 转 RGB 要 5ms——**把转换放在取帧路径上反而更贵**，所以把"拷贝"和"重活"都挪出采集线程，让采集线程保持 `getFrame → 拷贝 → putFrame` 三个 O(1) 操作。这就是 `main.cpp` 注释"采集线程仅做 getFrame → 拷贝 → putFrame，不阻塞在推流/录像上"的深层原因。
+
+## 10.4 面试一句话总结（本主题三连答）
+
+> "YUYV→RGB→JPEG 需要 RGB 和 JPEG 两份额外缓冲：RGB 是 libjpeg 接口约定（`JCS_RGB`）绕不开的中间态，约 922KB/帧，函数返回即释放；JPEG 是输出产物，压缩后反而比 YUYV 小（30~100KB），峰值内存约 1.6MB。mmap 零拷贝省的是'驱动→用户态'的搬运，`getFrame` 拿到的指针直接指向映射的 DMA 内存；但 V4L2 缓冲池只有 4 槽、不能长期持有，所以采集线程必须立刻 `assign()` 深拷贝到 `g_state.frameData` 再 `putFrame` 归还——零拷贝说的是省 read() 的搬运，深拷贝是缓冲池租借模型的必然代价。能否省掉拷贝直接转？输入端可以省（mmap 上转 RGB 直写 g_state），但输出端 RGB 必然要分配，且转换 ~5ms 放在取帧路径上更贵；真正的不拷贝是 PXP 硬件直出，但只服务显示且引入驱动依赖。"
+
+---
+
+# 补充：为什么需要拷两次 YUYV？
+
+> 定位：承接 10.2/10.3 的"拷贝"话题，单独拆解"两次拷贝各自的原因"。核心一句话：**两次拷贝动机完全不同——#1 解决内存所有权，#2 解决锁竞争**。
+
+## 11.1 两次拷贝在哪
+
+**拷贝 #1**：采集线程，`main.cpp:785`
+
+```cpp
+g_state.frameData.assign(fb.data, fb.data + fb.length);  // mmap → g_state
+```
+
+**拷贝 #2**：处理线程，`main.cpp:829`
+
+```cpp
+localFrame = g_state.frameData;   // g_state → 处理线程本地
+```
+
+## 11.2 拷贝 #1 的原因：V4L2 缓冲池租借模型
+
+`fb.data` 指向 **mmap 的 DMA 缓冲**（内核物理内存映射），这块内存的生死由 V4L2 缓冲池控制：
+
+1. 缓冲池只有 **4 个槽位**，`putFrame` 归还后硬件立刻可能覆盖写下一帧；
+2. 采集线程如果不拷贝、直接持有 `fb.data`，就无法 `putFrame`，4 帧后槽位耗尽 → `DQBUF` 永久阻塞 → **整个采集冻结**；
+3. 而且 `fb.data` 是内核缓冲，跨线程共享它属于"未知生命周期内存"，任何别的线程持有它都可能读到被覆盖的数据。
+
+所以拷贝 #1 的实质是：**把"驱动借给我的临时内存"转成"应用自己拥有的稳定内存"**。这是缓冲池租借模型的必然要求，无法省略（除非改用 USERPTR/DMABUF 方案，见 11.5）。
+
+## 11.3 拷贝 #2 的原因：避免长时间持锁
+
+处理线程拿到帧后要做什么？看 `main.cpp:807` 起：**YUYV→JPEG 编码（~25ms CPU 重活）+ 推流 + 录像**。如果它直接在 `g_state.mtx` 锁内做这些：
+
+```cpp
+// 错误写法：锁内做重活
+std::lock_guard<std::mutex> lock(g_state.mtx);
+encodeYUYVtoJPEG(g_state.frameData.data(), ...);   // 25ms 占着锁！
+```
+
+那采集线程想写下一帧时会被锁阻塞 **25ms**——30fps 下每帧间隔才 33ms，等于采集线程 75% 时间在等锁，**必然掉帧**。
+
+所以拷贝 #2 的设计意图是 **"拷贝出来，快速释放锁，锁外做重活"**：
+
+```cpp
+{
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    localFrame = g_state.frameData;   // 锁内只拷贝（~1ms）
+    ...
+}   // 锁立刻释放
+// 锁外：编码、推流、录像，采集线程完全不受影响
+```
+
+锁持有时间从 25ms 降到 1ms，这是"**锁内轻活、锁外重活**"的典型实践（display 篇里 displayTimer 锁内只拷贝也是同一哲学）。
+
+## 11.4 本质：生产者-消费者解耦，"以拷贝换并发"
+
+把两次拷贝放一起看，本质是**采集线程（生产者）与处理线程（消费者）之间用"深拷贝"做解耦**：
+
+```
+采集线程（生产）                      处理线程（消费）
+  getFrame → mmap 指针
+  │
+  ├─ 拷贝#1 ──→ g_state.frameData（中转站，锁保护）
+  │              │
+  putFrame 归还   └─ 拷贝#2 ──→ localFrame（消费者私有）
+                                  │
+                             编码/推流（无锁，不阻塞任何人）
+```
+
+- 拷贝 #1 解决"**内存所有权**"：把内核临时内存变成应用稳定内存；
+- 拷贝 #2 解决"**锁竞争**"：把共享态转成私有态，消费者之后全程无锁。
+
+每次拷贝都是"把共享数据私有化"的一次操作——**共享越少，锁越短，并行度越高**。这是多线程设计里"以拷贝换并发"的标准权衡。
+
+## 11.5 能不能省掉拷贝？（面试加分项）
+
+**省拷贝 #2——方案 A：双缓冲（double buffering）**
+
+```
+采集写 B ──→ 采集写 A ──→ 采集写 B ...
+         处理读 A       处理读 B
+```
+
+处理线程读 A 缓冲时采集线程写 B，交替使用，处理线程引用 A 而不拷贝。省掉拷贝 #2，但引入"**缓冲翻转同步**"：处理线程还没读完 A，采集线程能不能开始写 A？需要额外同步（帧号 + 引用计数），复杂度大增，处理跟不上时依然要丢帧。**用 1ms 拷贝换来的确定性，比这套同步逻辑便宜得多**。
+
+**省拷贝 #2——方案 B：锁内直接引用 `g_state.frameData`**
+
+不拷贝只传引用/指针，编码时持有锁。前面说了，锁内 25ms 会卡死采集，不可行。
+
+**省拷贝 #1——方案 C：USERPTR / DMABUF 模式**
+
+应用自己分配内存、驱动 DMA 写进来，应用持有所有权就不需再拷贝。代价：USERPTR 需要物理连续/对齐内存且部分驱动不支持；跨线程共享依然要解决"驱动正在写、应用在读"的同步（还是要拷贝或双缓冲）。所以 MMAP + 深拷贝是最稳妥的通用方案。
+
+## 11.6 面试一句话总结
+
+> "两次拷贝动机不同：拷贝 #1（mmap→g_state）是因为 V4L2 缓冲池只有 4 槽、`fb.data` 是驱动临时借用的 DMA 内存，必须尽快归还，所以先深拷贝成应用自己的稳定内存；拷贝 #2（g_state→localFrame）是因为处理线程要做 25ms 的 JPEG 编码，不能占着 `g_state.mtx`，所以锁内只拷贝 1ms、快速释放锁，锁外无锁做重活——锁内轻活锁外重活。本质是'以拷贝换并发'：每次拷贝都把共享数据私有化，共享越少锁越短。省拷贝要么用双缓冲（引入翻转同步复杂度）、要么锁内直接引用（卡死采集），都不如 1ms 拷贝划算。"

@@ -809,3 +809,75 @@ README 说"运行内存（推流）~8MB"——display 占了其中一半多。�
 **撕裂的本质与解法**：linuxfb 单缓冲时，LCD 控制器在扫描中间改写帧缓冲 → 水平撕裂线。解法：① Qt backing store（软件双缓冲，当前已用）；② `FBIO_WAITFORVSYNC` 等 vsync 再 flush；③ 上 PXP 硬件叠加/缩放（i.MX6ULL 有 PXP，**本项目未用**——诚实点 + 可扩展点）。
 
 **PXP 追问应答**：诚实回答项目未用 PXP。原因：PXP 主要价值是 YUV→RGB 转换、旋转/缩放/叠加，需初始化 `imx_pxp` 驱动 + DMA 同步，本项目靠 NEON 软转（~5ms）已达标，引入复杂度收益不成比例。若用，最佳落点：① 显示前 YUYV→RGB 交 PXP（释放 CPU 给编码）；② OSD 两层合成；③ 大分辨率缩放。注意 PXP 不加速 JPEG 解码。"知道有硬件、知道为什么不用、知道怎么用"三层次。
+
+---
+
+# 补充：CameraControl 与 Format 的区别
+
+> 定位：display 模块中两个容易混淆的回调/概念。**CameraControl 调 sensor 图像参数（亮度/白平衡/曝光）**，**Format 改像素格式（YUYV/MJPEG）**——两者底层走完全不同的 V4L2 ioctl 路径，GUI 侧对应不同的回调与流程。
+
+## 1. 一句话区别
+
+- **CameraControl（相机控制）** = 调整**传感器图像参数**（亮度/对比度/白平衡/曝光），通过 V4L2 控件（`V4L2_CID_*`）设置，**改完即时生效，无需重启采集流**。
+- **Format（像素格式）** = 决定摄像头**输出的数据编码**（YUYV 原始 / MJPEG 压缩），通过 `VIDIOC_S_FMT` 设置，**改完必须停流重启**。
+
+## 2. 代码层面的对应关系
+
+| 维度 | CameraControl | Format |
+|------|---------------|--------|
+| 回调类型 | `CallbackCameraControl = std::function<void(int cid, int value)>` | `CallbackFormat = std::function<void(PixelFormat)>` |
+| GUI 注入 | `onCameraControlChanged(...)` | `onFormatChanged(...)` |
+| 底层 V4L2 ioctl | `VIDIOC_S_CTRL` / `VIDIOC_G_CTRL` / `VIDIOC_QUERYCTRL` | `VIDIOC_S_FMT` / `VIDIOC_ENUM_FMT` |
+| 具体项 | 亮度、对比度、白平衡、色温、曝光 | YUYV、MJPEG |
+| 修改后动作 | 直接 `setControl` 即时生效 | 暂停采集 → 停流 → `setFormat` → 重启流 |
+
+## 3. GUI 中的调用差异
+
+**CameraControl**（`gui.cpp` 滑块拖动时直接回调）：
+
+```cpp
+void CameraGUI::onBrightnessChanged(int value) {
+    m_brightnessValue->setText(QString::number(value));
+    if (m_onCameraControl) {
+        m_onCameraControl(static_cast<int>(CameraCapture::V4L2_CID_BRIGHTNESS), value);
+    }
+}
+```
+
+main.cpp 收到后就是一行 `capture->setControl(cid, value)`，驱动实时调整，**采集流不受影响**：
+
+```cpp
+gui.onCameraControlChanged([capture](int cid, int value) {
+    capture->setControl(cid, value);   // 即改即生效
+});
+```
+
+**Format**（下拉框切换时需要完整重启流程，`main.cpp:961`）：
+
+```cpp
+gui.onFormatChanged([capture, device](PixelFormat fmt) {
+    uint32_t v4l2fmt = (fmt == PixelFormat::FMT_YUYV)
+                           ? CameraCapture::V4L2_PIX_FMT_YUYV
+                           : CameraCapture::V4L2_PIX_FMT_MJPEG;
+    g_state.paused = true;              // ① 暂停采集线程
+    // ② 等采集线程确认暂停
+    capture->stopCapture();             // ③ 停流
+    capture->setFormat(640, 480, v4l2fmt);  // ④ 改格式
+    capture->startCapture();            // ⑤ 重启
+    g_state.paused = false;
+});
+```
+
+## 4. 为什么 Format 切换要重启而 Control 不用？
+
+1. **Format 影响缓冲区分配**：YUYV 帧是 `w*h*2` 字节、MJPEG 帧是压缩后变长字节，缓冲池大小/格式不同，必须先 `REQBUFS` 重来；
+2. **V4L2 规范**：`VIDIOC_S_FMT` 在 STREAMON 状态下返回 `EBUSY`，必须先 `STREAMOFF`；
+3. **CameraControl 是"参数寄存器"**：直接写 sensor 内部寄存器（增益、曝光时间），DMA 管线无需重启。
+
+## 5. 一个容易混淆的点
+
+`V4L2_CID_EXPOSURE_*`（曝光）虽然名叫"Control"，但调整曝光会影响帧率（曝光时间长了帧率掉），所以 GUI 里曝光滑块**不走防抖、直接回调**——而 FrameRate 变更却要走"停流重启"（因为 `VIDIOC_S_PARM` 也是流状态敏感）。这说明 V4L2 里"控件"和"流参数"是两套体系，不能只看名字。
+
+## 6. 面试一句话总结
+
+> "CameraControl 走 `VIDIOC_S_CTRL`，是调 sensor 的图像参数（亮度/白平衡/曝光），写寄存器即时生效、不断流；Format 走 `VIDIOC_S_FMT`，是改像素格式（YUYV/MJPEG），因为要重新分配缓冲池且 S_FMT 在 STREAMON 下会 EBUSY，所以必须先停流再重启。GUI 层对应两个回调：`onCameraControlChanged(cid, value)` 即时透传，`onFormatChanged(fmt)` 触发完整的暂停→停流→设置→重启握手。"
