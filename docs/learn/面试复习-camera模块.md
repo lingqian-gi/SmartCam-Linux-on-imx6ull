@@ -1111,3 +1111,838 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 | 换 CSI 怎么改 | 抽象 ICameraSource 工厂 + demosaic 管线 |
 | 升 4K 怎么改 | 内存/带宽/编码全爆表 → 预算分析反推硬件选型 |
 | 30→60fps 改什么 | 曝光上限减半、缓冲池扩容、强制 MJPEG、节流精度提高 |
+
+---
+
+# 补充：requestBuffers / mapBuffers / unmapBuffers 详解
+
+> 定位：三个函数组成 V4L2 **mmap 内存映射模式**缓冲池的核心生命周期：**申请 → 映射 → 释放**。
+> 对应代码：`src/camera/capture.cpp` 第 588~678 行。三者与 `queueAllBuffers` / `dequeueBuffer` 构成完整缓冲池闭环。
+
+## 4.1 requestBuffers() — 向驱动申请缓冲区（驱动侧分配）
+
+```cpp
+int CameraCapture::requestBuffers(int count) {
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count  = static_cast<__u32>(count);
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(m_fd, VIDIOC_REQBUFS, &req) < 0) {
+        LOG_ERR_("VIDIOC_REQBUFS (%d buffers) failed: %s", count, strerror(errno));
+        return -errno;
+    }
+
+    if (req.count < 2) {
+        LOG_ERR_("Insufficient buffer memory: only %u buffers", req.count);
+        return -ENOMEM;
+    }
+
+    m_nbuffers = static_cast<int>(req.count);
+    m_buffers  = new BufferUnit[static_cast<size_t>(m_nbuffers)];
+    memset(m_buffers, 0, sizeof(BufferUnit) * static_cast<size_t>(m_nbuffers));
+
+    LOG_INF("Requested %d V4L2 buffers (got %d)", count, m_nbuffers);
+    return 0;
+}
+```
+
+### 作用
+
+通过 `VIDIOC_REQBUFS` ioctl 请求驱动在**内核/驱动侧**分配一定数量的帧缓冲区。这是 mmap 模式的第一步。
+
+### 代码讲解
+
+- **三个字段**：`type = V4L2_BUF_TYPE_VIDEO_CAPTURE`（视频采集流类型）、`memory = V4L2_MEMORY_MMAP`（指定使用 mmap 内存映射方式）、`count = 4`（期望数量，来自 `kDefaultBufferCount`）。
+- **`count` 是"请求值/返回值"双向的**：你请求 4 个，驱动可能只给 3 个（受硬件限制），`req.count` 会被驱动改写为**实际分配数**。代码因此用 `req.count` 覆盖 `m_nbuffers`，而不是直接用入参 `count`。
+- **最少 2 个的防御检查**：V4L2 规范要求至少 2 个缓冲区才能正常轮转（一个正在被应用读取，另一个驱动可以往里写），否则报 `-ENOMEM`。
+- **分配用户态元数据数组**：`new BufferUnit[m_nbuffers]` 建立缓冲池的描述结构（每个 `BufferUnit` 记录 `start`/`length`/`index`/`queued`）。注意这里**只分配了描述结构，真正的帧内存还没映射**——那是下一步 `mapBuffers` 的活。
+
+## 4.2 mapBuffers() — 查询并映射到用户态（用户侧映射）
+
+```cpp
+int CameraCapture::mapBuffers() {
+    for (int i = 0; i < m_nbuffers; ++i) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = static_cast<__u32>(i);
+
+        if (ioctl(m_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            LOG_ERR_("VIDIOC_QUERYBUF[%d] failed: %s", i, strerror(errno));
+            return -errno;
+        }
+
+        m_buffers[i].start = mmap(nullptr,
+                                   buf.length,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED,
+                                   m_fd,
+                                   buf.m.offset);
+        if (m_buffers[i].start == MAP_FAILED) {
+            LOG_ERR_("mmap[%d] failed: %s (length=%u, offset=%u)",
+                      i, strerror(errno), buf.length, buf.m.offset);
+            m_buffers[i].start = nullptr;
+            return -errno;
+        }
+
+        m_buffers[i].length = static_cast<size_t>(buf.length);
+        m_buffers[i].index  = i;
+        m_buffers[i].queued = false;
+
+        LOG_DBG("  Buffer[%d]: mapped at %p, length=%zu", i,
+                  m_buffers[i].start, m_buffers[i].length);
+    }
+
+    return 0;
+}
+```
+
+### 作用
+
+把驱动侧已经分配好的缓冲区**映射到进程的用户态地址空间**，应用从此可以直接读写这块内存，这就是"零拷贝"的来源——驱动把摄像头数据 DMA 写进这块内存，应用读的就是同一块物理内存，中间没有 memcpy。
+
+### 代码讲解
+
+1. **`VIDIOC_QUERYBUF` 查询缓冲区信息**：对每个 `index`，拿到该缓冲区的 `length`（大小）和 `m.offset`（**在设备内存中的偏移**，这是 mmap 的第六个参数）。内核为每个缓冲区分配了不同的 offset，所以每个 index 要单独查询一次。
+2. **`mmap` 建立映射**：
+   - `nullptr`：由内核挑选合适的用户态地址；
+   - `buf.length`：映射长度（一帧大小，如 640x480 MJPEG 约几十 KB）；
+   - `PROT_READ | PROT_WRITE`：可读可写；
+   - `MAP_SHARED`：**共享映射**，至关重要——多个进程/内核共享同一物理页，对映射的修改对所有人可见（V4L2 要求用 MAP_SHARED）；
+   - `m_fd`：设备文件描述符，内核据此知道要映射哪个设备的内存；
+   - `buf.m.offset`：映射到驱动缓冲区在物理内存中的偏移。
+3. **`MAP_FAILED` 检查**：映射失败（如内存不足）时记录日志并立即返回，`m_buffers[i].start` 置 `nullptr` 防止后续误用。
+4. **回填元数据**：把 `length`、`index` 记入 `BufferUnit`，`queued` 初始化为 `false`（还没入队）。
+
+> 注意：这里的映射是**零拷贝**的——摄像头 DMA 直接写入内核缓冲区，应用通过 mmap 直接读，整个链路没有一次数据复制。这是代码注释中反复强调的 "mmap 零拷贝"。
+
+## 4.3 unmapBuffers() — 解除映射并释放（逆操作）
+
+```cpp
+int CameraCapture::unmapBuffers() {
+    if (!m_buffers) return 0;
+
+    for (int i = 0; i < m_nbuffers; ++i) {
+        if (m_buffers[i].start && m_buffers[i].start != MAP_FAILED) {
+            munmap(m_buffers[i].start, m_buffers[i].length);
+            m_buffers[i].start = nullptr;
+        }
+    }
+
+    delete[] m_buffers;
+    m_buffers  = nullptr;
+    m_nbuffers = 0;
+
+    // 释放 V4L2 驱动侧缓冲区资源，否则后续 VIDIOC_S_FMT 会返回 EBUSY
+    if (m_fd >= 0) {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count  = 0;
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(m_fd, VIDIOC_REQBUFS, &req) < 0) {
+            LOG_WRN("VIDIOC_REQBUFS(0) failed: %s", strerror(errno));
+        }
+    }
+
+    return 0;
+}
+```
+
+### 作用
+
+`requestBuffers` 和 `mapBuffers` 的逆操作，分三层清理。它由 `release()`（析构时）和 `stopCapture()` 调用。
+
+### 代码讲解
+
+1. **`munmap` 解除映射**：对每个已成功映射的缓冲区调用 `munmap(start, length)`，把用户态地址空间归还给内核。注意先检查 `start && start != MAP_FAILED`，避免对无效指针调用 `munmap`（会 `SIGSEGV`）。
+2. **释放元数据数组**：`delete[] m_buffers`，归还 `BufferUnit` 数组，指针和计数清零。
+3. **关键的一步：`VIDIOC_REQBUFS` 且 `count = 0`**：这是 V4L2 的"释放驱动侧缓冲区"约定——向驱动请求 0 个缓冲区，驱动就会释放之前分配的所有内核缓冲区。代码注释明确说明了为什么必须这么做：**如果不释放，后续再调用 `VIDIOC_S_FMT` 更改格式/分辨率时会返回 `EBUSY`**（格式变更要求缓冲区池为空）。
+
+## 4.4 三者的关系（生命周期）
+
+```
+startCapture()
+    │
+    ├─ requestBuffers(4)  → 驱动分配 4 个内核缓冲区（VIDIOC_REQBUFS）
+    ├─ mapBuffers()       → 每个缓冲区 QUERYBUF 查询 + mmap 映射到用户态
+    ├─ queueAllBuffers()  → 全部 QBUF 入队（VIDIOC_QBUF）
+    ├─ STREAMON           → 开始采集
+    │
+    ├─ [dqbuf → 处理帧 → qbuf]   ← 循环取帧/还帧（getFrame/putFrame）
+    │
+    ├─ STREAMOFF
+    └─ unmapBuffers()
+         ├─ munmap() 解除用户态映射
+         ├─ delete[] 释放 BufferUnit 数组
+         └─ REQBUFS(count=0) 释放驱动侧缓冲区
+```
+
+## 4.5 面试追问与应答
+
+**Q1：三个函数的本质区别是什么？**
+
+> `requestBuffers` 对应 `VIDIOC_REQBUFS`，是在**驱动侧**申请内存（内核分配）；`mapBuffers` 对应 `VIDIOC_QUERYBUF` + `mmap`，是把驱动缓冲**映射到用户态**（应用可零拷贝读写）；`unmapBuffers` 对应 `munmap` + `VIDIOC_REQBUFS(count=0)`，是**解除映射 + 释放驱动缓冲**。
+
+**Q2：为什么 `requestBuffers` 里 `count` 是双向的？**
+
+> 入参 `count` 是"我想要的"，ioctl 返回后驱动会把它改写为"实际能给的"（受硬件内存限制）。所以必须回读 `req.count` 作为真实缓冲区数量，否则后续按错误数量遍历会越界。
+
+**Q3：为什么 `mapBuffers` 要每个 buffer 单独 `QUERYBUF`？**
+
+> 每个缓冲区的 `length` 和 `m.offset` 都是内核单独分配的，不是固定值，必须逐 index 查询后才能正确 mmap。
+
+**Q4：为什么必须 `MAP_SHARED` 而不是 `MAP_PRIVATE`？**
+
+> `MAP_SHARED` 让内核/驱动与应用共享同一物理页，驱动 DMA 写入的内容应用立即可见。`MAP_PRIVATE` 是写时复制语义，写入不落回原页，V4L2 帧数据根本看不到。
+
+**Q5：`unmapBuffers` 里为什么还要 `REQBUFS(0)`？只 `munmap` 不行吗？**
+
+> 不行。`munmap` 只解除用户态映射，驱动侧的内核缓冲区还占着。V4L2 约定 `count=0` 的 `REQBUFS` 才会释放驱动缓冲，否则下次 `VIDIOC_S_FMT` 改格式/分辨率会返回 `EBUSY`。这是初学者最容易踩的坑。
+
+**Q6：这套缓冲池是什么"租借模型"？**
+
+> 请求 N 个缓冲后全部入队（qbuf），驱动填一帧应用取一帧（dqbuf），处理完必须归还（qbuf）。漏还 = 队列耗尽 = 采集冻结。`getFrame`/`putFrame` 成对调用 + `pool_index` O(1) 归还，就是这个模型的工程落地。
+
+### 一句话总结
+
+| 函数 | 对应 ioctl/系统调用 | 干什么 |
+|------|---------------------|--------|
+| `requestBuffers` | `VIDIOC_REQBUFS` | 向驱动**申请** N 个缓冲区（内核侧分配内存） |
+| `mapBuffers` | `VIDIOC_QUERYBUF` + `mmap` | 查询每个缓冲区信息并**映射到用户态**（应用可零拷贝读写） |
+| `unmapBuffers` | `munmap` + `VIDIOC_REQBUFS(count=0)` | **解除映射 + 释放**驱动侧缓冲区，保证下次改格式不报 `EBUSY` |
+
+---
+
+# 补充：驱动侧缓冲区是什么？不在内存中吗？
+
+> 定位：澄清「驱动侧缓冲区」的常见误解。它**就在内存（RAM）里**，不是另外一块硬件内存。区别不在"内存的位置"，而在**这块内存归谁管理、谁看得见**。
+
+## 5.1 "驱动侧"到底指什么
+
+它指的是**内核态（kernel space）**：
+
+- 当你调用 `requestBuffers()` 时，真正干活的是内核里的 V4L2 驱动（比如 `uvcvideo`）。驱动在 RAM 里分配若干物理页（通常要求物理连续、对齐到页，以便 **DMA 引擎直接往里写**）。
+- 这些页虽然躺在内存条上，但此时它们**只映射在内核地址空间**，你的用户态进程**看不到也摸不着**——因为进程的虚拟地址空间是隔离的，内核页表没把这部分虚拟地址映射给任何用户进程。
+
+所以"驱动侧" = **"这块内存还没映射到你的进程里"**，而不是"这块内存不在 RAM 里"。
+
+## 5.2 同一条物理内存，两个视图
+
+整个链路里只有**一份物理内存**，但会被映射两次：
+
+```
+                     物理内存 (RAM) 中的同一块页
+                            │
+        ┌───────────────────┴───────────────────┐
+        │                                       │
+   内核视图                               用户视图
+   (驱动分配后就有)                        (mmap 之后才有)
+        │                                       │
+   DMA 引擎直接把摄像头数据写入           进程通过虚拟地址读写
+   （不需要经过 CPU）                        同一块物理页
+```
+
+- **DMA 写入**：摄像头 sensor → USB 控制器 → DMA 直接把数据写进这块物理页，CPU 不参与。
+- **mmap 之后**：内核把同一物理页映射进你进程的虚拟地址空间，于是应用代码直接 `buf->data` 就能读到摄像头刚写进去的数据。
+
+这就是"零拷贝"的完整含义：**数据从摄像头到应用，全程物理内存只有一份，没有任何 memcpy**。
+
+## 5.3 一个类比
+
+把它想象成"库房"：
+
+| 阶段 | 类比 |
+|------|------|
+| `requestBuffers()` | 在库房（RAM）里划出一块区域，挂上"内核专用"的牌子 |
+| 分配后、mmap 前 | 货在库里，但你**没有钥匙**（虚拟地址未映射），看得见摸不着 |
+| `mapBuffers()` (mmap) | 发给你一把钥匙（建立虚拟地址映射），从此你能直接进出拿货 |
+| `unmapBuffers()` | 收回钥匙（munmap），再撤掉牌子（REQBUFS count=0，驱动释放内核里的页） |
+
+## 5.4 回到代码的对应关系
+
+| 函数 | 干了什么 | 内存视角 |
+|------|----------|----------|
+| `requestBuffers` (`VIDIOC_REQBUFS`) | 驱动在**内核**分配物理页 | 分配内存，但用户不可见 |
+| `mapBuffers` (`QUERYBUF` + `mmap`) | 把内核页映射进用户虚拟空间 | 同一块内存，用户可见了 |
+| `unmapBuffers` (`munmap` + `REQBUFS(0)`) | 解除映射 + 让内核回收页 | 用户不可见，内核回收 |
+
+## 5.5 面试追问与应答
+
+**Q1：为什么不能让驱动直接写在用户传进来的 buffer 里？**
+
+> 因为 DMA 需要物理连续内存，而用户态 `malloc` 的虚拟内存对应的物理页可能不连续，驱动没法保证 DMA 安全写入——这正是 `VIDIOC_REQBUFS` 必须由内核统一分配缓冲的根本原因。
+
+**Q2：mmap 之前用户进程为什么看不到这块内存？**
+
+> 进程的虚拟地址空间是隔离的，内核页表没有为任何用户进程建立这块物理页的映射。内核在分配缓冲时只把页映射到了自己的地址空间，用户进程拿不到对应的虚拟地址，自然无法访问。
+
+**Q3：同一块物理内存映射两次，会不会有数据一致性/缓存问题？**
+
+> 现代架构中 DMA 与 CPU 缓存的一致性由硬件（缓存一致性协议）和驱动（如 DMA API 的 cache 同步操作）共同保证；对应用来说，`MAP_SHARED` 映射 + 内核正确同步，读到的就是 DMA 写入后的最新数据。
+
+### 面试一句话总结
+
+> "驱动侧缓冲区就在 RAM 里，所谓'驱动侧'是指它由内核驱动分配、先映射在内核地址空间，用户进程通过 mmap 之后才在自己的虚拟地址空间里看到同一块物理内存。V4L2 mmap 模式的零拷贝，本质就是这份物理内存只存在一份，DMA 写、应用读，中间没有拷贝。"
+
+---
+
+# 补充：`-errno` 是什么？为什么函数返回这个？
+
+> 定位：讲解 Linux C/C++ 编程中经典的错误返回约定，`capture.cpp` 全文件大量使用（16 处 `return -errno`）。
+
+## 6.1 `errno` 是什么
+
+`errno` 是 C 标准库提供的一个全局整数变量（`<cerrno>`）。**当系统调用失败时**（如 `open`、`ioctl`、`mmap`），内核会把失败的具体原因写进 `errno`，并返回 `-1`。
+
+比如 `capture.cpp` 里的 `setFormat`：
+
+```cpp
+if (ioctl(m_fd, VIDIOC_S_FMT, &fmt) < 0) {
+    LOG_ERR_("VIDIOC_S_FMT failed: %s (w=%d h=%d fmt=0x%08X)",
+              strerror(errno), width, height, pixfmt);
+    return -errno;
+}
+```
+
+这里 `ioctl` 失败返回 `-1`，同时 `errno` 被内核设置为具体原因（如 `EINVAL` = 22、`EBUSY` = 16）。但 `-1` 丢失了原因信息，所以代码用 `-errno` 把它**编码进返回值**。
+
+## 6.2 为什么返回 `-errno` 而不是 `-1`？
+
+核心目的：**把"失败原因"通过返回值传给调用者**。
+
+`errno` 有个致命问题——它是**全局变量**，非常脆弱：
+
+```cpp
+// 假设 ioctl 失败，errno = EINVAL
+int ret = ioctl(...);       // 返回 -1
+int err = errno;            // 此刻正确读取：EINVAL
+printf(...);                // 任何库调用都可能覆盖 errno！
+int err2 = errno;           // 可能已经不是 EINVAL 了
+```
+
+如果在读取 `errno` 前调用了别的函数（哪怕是 `printf`），`errno` 可能已被改写。所以把错误码"扣留"到返回值里，是更安全、可传播的封装方式。
+
+## 6.3 `-errno` 的"负号"有什么讲究？
+
+这是刻意设计，让返回值**带符号即语义**：
+
+| 返回值 | 含义 |
+|--------|------|
+| `0` | 成功 |
+| `< 0`（如 `-22`） | 失败，绝对值就是 errno 码 |
+
+这样调用方只需一行就能判断：
+
+```cpp
+if (capture->startCapture() < 0) {   // <0 即失败，与"0成功"天然对应
+    LOG_ERR_("Failed to start capture");
+    ...
+}
+```
+
+这也和 **Linux 内核的系统调用约定**完全一致（内核函数返回负数 errno，如 `-ENOMEM`），嵌入式工程师看到 `-ENODEV`、`-EBUSY` 就能秒懂，无需额外约定。
+
+## 6.4 调用方如何还原错误信息
+
+拿到负返回值后，有三种用法：
+
+```cpp
+int ret = cap.setFormat(640, 480, fmt);
+
+// 用法一：判断成败
+if (ret < 0) { ... }
+
+// 用法二：还原 errno，用 strerror 打印人类可读信息
+errno = -ret;
+perror("setFormat");          // 输出: setFormat: Invalid argument
+
+// 用法三：直接比较错误码常量
+if (ret == -EBUSY) {          // 设备正忙，提示"先停止再改格式"
+    ...
+}
+```
+
+## 6.5 项目中具体用到的错误码
+
+`capture.cpp` 用得很全：
+
+| 返回值 | errno 常量 | 场景 |
+|--------|-----------|------|
+| `-ENODEV` | No such device | `m_fd < 0`，设备未打开/不是采集设备 |
+| `-EBUSY` | Device busy | 流未停止就调用 `setFormat` |
+| `-EINVAL` | Invalid argument | `putFrame` 传入非法 `pool_index` 或指针不匹配 |
+| `-ENOMEM` | Out of memory | `REQBUFS` 分配的缓冲区不足 2 个 |
+| `-ETIMEDOUT` | Timeout | `select` 超时没等到新帧 |
+| `-EIO` | I/O error | 未在流状态下调用 `getFrame/putFrame` |
+| 其他 `-errno` | 由 ioctl 决定 | 系统调用失败时透传内核错误码 |
+
+## 6.6 项目里一个很好的实践：`-errno` + 日志双通道
+
+注意代码里是**日志记录 + 负值返回**双保险：
+
+```cpp
+if (ioctl(m_fd, VIDIOC_REQBUFS, &req) < 0) {
+    LOG_ERR_("VIDIOC_REQBUFS (%d buffers) failed: %s", count, strerror(errno));  // ① 立即记录人类可读信息
+    return -errno;                                                                // ② 同时把错误码传回上层
+}
+```
+
+① 保证了日志里能看到具体原因（`strerror(errno)` 立刻转成字符串）；② 保证了上层逻辑（如 `startCapture` 的 `if (ret < 0)` 分支）能按错误码分派处理。两者互补，不冲突。
+
+## 6.7 面试追问与应答
+
+**Q1：为什么不直接用异常（exception）？**
+
+> 嵌入式 C++ 项目通常禁用或慎用异常（异常会增加代码体积、破坏实时性、且 `-fno-exceptions` 更可控）。用返回值传递错误是嵌入式约定俗成的做法，配合日志即可覆盖绝大多数错误场景。
+
+**Q2：`errno` 和返回值里的错误码是同一份吗？**
+
+> `errno` 是全局变量，函数返回的 `-errno` 是在失败瞬间"快照"下来的拷贝。前者易被后续库调用覆盖，后者随返回值传给调用者，更可靠。
+
+### 面试一句话总结
+
+> "`-errno` 是把系统调用失败原因编码进返回值的约定：返回 0 成功、负数为错误码（绝对值即 errno）。因为 errno 是全局变量、在读取前可能被任何库调用覆盖，所以把错误码扣留在返回值里传播更安全；同时负号让调用方用 `ret < 0` 一行判断成败，与 Linux 内核的 `-ENOMEM` 风格一致。用的时候要注意：先在日志里 `strerror(errno)` 转成字符串，再 `return -errno`。"
+
+---
+
+# 补充：NEON 是什么？为什么需要使用？
+
+> 定位：讲解 `src/camera/processor_neon.cpp` 背后的 SIMD 基础，以及 i.MX6ULL 上必须用 NEON 的性能原因。
+
+## 7.1 NEON 是什么
+
+**NEON 是 ARM 处理器的 SIMD（单指令多数据）扩展指令集**，即 ARM 官方的"128 位 SIMD 引擎"：
+
+- 拥有 32 个 **128-bit 宽寄存器**（`Q0`~`Q31`，也可当作 64-bit 的 `D0`~`D31` 使用）；
+- **一条指令同时处理多个数据**。比如一次 `vaddq_s16` 可以同时对 8 个 16-bit 整数做加法，相当于标量代码执行 8 条加法指令；
+- 适用于图像/音频/编解码等"同一种运算在大量数据上重复"的场景。
+
+## 7.2 项目里它具体干什么
+
+项目里 NEON 只干一件事：**YUYV → RGB24 颜色空间转换**（`src/camera/processor_neon.cpp`）。核心是 128-bit 寄存器 + 向量指令：
+
+```cpp
+for (; i + 15 < totalPixels; i += 16, src += 32) {
+    // Step 1: 加载并去交织 YUYV
+    // vld2 将偶数字节 (Y) 和奇数字节 (U/V) 分到两个寄存器
+    uint8x16x2_t yu = vld2q_u8(src);
+    uint8x16_t  y16   = yu.val[0];  // [Y0,...,Y15] 16 个 Y
+    uint8x16_t  uv16  = yu.val[1];  // [U0,V0,...,U7,V7] 8 对 UV
+```
+
+**一次循环处理 16 像素**（32 字节 YUYV → 48 字节 RGB）：
+
+- `vld2q_u8`：一次加载 16 字节并**去交织**，Y 和 UV 自动分成两个寄存器（标量要写循环逐字节取）；
+- `vuzp_u8`：一条指令完成 U/V 分离（标量要 `if (i%2)` 判断）；
+- `vmulq_s16` / `vshrq_n_s16`：一次对 8 个 16-bit 值做乘法和移位（BT.601 系数 359/88/183/454 的定点运算）；
+- `vqmovun_s16`：**饱和转换** int16→uint8，自动钳位到 [0,255]，免去标量代码里手写的 `clip()` 三元判断和分支；
+- `vst3_u8`：把 R、G、B 三个向量**交织写入**内存，直接生成 RGB24 布局。
+
+对照标量实现（`processor.cpp` 的退路）：
+
+```cpp
+auto clip = [](int x) -> uint8_t {
+    return static_cast<uint8_t>(x < 0 ? 0 : (x > 255 ? 255 : x));
+};
+
+int r0 = y0 + ((v * 359) >> 8);
+int g0 = y0 - ((u * 88) >> 8) - ((v * 183) >> 8);
+int b0 = y0 + ((u * 454) >> 8);
+...
+rgb[di++] = clip(r0);
+rgb[di++] = clip(g0);
+rgb[di++] = clip(b0);
+```
+
+标量版一次只处理 **2 个像素**（1 个宏像素），且每个输出都要走一次 `clip` 分支判断；NEON 版一次处理 **16 个像素**且无分支。
+
+## 7.3 为什么必须用 NEON？—— 项目里的性能账
+
+核心原因是 **i.MX6ULL 的 CPU 太弱**：
+
+| 参数 | 数值 |
+|------|------|
+| 处理器 | Cortex-A7，**单核 792MHz** |
+| 内存 | 512MB DDR3 |
+| 目标 | 640x480 @ 30fps 实时预览 |
+
+算一笔账：
+
+```
+每帧像素数 = 640 × 480 = 307,200
+YUYV→RGB24 每个像素 ≈ 3 次乘加 + 钳位
+
+标量版: 每像素约 5~6 条指令 + 2 次分支判断
+       → 单核 792MHz 全速跑也要 15~20ms+/帧，吃掉 50%+ CPU
+
+NEON 版: 一条指令并行 8~16 个数据，且无分支（vqmovun 内置饱和）
+       → 实测约 5ms/帧（README 性能表），CPU 占用大幅下降
+```
+
+**数据出处**（README 性能表）：
+
+| 操作 | 耗时 |
+|------|------|
+| YUYV 转 RGB24 | ~5ms（NEON 定点，文档注释"实测 ~8×"加速） |
+| libjpeg-turbo 编码 | ~25ms（NEON 加速） |
+
+## 7.4 为什么"刚好够"—— NEON + 零拷贝 + MJPEG 直出的整体设计
+
+NEON 不是孤立优化，它和系统的其他零拷贝策略配合，才让 792MHz 单核跑得动 30fps：
+
+- **MJPEG 模式**：摄像头硬件直出 JPEG，**根本不走 YUYV→RGB 转换**（<1ms），NEON 转换只在 YUYV 模式或本地显示时才启用；
+- **YUYV 模式**：必须软转 RGB，此时 NEON 的 ~8× 加速是"能不能实时"的分水岭；
+- 所以 NEON 是**保底能力**——MJPEG 直出是主力路径，NEON 保证 YUYV 备用路径也能实时。
+
+## 7.5 代码里的兼容设计（工程细节）
+
+NEON 代码通过宏**条件编译**隔离平台：
+
+```cmake
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    list(APPEND CAMERA_SOURCES src/camera/processor_neon.cpp)
+    ...
+else()
+    message(STATUS "✓ x86 模式：跳过 NEON 源，使用标量实现")
+endif()
+```
+
+```cpp
+void VideoProcessor::yuyvToRgb24(const uint8_t* yuyv, uint8_t* rgb,
+                                  int w, int h) {
+#ifdef __ARM_NEON
+    // ARM 平台: 使用 NEON SIMD 加速（外部链接到 processor_neon.cpp）
+    extern void yuyv_to_rgb24_neon(const uint8_t*, uint8_t*, int, int);
+    yuyv_to_rgb24_neon(yuyv, rgb, w, h);
+    return;
+#endif
+    // x86 / 无 NEON 退路: 标量 C++ 实现
+    ...
+}
+```
+
+- ARM 编译时 `-mfpu=neon` 自动定义 `__ARM_NEON`，走 NEON 路径；
+- x86 开发机上没有 `arm_neon.h`，退化为标量实现，PC 调试不受影响。
+
+## 7.6 面试追问与应答
+
+**Q1：NEON 为什么比标量快这么多？**
+
+> 三个来源：① 数据级并行——一条指令处理 8~16 个数据；② 无分支——`vqmovun` 硬件饱和替代 `clip()` 的三元判断，消除分支预测惩罚；③ 专用加载/存储指令——`vld2/vst3` 一条指令完成去交织/交织，替代标量的循环取存。
+
+**Q2：什么时候该用 NEON，什么时候不该用？**
+
+> 数据量大、运算规则简单重复（图像像素级、音频采样级、编解码）适合；逻辑复杂、有数据依赖（分支多的解析、串行算法）不适合。嵌入式优化顺序应是"先算法后指令"：先保证缓存友好、零拷贝，再用 SIMD 压热路径。
+
+### 面试一句话总结
+
+> "NEON 是 ARM 的 128 位 SIMD 指令集，一条指令并行处理 8~16 个数据。项目用它加速 YUYV→RGB 转换：用 `vld2/vuzp` 去交织、`vmul/vshr` 做 BT.601 定点乘加、`vqmovun` 免分支饱和钳位，一次循环处理 16 像素，实测约 8× 加速、降到 ~5ms/帧。之所以必须用，是因为 i.MX6ULL 只有 792MHz 单核，标量转换要 15~20ms 会吃掉一半 CPU，无法保证 640x480@30fps 实时；NEON 让 YUYV 备用路径也能实时。工程上通过 `__ARM_NEON` 宏条件编译，x86 开发机自动退化为标量实现。"
+
+---
+
+# 补充：NEON 指令（vdupq_n_s16 / vld2q_u8）与 YUYV 格式详解
+
+> 定位：这三个问题正是理解 `processor_neon.cpp` 的钥匙：**先懂 YUYV 格式，再看 NEON 指令的命名规则，最后串起处理思路**。
+
+## 8.1 YUYV 格式是怎样的？
+
+YUYV（也叫 YUY2）是 **YUV 4:2:2** 采样格式，每 **4 字节 = 2 个像素**：
+
+```
+一个"宏像素"(macropixel) = 4 字节 = [Y0, U, Y1, V] → 代表 2 个像素
+                              ↑    ↑   ↑    ↑
+                              第1像素亮度  第2像素亮度
+                              └─────┴───┴──────┘
+                                    共用色度
+```
+
+按行排布，一行 640 像素就是这样：
+
+```
+[Y0 U Y1 V][Y2 U Y4 V][Y4 U Y5 V] ...
+ └─像素0/1─┘ └─像素2/3─┘ └─像素4/5─┘
+```
+
+关键点：**相邻两个像素共享一对 U/V 色度分量，只有 Y 亮度是各自的**。因为人眼对亮度敏感、对色度不敏感，所以 4:2:2 采样用 2/3 的带宽（每像素平均 2 字节）保留了视觉上足够的色度信息。
+
+对应项目代码（`processor_neon.cpp` 的尾部标量实现）就是这么读的：
+
+```cpp
+int y0 = yuyv[si];
+int u  = yuyv[si + 1] - 128;
+int y1 = yuyv[si + 2];
+int v  = yuyv[si + 3] - 128;
+```
+
+## 8.2 NEON 指令命名规则 —— 先学会"读名字"
+
+NEON 内建函数的命名非常有规律，`vdupq_n_s16`、`vld2q_u8` 都可以拆开读：
+
+```
+v<操作> [q] [_n] _<type>
+│  │    │     │   └── 数据类型: u8=无符号8位, s16=有符号16位
+│  │    │     └────── _n: 带立即数/标量参数
+│  │    └──────────── q: 128-bit 寄存器(Q0-Q31)，不带q是64-bit(D寄存器)
+│  └───────────────── 具体操作: dup=复制, ld2=加载并去交织, mul=乘, add=加
+└──────────────────── 固定前缀 v
+```
+
+对照具体指令：
+
+| 指令 | 拆解 | 含义 |
+|------|------|------|
+| `vdupq_n_s16(359)` | dup + q + n + s16 | 把标量 359 **复制**成一个 128-bit 向量，8 个 16-bit 全填 359 |
+| `vld2q_u8(src)` | ld2 + q + u8 | **加载并去交织**：一次读 16 字节，偶数字节进一个向量、奇数字节进另一个向量 |
+| `vuzp_u8(a, a)` | uzp + u8 | **unzip 逆交织**：把 [U0,V0,U1,V1...] 拆成 U 向量和 V 向量 |
+| `vqmovun_s16(r)` | q + mov + un + s16 | 饱和窄化：s16 → u8，超界自动钳位 |
+| `vst3_u8(dst, x)` | st3 + u8 | 三个向量按 R0,G0,B0,R1,G1,B1... **交织写回**内存 |
+
+- `q` 这个字母最常被忽略，但它决定了寄存器宽度：带 `q` 一次处理 8 个 s16 或 16 个 u8，不带 `q` 只有一半（4 个 s16 / 8 个 u8）。
+- `2`/`3` 这类数字表示"交错结构"，`vld2` 输入是 2 通道交织的数据（YUYV 正是 2 路交织：Y 一路、UV 一路）。
+
+## 8.3 整体处理思路 —— 逐步骤拆解
+
+核心思想一句话：**让数据在寄存器里"排列整齐"，然后一条指令打一整批**。看主循环的完整流程：
+
+```
+输入: 32 字节 YUYV = 16 像素 = 8 个宏像素
+      [Y0 U Y1 V][Y2 U Y3 V] ... [Y14 U Y15 V]
+```
+
+**Step 1 — `vld2q_u8`：一次加载并去交织**
+
+```
+src → 寄存器:
+  val[0] = [Y0,Y1,Y2,...,Y15]     ← 16 个 Y（偶数字节）
+  val[1] = [U0,V0,U1,V1,...,U7,V7] ← 16 字节 UV 对（奇数字节）
+```
+这一步用了 YUYV 的物理特性：字节就是"偶数位 Y、奇数位 UV"交替排列，`vld2` 一条指令就完成分离，标量得写循环。
+
+**Step 2 — `vuzp`：从 UV 对里分离 U 和 V**
+
+```
+val[1] = [U0,V0,U1,V1,...,U7,V7]
+   ↓ vuzp（先低 8 字节，再高 8 字节，各 unzip 一次，再合并）
+u8 = [U0,U2,U4,U6,U8,U10,U12,U14]   ← 8 个 U
+v8 = [V0,V2,V4,V6,V8,V10,V12,V14]   ← 8 个 V
+```
+（U/V 交叉排列也是 YUYV 布局的另一个物理特性，`vuzp` 正好拆开。）
+
+**Step 3 — 扩展 16-bit 并去偏移（减 128）**
+
+```
+u = vmovl(u8) − 128   →  int16x8 的 U 分量（BT.601 公式需要带符号计算）
+v = vmovl(v8) − 128
+y_lo / y_hi = 16 个 Y 拆成两个 int16x8
+```
+`vmovl` 把 8 个 u8 拓宽成 8 个 s16，因为后面的乘加可能溢出 8-bit 范围。
+
+**Step 4 — BT.601 矩阵：一条指令算一整批**
+
+```cpp
+int16x8_t r_lo = vaddq_s16(y_lo,
+    vshrq_n_s16(vaddq_s16(vmulq_s16(v, vRcoeff), vHalf), 8));
+int16x8_t g_lo = vsubq_s16(y_lo,
+    vshrq_n_s16(vaddq_s16(
+        vaddq_s16(vmulq_s16(u, vGcoeff_U),
+                  vmulq_s16(v, vGcoeff_V)), vHalf), 8));
+int16x8_t b_lo = vaddq_s16(y_lo,
+    vshrq_n_s16(vaddq_s16(vmulq_s16(u, vBcoeff), vHalf), 8));
+```
+
+这里同时算 **8 个像素**的 R（`vRcoeff=359`）、G（`88`/`183`）、B（`454`），一个 `vmulq` 等于标量的 8 次乘法，一条指令完成，这就是 SIMD 的威力所在。
+
+**Step 5 — `vqmovun_s16`：饱和窄化，免分支钳位**
+
+```
+r8 = vqmovun_s16(r_lo)   // int16 → uint8，>255 自动截到 255，<0 自动截到 0
+```
+标量版必须写 `clip()` 函数 + 两个分支判断；NEON 的 `qmovun` 是硬件内置饱和，**零分支**。分支在 ARM 上有流水线惩罚，去掉它能实打实提速。
+
+**Step 6 — `vst3_u8`：交织写回，直接生成 RGB24**
+
+```cpp
+uint8x8x3_t rgb_lo;
+rgb_lo.val[0] = r8_lo;
+rgb_lo.val[1] = g8_lo;
+rgb_lo.val[2] = b8_lo;
+vst3_u8(dst, rgb_lo);
+```
+
+把 R、G、B 三个分离向量一条指令写成交错的 `R0,G0,B0,R1,G1,B1...` 序列，恰好就是 RGB24 的内存布局。
+
+**尾部处理**：主循环每次吃掉 16 像素，剩下的 `<16` 像素（图像宽度不一定能被 16 整除）退化回标量循环处理，保证任何尺寸都正确。
+
+## 8.4 一句话串起全流程
+
+```
+32B YUYV（16像素）
+   │ vld2q      ← 按"偶Y奇UV"的布局去交织
+   ▼
+Y向量 + UV交错向量
+   │ vuzp       ← 按"U,V交叉"的布局拆色度
+   ▼
+U向量 + V向量
+   │ vmovl+sub  ← 拓宽16位、去128偏移
+   ▼
+带符号分量
+   │ vmul/vshr  ← BT.601矩阵，一次8像素
+   ▼
+R/G/B 三个int16向量
+   │ vqmovun    ← 饱和钳位[0,255]，零分支
+   ▼
+R/G/B 三个uint8向量
+   │ vst3       ← 交织写回
+   ▼
+48B RGB24
+```
+
+**思路的本质**：YUYV 的两种物理布局（偶/奇交替、U/V 交叉）恰好能被 `vld2`/`vuzp` 一次剥离，让数据在寄存器里"排好队"，然后用 `vmul`/`vshr`/`vqmovun` 以 8 像素/指令的吞吐处理，最后 `vst3` 一次写回。每条 NEON 指令都在替代标量循环里的"若干次运算 + 一个分支"，这就是 ~8× 加速的来源。
+
+### 面试一句话总结
+
+> "YUYV 是 4:2:2 采样，每 4 字节 [Y0,U,Y1,V] 代表 2 个共享色度的像素；NEON 指令名可按 `v<操作>[q][_n]_<type>` 拆读。处理思路是：利用 YUYV '偶 Y 奇 UV'和 'U/V 交叉' 两种物理布局，用 `vld2`/`vuzp` 把数据在寄存器里排整齐，`vmul`/`vshr` 一次算 8 个像素的 BT.601 矩阵，`vqmovun` 硬件饱和免分支钳位，最后 `vst3` 一次交织写回 RGB24——让每条指令都替代标量循环里的多次运算 + 分支。"
+
+---
+
+# 补充：为什么要做 YUYV→RGB→JPEG？意义是什么？
+
+> 定位：理解 YUYV 模式下"颜色空间转换 + 软编码"这条链路的动机，以及它与 MJPEG 硬件直出路径的分工。
+> 对应代码：`src/camera/processor.cpp` 的 `yuyvToRgb24()` / `encodeRGBtoJPEG()` / `encodeYUYVtoJPEG()`，以及 `src/main.cpp` 中推流与拍照的调用点。
+
+## 9.1 背景：两种采集模式决定了编码路径
+
+摄像头有两种输出模式，决定了编码路径完全不同：
+
+| 模式 | 摄像头输出 | 本地显示 | 推流/拍照 |
+|------|-----------|---------|-----------|
+| **MJPEG 模式** | JPEG 帧（硬件直出） | 需解码成 RGB | **零编码直接推** |
+| **YUYV 模式** | 原始 YUYV | 需转 RGB | **必须软编码 JPEG** |
+
+MJPEG 模式下摄像头硬件直接输出 JPEG，推流/拍照**零 CPU 开销**（README 实测 <1ms）。但有些摄像头/分辨率不支持 MJPEG，或者用户想要原始数据处理（亮度/对比度调整等），就得退到 YUYV 模式——这时摄像头输出的是**裸的 YUYV 像素数据**，既不能直接显示，也不能直接上网络。
+
+## 9.2 YUYV→RGB 的意义：喂给显示端
+
+本地 GUI（Qt 渲染 framebuffer）不认识 YUYV，只认 RGB。YUYV 是 YUV 家族，和 RGB 是两种颜色空间，必须做颜色空间转换：
+
+```cpp
+void VideoProcessor::yuyvToRgb24(const uint8_t* yuyv, uint8_t* rgb,
+                                  int w, int h) {
+#ifdef __ARM_NEON
+    // ARM 平台: 使用 NEON SIMD 加速（外部链接到 processor_neon.cpp）
+    extern void yuyv_to_rgb24_neon(const uint8_t*, uint8_t*, int, int);
+    yuyv_to_rgb24_neon(yuyv, rgb, w, h);
+    return;
+#endif
+    // x86 / 无 NEON 退路: 标量 C++ 实现
+    ...
+}
+```
+
+这就是 NEON 加速那条路径（见补充 7/8）。
+
+## 9.3 RGB→JPEG 的意义：喂给网络和存储
+
+JPEG 的消费方有三个——**HTTP 推流、RTSP 推流、拍照存档**，它们统一只认 JPEG 字节流：
+
+```cpp
+if (needEncode) {
+#ifdef HAS_LIBJPEG
+    VideoProcessor::encodeYUYVtoJPEG(
+        localFrame.data(), localW, localH,
+        80, &jpeg_out, &jpeg_len);
+#endif
+}
+
+// 推流到 MJPEG HTTP 服务器
+if (mjpegServerOk) {
+    if (localFmt == PixelFormat::FMT_MJPEG) {
+        mjpegServer->updateFrame(localFrame.data(),
+            static_cast<size_t>(localFrame.size()));   // MJPEG 直通，零编码
+    } else if (jpeg_out && jpeg_len > 0) {
+        mjpegServer->updateFrame(jpeg_out, ...);        // YUYV 软编码后的 JPEG
+```
+
+以及拍照：
+
+```cpp
+// YUV 模式：需要先编码为 JPEG
+uint8_t* jpeg_out = nullptr;
+unsigned long jpeg_len = 0;
+if (VideoProcessor::encodeYUYVtoJPEG(
+        g_state.frameData.data(),
+        g_state.width, g_state.height,
+        85, &jpeg_out, &jpeg_len) == 0) {
+    std::string path = g_storage->savePhoto(
+        jpeg_out, static_cast<int>(jpeg_len));
+    ...
+```
+
+## 9.4 为什么要"先转 RGB，再编码 JPEG"，而不是直接 YUYV→JPEG？
+
+这是 libjpeg-turbo 的 API 约束。看 `encodeRGBtoJPEG` 的输入约定：
+
+```cpp
+cinfo.image_width      = static_cast<JDIMENSION>(width);
+cinfo.image_height     = static_cast<JDIMENSION>(height);
+cinfo.input_components = 3;
+cinfo.in_color_space   = JCS_RGB;   // libjpeg 的标准输入是 RGB
+```
+
+`JCS_RGB` 是 libjpeg 官方定义的标准输入颜色空间（还有 `JCS_GRAYSCALE`、`JCS_YCbCr` 等选项，但 RGB 最通用）。虽然 JPEG 压缩内部本来就要转成 YCbCr 再 DCT，但 **libjpeg-turbo 的 API 不接受 YUYV 这种打包格式**——它只接收"3 通道分离/交错的 RGB"或"灰阶"，自己内部再做 YCbCr 转换和量化。所以 YUYV 必须先用自定义代码转成 RGB24，才能喂给 `jpeg_mem_dest` + `jpeg_write_scanlines`。
+
+这也是 `encodeYUYVtoJPEG` 这个组合函数的由来：
+
+```cpp
+int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
+                                     int quality, uint8_t** jpeg_out,
+                                     unsigned long* jpeg_len) {
+    // YUYV → RGB24 临时缓冲
+    std::vector<uint8_t> rgb(static_cast<size_t>(width * height * 3));
+    yuyvToRgb24(yuyv, rgb.data(), width, height);
+
+    return encodeRGBtoJPEG(rgb.data(), width, height, quality, jpeg_out, jpeg_len);
+}
+```
+
+## 9.5 意义总结：多路复用一次编码
+
+这条链路设计的巧妙之处在于**一次转换、多处复用**：
+
+```
+摄像头(YUYV)
+   │
+   ├─ yuyvToRgb24 ──────────→ RGB24 ──→ Qt 本地显示
+   │                            │
+   │                            └── encodeRGBtoJPEG ──→ JPEG
+   │                                                   ├─→ MJPEG HTTP 推流
+   │                                                   ├─→ RTSP 推流
+   │                                                   └─→ 拍照存盘
+```
+
+- **显示**要 RGB，**网络/存储**要 JPEG，两个需求恰好一个函数族覆盖；
+- RGB 中间态不浪费——它本身就是显示路径的产物（虽然当前代码里显示走 `g_state` 独立拷贝，但转换逻辑可复用）；
+- 与 MJPEG 模式形成**双路径互补**：MJPEG 硬件直出免编码，YUYV 软编码作为兜底，两种模式都统一输出 JPEG 给下游三个消费者，网络层完全不用区分来源。
+
+## 9.6 面试追问与应答
+
+**Q1：为什么 YUYV 模式下拍照/推流都要先编码成 JPEG？**
+
+> 下游三个消费者（HTTP 推流、RTSP 推流、拍照存档）统一消费 JPEG 字节流。YUYV 是裸像素数据，既不能直接显示（显示要 RGB），也不能直接传输/存储（要压缩编码），所以必须编码为 JPEG。
+
+**Q2：为什么不能直接 YUYV→JPEG？**
+
+> libjpeg-turbo 的标准输入是 RGB（`JCS_RGB`），不接受 YUYV 这种 YUV 打包格式，所以要先做 YUYV→RGB 颜色空间转换。RGB 既是显示需求也是编码输入，一个中间态服务两个消费方。
+
+**Q3：这条链路为什么慢？CPU 花在哪？**
+
+> YUYV→RGB 是逐像素的颜色矩阵运算（有 NEON 加速，~5ms/帧），JPEG 编码是 DCT + 量化 + 熵编码（~25ms/帧）。这也是为什么系统**优先推荐 MJPEG 硬件直出模式**——它绕过整条软编码链路，零 CPU 开销。
+
+### 面试一句话总结
+
+> "YUYV→RGB→JPEG 是 YUYV 模式下的软编码兜底路径：本地显示只认 RGB，所以先做 YUYV→RGB 颜色空间转换（用 NEON 加速）；网络推流和拍照只认 JPEG，而 libjpeg-turbo 的标准输入恰好就是 RGB（`JCS_RGB`），所以再对 RGB 做 JPEG 编码。一次 RGB 转换 + 一次 JPEG 编码，产出的 JPEG 同时喂给 HTTP 推流、RTSP 推流和拍照存盘三个消费者，与 MJPEG 模式的硬件直出形成双路径互补，保证无论摄像头支持哪种格式，下游统一消费 JPEG。"
