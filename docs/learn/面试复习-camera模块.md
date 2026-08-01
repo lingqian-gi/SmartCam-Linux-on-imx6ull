@@ -18,6 +18,7 @@
    - 1.5 核心类 / 函数列表与调用关系
 2. [第二部分 分块代码详解（含面试追问）](#第二部分-分块代码详解含面试追问)
    - 2.1 块一：设备初始化与能力查询
+   - 2.1.1 ioctl 与 fcntl：驱动指令通道 vs fd 属性开关
    - 2.2 块二：格式 / 帧率 / 分辨率设置
    - 2.3 块三：mmap 帧缓冲池与流控制
    - 2.4 块四：帧捕获循环（getFrame / putFrame）
@@ -279,6 +280,114 @@ if (!(cap.capabilities & V4L2_CAP_STREAMING))     return -ENOSYS;   // 不支持
 
 **Q4：`release()` 是线程安全的吗？如果在采集线程还在 `getFrame` 时调用会发生什么？**
 **A**：`CameraCapture` 自身**不是线程安全的**，头文件注释明确"建议作为单例或由主线程管理生命周期"。如果采集线程正在 `getFrame`（阻塞在 select 或 DQBUF）时主线程调用 `stopCapture`，会出现对 `m_fd` 的并发 ioctl。这正是 main.cpp 中引入 `g_state.paused + pauseCv + pausedAck` 暂停机制的根因：**切分辨率/帧率前先让采集线程确认暂停**（getFrame 有 1s 超时，最多等 1.1s），确保 mmap 缓冲和 fd 无人使用后再安全 stop。这是"模块不保证线程安全 + 上层用协议保证安全"的典型配合。
+
+---
+
+## 2.1.1 ioctl 与 fcntl：驱动指令通道 vs fd 属性开关
+
+> 本模块两个最常用的系统调用，面试高频辨析题。核心一句话：**`ioctl` 问"驱动怎么工作"（设备行为），`fcntl` 管"这个文件句柄怎么用"（fd 属性）**。
+
+### 核心区别
+
+| 维度 | `ioctl`（I/O Control） | `fcntl`（File Control） |
+|------|------------------------|------------------------|
+| 作用对象 | 设备本身（驱动行为） | 文件描述符（fd）的属性 |
+| 适用范围 | 仅设备文件 `/dev/xxx`（字符/块设备） | **任意 fd**：普通文件、socket、管道、设备 |
+| 本质 | 给驱动发**自定义命令**，每个驱动可定义海量命令 | 只有**有限的十几个标准命令**（`F_GETFL`/`F_SETFL`/`F_GETFD`/`F_SETLKW`...） |
+| 第二参数含义 | 命令号（由内核宏编码，如 `VIDIOC_S_FMT`） | 标准命令常量（`F_xxx`） |
+| 第三参数 | 通常是指向结构体的指针，由驱动解析 | 标志位、锁结构、fd 等，语义固定 |
+| 返回 | 0 成功 / -1 失败（设 `errno`） | 视命令而定（如 `F_GETFL` 返回标志值） |
+
+### `ioctl` 的使用（项目里的 V4L2 教科书案例）
+
+**签名**：`int ioctl(int fd, unsigned long request, ...)`，第三个参数几乎总是指向结构体的指针。
+
+项目 `capture.cpp` 的用法模式高度统一：**填结构体 → 传指针 → 查 `errno`**：
+
+```cpp
+// 1. 查询设备能力
+struct v4l2_capability cap;
+memset(&cap, 0, sizeof(cap));
+if (ioctl(m_fd, VIDIOC_QUERYCAP, &cap) < 0) {
+    return "QUERYCAP failed";
+}
+
+// 2. 设置格式
+struct v4l2_format fmt;
+fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+fmt.fmt.pix.width  = width;
+fmt.fmt.pix.height = height;
+fmt.fmt.pix.pixelformat = pixfmt;
+if (ioctl(m_fd, VIDIOC_S_FMT, &fmt) < 0) {
+    LOG_ERR_("VIDIOC_S_FMT failed: %s", strerror(errno), ...);
+}
+
+// 3. 开始/停止流
+enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+if (ioctl(m_fd, VIDIOC_STREAMON, &type) < 0) { ... }
+```
+
+要点：
+- **命令号是内核写死的宏**（`VIDIOC_S_FMT`、`VIDIOC_QUERYCAP` 等），由 `linux/videodev2.h` 定义，你只能"选"，不能自定义。
+- 命令号内部**编码了方向与大小**（`_IOR` 读 / `_IOW` 写 / `_IOWR` 读写），驱动靠它决定"从指针读入参数"还是"往指针写结果"。
+- 所以同一个调用：`VIDIOC_S_CTRL` 是"把结构体写进内核"，`VIDIOC_G_CTRL` 是"从内核读出到结构体"。
+- **失败一律返回 -1 并设置 `errno`**，必须查 `strerror(errno)`，这是驱动排障的第一信息来源。
+
+### `fcntl` 的使用（项目里两种典型用法）
+
+**签名**：`int fcntl(int fd, int cmd, ...)`。
+
+**用法 1：读写 fd 状态标志（`F_GETFL` / `F_SETFL`）**——项目最常用，模式固定为 **GET 再 SET（读改写）**，避免覆盖其它标志：
+
+```cpp
+// capture.cpp：打开时先加 O_NONBLOCK，随后清掉转阻塞
+int flags = fcntl(m_fd, F_GETFL, 0);
+if (flags >= 0) {
+    fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);   // 清掉 NONBLOCK 位，再写回
+}
+
+// rtsp_server.cpp / mjpeg_server.cpp / control.cpp：置为非阻塞
+int flags = fcntl(fd, F_GETFL, 0);
+if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);   // 加上 NONBLOCK 位
+```
+
+注意三点：
+- **必须先 `F_GETFL` 读回再改**：若直接 `F_SETFL` 传新值，会**覆盖原有标志**（如 `O_APPEND`、`O_RDWR`），这是经典 bug。
+- 能改的只有**文件状态标志**中的一小部分（`O_NONBLOCK`、`O_APPEND`、`O_ASYNC`、`O_DIRECT` 等），`O_RDWR` 这类访问模式改不了。
+- `F_SETFL` 可以作用在**任意 fd** 上（socket 设非阻塞就是这么做），这是它比 `ioctl` 通用之处。
+
+**用法 2：fd 描述符标志 / 文件锁**（次要）：
+
+```cpp
+int fdflags = fcntl(fd, F_GETFD, 0);       // 如 FD_CLOEXEC 位
+fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);  // exec 后自动关闭
+
+struct flock lock = { F_WRLCK, SEEK_SET, 0, 0, 0 };
+fcntl(fd, F_SETLKW, &lock);                // 文件锁（进程间互斥）
+```
+
+### 为什么本模块两种都要用？
+
+回到 `capture.cpp` 的 open 序列，正好演示了两者的分工：
+
+```cpp
+m_fd = open(device, O_RDWR | O_NONBLOCK, 0);   // open 时初始为非阻塞
+// 之后：
+ioctl(m_fd, VIDIOC_QUERYCAP, &cap);   // ① 用 ioctl 问驱动"你是谁"（设备能力）
+fcntl(m_fd, F_GETFL, ...);            // ② 用 fcntl 改 fd 的阻塞属性（与驱动无关）
+ioctl(m_fd, VIDIOC_S_FMT, ...);       // ③ 用 ioctl 配置驱动采集格式
+ioctl(m_fd, VIDIOC_REQBUFS, ...);     // ④ 用 ioctl 申请驱动侧 buffer
+```
+
+- **`fcntl` 管"fd 层"**：阻塞/非阻塞、append、close-on-exec、文件锁——这些是内核 **VFS 层**提供的，与具体设备无关，所以 socket、管道、设备都通用。
+- **`ioctl` 管"驱动层"**：分辨率、帧率、曝光、申请 buffer、启停流——这些**只有具体驱动才懂**，通用内核无法定义，命令号由驱动头文件（`videodev2.h`）定义。
+
+### 面试易混淆点
+
+1. **`O_NONBLOCK` 用哪个设置？** 用 `fcntl`（fd 属性，通用）；`ioctl` 里没有"非阻塞"这个概念。
+2. **`ioctl` 命令能自己发明吗？** 驱动开发者可以自定义，但用户态程序只能用驱动导出的宏（且要经 `_IOC` 宏校验方向/大小；命令未实现时返回 `ENOTTY`）。
+3. **返回值陷阱**：`fcntl(F_GETFL)` 失败返回 -1；判断 `< 0` 即可（项目代码均如此）。
+4. **改阻塞属性为什么不重新 open？** 因为 `open` 会重新初始化设备状态（V4L2 会重置 buffer），而 `fcntl` 是轻量原地修改，代价极小。
 
 ---
 
