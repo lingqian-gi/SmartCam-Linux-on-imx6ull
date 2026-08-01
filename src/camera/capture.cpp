@@ -536,7 +536,8 @@ int CameraCapture::openDevice(const char* device) {
         return -errno;
     }
 
-    // 暂时设置为阻塞（后续用 select/poll）
+    // 先以 O_NONBLOCK 打开，避免 open 阶段阻塞（如 sensor 复位/固件下载）；
+    // 随后清除 O_NONBLOCK 转为阻塞模式（配合 select 超时取帧，语义更自然）
     int flags = fcntl(m_fd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
