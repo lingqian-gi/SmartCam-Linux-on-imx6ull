@@ -54,10 +54,17 @@ endif()
 set(CAMERA_SOURCES
     src/camera/capture.cpp
     src/camera/processor.cpp
-    src/camera/processor_neon.cpp
     include/camera/capture.h
     include/camera/processor.h
 )
+
+# NEON 加速实现仅 ARM 交叉编译时启用（x86 无 arm_neon.h，且调用方用 __ARM_NEON 包裹）
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    list(APPEND CAMERA_SOURCES src/camera/processor_neon.cpp)
+    message(STATUS "✓ 已启用 NEON 加速源 (processor_neon.cpp)")
+else()
+    message(STATUS "✓ x86 模式：跳过 NEON 源，使用标量实现")
+endif()
 
 set(DISPLAY_SOURCES
     src/display/gui.cpp

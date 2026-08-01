@@ -47,6 +47,7 @@ struct FrameBuffer {
     int       height   = 0;
     PixelFormat format = PixelFormat::FMT_RGB24;
     int       index    = 0;         // 帧序号（递增）
+    int       pool_index = -1;      // V4L2 缓冲池索引（getFrame 填充；putFrame 用其 O(1) 归还，-1 表示无效）
     std::chrono::steady_clock::time_point timestamp;
 
     FrameBuffer() : timestamp(std::chrono::steady_clock::now()) {}

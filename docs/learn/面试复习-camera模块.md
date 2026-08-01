@@ -20,8 +20,10 @@
    - 2.1 块一：设备初始化与能力查询
    - 2.1.1 ioctl 与 fcntl：驱动指令通道 vs fd 属性开关
    - 2.2 块二：格式 / 帧率 / 分辨率设置
+   - 2.2.1 bytesperline（stride）：行距与 padding
    - 2.3 块三：mmap 帧缓冲池与流控制
    - 2.4 块四：帧捕获循环（getFrame / putFrame）
+   - 2.4.1 为什么 MJPEG 帧长度每帧不同？（bytesused 详解）
    - 2.5 块五：FPS 统计与帧率控制
    - 2.6 块六：颜色空间转换（YUYV → RGB，BT.601 定点）
    - 2.7 块七：NEON SIMD 加速
@@ -91,7 +93,7 @@ open → querycap → s_fmt → reqbufs → querybuf → mmap → qbuf → strea
   - 期望格式 `(width, height, pixfmt)`，如 `(640, 480, V4L2_PIX_FMT_MJPEG)`
   - V4L2 控件 ID 与目标值（`setControl(cid, value)`）
 - **输出**：
-  - `FrameBuffer`（`include/common/types.h`）：`data/length/width/height/format/index/timestamp`
+  - `FrameBuffer`（`include/common/types.h`）：`data/length/width/height/format/index/pool_index/timestamp`
   - 枚举结果：格式列表、分辨率列表、帧率列表、控件范围
   - 统计信息：`getCurrentFPS()` / `getCurrentResolution()` / `getCurrentFormat()`
 
@@ -203,7 +205,7 @@ main.cpp（真实相机模式）
   │    getFrame(&fb, 1000)                 ← select 超时 + DQBUF
   │    （软件帧率节流，未到时间直接 putFrame 丢弃）
   │    frameData.assign(fb.data, ...)      ← ★深拷贝，立即归还缓冲
-  │    putFrame(&fb)                       ← 反查索引 + QBUF
+  │    putFrame(&fb)                       ← pool_index 直接 O(1) QBUF 归还
   │    通知处理线程（条件变量 procCv）
   │
   ├─ 处理线程（std::thread）
@@ -219,6 +221,7 @@ main.cpp（真实相机模式）
 1. 采集线程路径上只有 `DQBUF → 拷贝 → QBUF` 三个 O(1) 操作，**CPU 密集/阻塞操作一律不在取帧路径上**。
 2. V4L2 mmap 内存**不可长期持有**，必须尽快深拷贝后归还（4 缓冲池容易耗尽）。
 3. 一次采集，四路消费（GUI/HTTP/RTSP/存储），编码结果共享，避免重复计算。
+4. 归还缓冲用 `FrameBuffer.pool_index` 直接定位槽位，**O(1) 且自带双防御校验**，取帧路径上无 O(n) 操作。
 
 ---
 
@@ -444,6 +447,79 @@ if (actFps != reqFps)
 
 ---
 
+## 2.2.1 bytesperline（stride）：行距与 padding
+
+> 2.2 坑点里提过"确认无 padding 问题"，这里展开讲透。**`bytesperline` 是一行像素在内存里真实占用的字节数（含行尾填充），跨行跳转必须用它**。
+
+### 定义：一行像素占多少字节
+
+`bytesperline`（也叫 **stride / pitch / row stride**）是 V4L2 `struct v4l2_pix_format` 的字段，含义是：
+
+> 图像中"一行"在内存里占据的**字节数**（含可能存在的行尾填充 padding）。
+
+和 `width` 的区别是面试第一问：
+- `width` = 一行的**像素数**（逻辑宽度）
+- `bytesperline` = 一行在**内存**里占的**字节数**（含填充）
+
+### 为什么不是简单的 `width × 字节/像素`？
+
+因为硬件/驱动为了对齐（DMA、cache line、SIMD），常在每行末尾塞填充字节。例如：
+
+```
+width = 640,  YUYV 每像素 2 字节
+理想紧凑:   bytesperline = 640 × 2 = 1280 字节
+实际驱动:   bytesperline = 1296 字节   ← 每行多 16 字节 padding，为 16 字节对齐
+```
+
+此时内存布局：
+
+```
+行 0: [1280 字节有效数据][16 字节 padding]
+行 1: [1280 字节有效数据][16 字节 padding]
+...
+```
+
+若按 `width × 2` 计算下一行的起始位置，就会**错位**，整帧花屏/扭曲。
+
+### 正确用法：跨行用 bytesperline，行内用 width
+
+```cpp
+// 访问第 y 行第 x 个像素的地址：
+uint8_t* row   = data + y * bytesperline;   // ✅ 跨行用 bytesperline（决定行距）
+uint8_t* pixel = row + x * 2;               // ✅ 行内用 width 推导（行内无填充）
+```
+
+- **跨行**用 `bytesperline`（决定行距）
+- **行内**用 `width × 每像素字节`（决定列距，行内无 padding）
+
+### 本项目的情况
+
+`capture.cpp` 在 `setFormat()` 回读后打这条日志，正是为了**检测驱动是否加了 padding**：
+
+```cpp
+// 检查 bytesperline，确认无 padding 问题
+LOG_INF("Format set: %dx%d, fmt='%c%c%c%c', stride=%d",
+         m_width, m_height, ..., fmt.fmt.pix.bytesperline);
+```
+
+- 若 `width × 2 == bytesperline` → 无 padding，行距就是紧凑的
+- 若不等 → 有 padding，必须按 `bytesperline` 跳行
+
+本模块的工程取舍：**打日志用于检测告警，实际处理 YUYV 时假设 `bytesperline == width × 2`**（UVC 摄像头通常确实如此）。如果要支持带 padding 的设备，就需要把 `bytesperline` 存为成员，并在颜色转换、帧拷贝时按它跳行——这是文档 2.2 坑点里"通用性上的一个简化假设"的具体含义。
+
+### 面试追问自测
+
+**Q1：`bytesperline` 和 `width` 什么关系？为什么不等？**
+**A**：`bytesperline` = 一行内存字节数（含 padding），`width` = 一行像素数。不等是因为硬件为 DMA/缓存对齐在行尾加 padding，比如把 1280 字节的行补到 1296。对齐能提升 DMA 效率，代价是每行多占内存。
+
+**Q2：`bytesperline` 会影响一帧的 mmap 大小吗？**
+**A**：会。`QUERYBUF` 返回的 `length` 是按 `bytesperline × height` 计算的（可能还加页对齐），所以 mmap 长度以 `buf.length` 为准，而不是 `width × 2 × height`。忽略 padding 时按后者分配可能不够用。
+
+**Q3：本项目为什么可以假设无 padding？**
+**A**：目标设备是 UVC 摄像头，实测 `width × 2 == bytesperline`，日志确认后按紧凑布局处理，省去逐行跳转的开销。这是"针对确定硬件做合理简化"——如果换驱动出现 padding，日志会暴露 `width*2 != stride`，届时再按 stride 逐行处理即可。
+
+---
+
 ## 2.3 块三：mmap 帧缓冲池与流控制
 
 ### 代码讲解
@@ -513,25 +589,40 @@ int CameraCapture::getFrame(FrameBuffer* buf, int timeout_ms) {
     if (vbuf.index >= (unsigned)m_nbuffers || !m_buffers) {   // 索引越界防御
         LOG_ERR_("Invalid buffer index"); return -EINVAL;
     }
-    buf->data     = (uint8_t*)m_buffers[vbuf.index].start;   // 零拷贝：直接指向 mmap
-    buf->length   = vbuf.bytesused;                          // 驱动回填的实际字节数
-    buf->width    = m_width; buf->height = m_height;
-    buf->format   = (m_pixfmt == V4L2_PIX_FMT_YUYV) ? FMT_YUYV : FMT_MJPEG;
-    buf->index    = m_frameCount++;
-    buf->timestamp = std::chrono::steady_clock::now();
+    buf->data       = (uint8_t*)m_buffers[vbuf.index].start; // 零拷贝：直接指向 mmap
+    buf->length     = vbuf.bytesused;                        // 驱动回填的实际字节数
+    buf->width      = m_width; buf->height = m_height;
+    buf->format     = (m_pixfmt == V4L2_PIX_FMT_YUYV) ? FMT_YUYV : FMT_MJPEG;
+    buf->index      = m_frameCount++;
+    buf->pool_index = vbuf.index;                            // 记录槽位，putFrame O(1) 归还
+    buf->timestamp  = std::chrono::steady_clock::now();
     updateFPS();
     return 0;
 }
 ```
 
-`putFrame()` 用**指针反查索引**归还缓冲：
+`putFrame()` 直接用 `pool_index` 归还（O(1)），并保留两道防御校验：
 
 ```cpp
-int idx = -1;
-for (int i = 0; i < m_nbuffers; ++i)   // 遍历池，找 data 指针对应的槽位
-    if (m_buffers[i].start == buf->data) { idx = i; break; }
-if (idx < 0) { LOG_ERR_("buffer pointer not found in pool"); return -EINVAL; }
-// QBUF(idx) 归还；m_buffers[idx].queued = true;
+int CameraCapture::putFrame(const FrameBuffer* buf) {
+    if (!m_streaming || m_fd < 0) return -EIO;
+    if (!buf || !buf->data) return -EINVAL;
+
+    const int idx = buf->pool_index;                  // getFrame 已填充
+    if (idx < 0 || idx >= m_nbuffers || !m_buffers) { // 索引合法性校验
+        LOG_ERR_("putFrame: invalid pool_index=%d (nbufs=%d)", idx, m_nbuffers);
+        return -EINVAL;
+    }
+    if (m_buffers[idx].start != buf->data) {          // 防御：指针必须匹配
+        LOG_ERR_("putFrame: pool_index=%d data pointer mismatch", idx);
+        return -EINVAL;
+    }
+    if (m_buffers[idx].queued) {                      // 防御：防 double put
+        LOG_ERR_("putFrame: buffer %d already queued (double put?)", idx);
+        return -EINVAL;
+    }
+    // QBUF(idx) 归还；m_buffers[idx].queued = true;
+}
 ```
 
 `dequeueBuffer()` 用 `select` 实现超时，避免 DQBUF 无限期阻塞：
@@ -549,7 +640,7 @@ ioctl(m_fd, VIDIOC_DQBUF, &buf);
 ### 潜在坑点
 
 - **配对契约**：`getFrame` 后**必须** `putFrame`，否则缓冲池 4 个槽位很快耗尽，`DQBUF` 永久阻塞。main.cpp 采集线程把深拷贝放在 getFrame 与 putFrame 之间，就是为满足"尽快归还"。
-- **`putFrame` 用 O(n) 扫描反查索引**：正确但非最优。若 FrameBuffer 直接携带 `buffer_index` 字段（V4L2 的 `vbuf.index` 本来就有），可 O(1) 归还。当前实现多一次遍历，属于可优化点（面试主动提及加分）。
+- **`putFrame` O(1) 归还**：已改为直接用 `FrameBuffer.pool_index`（getFrame 填充的 V4L2 `vbuf.index`）归还，不再遍历反查。同时保留两道防御：① 校验 `pool_index` 在 `[0, m_nbuffers)` 且 `data` 指针与槽位 `start` 一致（防伪造 FrameBuffer）；② 校验槽位 `queued` 状态，重复归还（double put）直接报错。
 - **`select` 被信号中断（EINTR）**：当前直接返回 `-errno`，采集线程 `continue` 重试。若要求更稳可改为循环重试 select。这是健壮性可改进点。
 - **`buf->length = vbuf.bytesused`**：使用驱动回填的实际字节数而非缓冲池长度。MJPEG 帧长度每帧不同，用池长度会导致多读垃圾数据；用 bytesused 才是真实有效数据。
 - **外部不能 free `buf->data`**：它指向 mmap 内存，头文件注释明确"不应外部释放"。一旦外部 free 会破坏 V4L2 映射，这是契约问题，靠文档约束 + 上层深拷贝规避。
@@ -559,14 +650,77 @@ ioctl(m_fd, VIDIOC_DQBUF, &buf);
 **Q1：getFrame/putFrame 为什么必须成对调用？如果某一帧被消费者遗忘会发生什么？**
 **A**：缓冲池是固定 4 个槽位的"租借"模型：getFrame 借出一个槽位，putFrame 归还。遗忘归还 = 槽位永久流失，4 帧后所有缓冲都在消费者手里，驱动无处写入，`DQBUF` 永久阻塞，整个采集链冻结。因此设计上要求：**持有 mmap 缓冲的时间越短越好**。main.cpp 的做法是"拷贝完立刻归还"，把帧数据复制到普通堆内存 `g_state.frameData` 后再分发，彻底解除对 mmap 生命周期的手动管理。
 
-**Q2：为什么 putFrame 要遍历缓冲池找索引，而不是直接记录？**
-**A**：当前 FrameBuffer 结构体里没有记录 V4L2 buffer index，所以只能用 `data` 指针与池中 `start` 比对来反推。这是功能正确的，但存在两个隐患：一是 O(n) 开销，二是依赖指针唯一性。改进方案是给 FrameBuffer 增加 `pool_index` 字段（V4L2 `vbuf.index` 本就有值），putFrame 直接 `QBUF(vbuf.index)`，同时 `getFrame` 里顺带校验索引合法性。我在设计初版时用指针匹配是为了接口简洁，现在看属于"可以更好"的地方。
+**Q2：putFrame 是怎么归还缓冲区的？O(n) 遍历反查的历史与改进？**
+**A**：现在已是 O(1)。`getFrame` 把 V4L2 的 `vbuf.index` 写入 `FrameBuffer.pool_index`，`putFrame` 直接 `QBUF(pool_index)`。历史背景：初版 `FrameBuffer` 没带缓冲池索引，只能拿 `data` 指针与池中 `start` 逐个比对反推，功能正确但有两个隐患——一是 O(n) 开销，二是依赖指针唯一性（若未来某处构造了指向相同 mmap 地址的 FrameBuffer 就会误匹配）。改进要点：① `pool_index` 默认 `-1`，未经验证的 FrameBuffer 归还时会因越界被拒；② `putFrame` 保留两道 O(1) 防御校验（`data` 指针匹配 + 防 double put），把"信任成本"降到最低，同时避免破坏"getFrame/putFrame 必须成对"的契约检查。
 
 **Q3：select 超时 1 秒，超时后返回 -ETIMEDOUT，上层如何处理？**
 **A**：main.cpp 采集线程对 `getFrame < 0` 的处理是 `continue` 重试（除非 `!running` 退出）。超时本身不代表摄像头故障——可能是驱动在重协商、或系统调度导致帧间隔被拉长。但连续长时间超时（比如几十秒）就应视为设备异常，可以升级处理（日志告警、重启采集）。当前代码是"静默重试 + 依赖上层 watchdog"，是一个可讨论的简化。
 
 **Q4：这套"深拷贝 + 立刻归还"的设计和"引用计数持有 mmap"相比，优劣是什么？**
 **A**：深拷贝代价是每帧一次内存拷贝（MJPEG 640x480 约 30~100KB，DDR3 上约几十微秒，可接受），但换来的是**无共享、无锁**——消费者拿到独立数据，彻底消除悬垂指针和数据竞争，这是嵌入式调试成本最低的方案。引用计数（如共享 ptr 持有 mmap 槽位）能省拷贝，但引入"槽位何时可回收"的复杂所有权逻辑，且 mmap 内存不可自由释放/拷贝。**在 792MHz 单核上，多一次内存拷贝换来的确定性和可调试性，性价比远高于省那次拷贝**。这是我明确做的工程取舍。
+
+---
+
+## 2.4.1 为什么 MJPEG 帧长度每帧不同？（bytesused 详解）
+
+> 对应 2.4 坑点里"`buf->length = vbuf.bytesused`"那条。核心一句话：**MJPEG 帧长 = JPEG 压缩结果 = 图像内容复杂度的函数，画面每帧不同 → 字节数每帧浮动**。
+
+### 代码先回顾
+
+```cpp
+buf->length = vbuf.bytesused;   // 驱动回填的实际字节数
+```
+
+`vbuf.bytesused` 是驱动在 `DQBUF` 时**回填的"这一帧实际写了多少字节"**。对 MJPEG 来说，这个数字每帧都可能不一样。
+
+### 为什么每帧不一样？—— JPEG 压缩的本质
+
+JPEG 压缩不是"把固定大小变成固定大小"，而是**根据内容决定压缩率**：
+
+| 画面内容 | 压缩率 | 帧大小 |
+|---------|-------|--------|
+| 大面积纯色（天空、白墙） | 很高 | 小（几 KB ~ 十几 KB）|
+| 复杂纹理（草地、树叶、噪点） | 较低 | 大（几十 KB ~ 上百 KB）|
+| 细节极多（运动模糊、密集文字） | 最低 | 更大 |
+
+原因在于 JPEG 的两步核心算法：
+1. **DCT（离散余弦变换）**：把 8×8 像素块变换到频域，纯色块的系数几乎全集中在低频、能量集中，可大量量化归零；
+2. **熵编码（Huffman）**：对量化后的系数编码，全零/小系数可用极短的码字。
+
+画面越"平"，DCT 系数越稀疏、越容易压缩 → 帧越小；画面越"花"，系数越密 → 帧越大。摄像头每帧画面不同，所以每帧压缩结果都不同：
+
+```
+第 1 帧（对着纯白墙，几乎静止）：8 KB
+第 2 帧（有人从镜头前走过）：      42 KB
+第 3 帧（画面快速移动，全是噪点）：96 KB
+```
+
+即使画面"看似静止"，CMOS 传感器的暗电流噪声也会让每个像素值轻微抖动，导致 JPEG 输出大小在固定范围内波动。
+
+### 对比：为什么 YUYV 帧长度是固定的？
+
+YUYV 是**无压缩**的原始格式：每像素固定 2 字节，帧大小恒定为 `width × height × 2`，与内容无关。所以 YUYV 模式下 `bytesused` 每次基本都等于缓冲池长度，可以放心用固定值。MJPEG 是**有压缩**格式，帧长 = 压缩结果，随内容浮动。
+
+### 如果不用 bytesused 会怎样？
+
+`buf->length` 有两个候选：
+
+- **缓冲池长度**（`buf.length`）：驱动按"最坏情况"分配的空间，比如 640x480 的 MJPEG 缓冲池可能分配 256KB（保证能装下最大帧），但实际帧只有 8~100KB。
+- **`bytesused`**（实际写入字节数）：真实有效的帧大小。
+
+如果用缓冲池长度：
+- 每次拿 256KB 去喂解码器/推流，其中 150~240KB 是**上次残留的垃圾数据**或未初始化内存；
+- JPEG 解码器读到 `0xFFD8` 之后一长串不属于本帧的字节，轻则花屏，重则越界崩溃。
+
+所以必须用 `bytesused`——它告诉下游"这段 mmap 里从 0 到 `bytesused` 才是这一帧的有效 JPEG 数据"。
+
+### 面试延伸：两个隐藏考点
+
+**Q1：MJPEG 和 H.264 的帧大小波动有什么本质区别？**
+**A**：MJPEG 每帧**独立压缩**（帧内编码，像连续播放的静态 JPEG 照片），帧大小只取决于**本帧内容**。H.264 用**帧间预测**（I 帧大、P/B 帧小），大小波动更大且是"帧序列级别"的统计规律。MJPEG 实现简单、可随机访问，但压缩率远低于 H.264——这正是文档里"MJPEG 零编码但码率大"的根因。
+
+**Q2：既然帧长浮动，mmap 缓冲池长度怎么定？**
+**A**：驱动按该分辨率下 MJPEG 的**最大可能帧**分配（UVC 设备通常按 `width × height × 1.5` ~ ×3 甚至更大），保证任何内容都能放下。`QUERYBUF` 返回的 `buf.length` 就是这个"天花板"，mmap 用它映射；`bytesused` 才是每帧的真实水位线。
 
 ---
 
@@ -680,7 +834,7 @@ Step6: vst3_u8   → 交织写入 RGB24（R,G,B 三平面交错）
 
 ### 潜在坑点
 
-- **`__ARM_NEON` 宏由 `-mfpu=neon` 触发**：CMake 只在 ARM 交叉编译时加 `-march=armv7-a -mfpu=neon -mfloat-abi=hard`；x86 构建下 `__ARM_NEON` 未定义，`processor.cpp` 里被 `#ifdef __ARM_NEON` 包裹的 extern 声明 + 调用分支不生效，走标量路径。注意 CMake 源列表始终包含 `processor_neon.cpp`，其向量路径只有在 ARM 交叉编译时才被真正启用。
+- **`__ARM_NEON` 宏由 `-mfpu=neon` 触发**：CMake 只在 ARM 交叉编译时加 `-march=armv7-a -mfpu=neon -mfloat-abi=hard`，且**仅在 ARM 交叉编译时把 `processor_neon.cpp` 加入源列表**（`list(APPEND ...)`），x86 构建完全跳过该文件。x86 下 `__ARM_NEON` 未定义，`processor.cpp` 里被 `#ifdef __ARM_NEON` 包裹的 extern 声明 + 调用分支不生效，走标量路径。**这一点很重要**：`processor_neon.cpp` 第 19 行无条件 `#include <arm_neon.h>`，x86 没有该头文件，若源列表无条件包含会导致 PC 构建直接编译失败（实测修复过此问题）。"调用方 `#ifdef` 包裹 + CMake 按平台裁剪源文件"是双重保险。
 - **尾部长度的算术 bug 风险**：`i + 15 < totalPixels` 保证向量路径一次 16 像素不越界；尾部循环 `i + 1 < totalPixels` 按宏像素（2 像素）步进。若宽度为奇数，最后一个像素的 U/V 会读取到下一行数据——YUYV 本身要求偶数宽，此边界由上游保证，但代码里未显式断言。
 - **`vuzp_u8(uv_lo, uv_lo)` 的用法**：同一寄存器与自己 unzip，得到偶奇分离，再跨高低 64bit 合并出 8 个 U 与 8 个 V。这个"自 unzip"技巧是写出来易读、写错难调的典型，值得面试时展开。
 - **NEON 结果与标量一致性**：两者系数、舍入方式（`+128>>8` vs 标量 `>>8`）必须一致，否则切换平台画面亮度/偏色有细微差异。`vHalf=128` 对应四舍五入，标量版无 `+128`，这里有**轻微不一致**（可讨论的精确实现差异）。
@@ -853,7 +1007,7 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 
 | 接口点 | 设计 | 解耦价值 |
 |--------|------|---------|
-| 模块间传递单元 | 统一的 `FrameBuffer`（`data/length/width/height/format/index/timestamp`） | 生产/消费双方只需认识一种结构 |
+| 模块间传递单元 | 统一的 `FrameBuffer`（`data/length/width/height/format/index/pool_index/timestamp`） | 生产/消费双方只需认识一种结构；`pool_index` 让归还缓冲 O(1) |
 | 生产-消费同步 | 深拷贝 + mutex + 条件变量 | 消费者拿到独立数据，无悬垂指针 |
 | 取帧路径 | 采集线程只做 O(1) 操作 | 慢消费者（网络拥塞、磁盘 IO）不阻塞取帧 |
 | 格式路由 | `PixelFormat` 枚举 + 运行时分支（MJPEG 直通 / YUYV 先编码） | 编码策略可替换，消费方无感知 |
@@ -947,6 +1101,7 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 | 为什么必须回读 S_FMT 结果 | 驱动可能调整分辨率/格式，不回读会越界 |
 | 为什么 REQBUFS(0) | 释放驱动缓冲，否则 S_FMT 返回 EBUSY |
 | 为什么 getFrame/putFrame 成对 | 缓冲池租借模型，漏还 = 缓冲耗尽 = 采集冻结 |
+| 为什么 putFrame 能 O(1) 归还 | FrameBuffer.pool_index 直接记录槽位，免遍历反查 |
 | 为什么深拷贝再归还 | mmap 内存不能长期持有，深拷贝换确定性 |
 | 为什么定点不浮点 | 无浮点开销，且与 NEON 整数 SIMD 兼容 |
 | 为什么 NEON | 16 像素/轮 + vqmovun 免分支，实测 ~8× |

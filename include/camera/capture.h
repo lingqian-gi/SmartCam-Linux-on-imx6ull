@@ -193,6 +193,10 @@ public:
 
     /**
      * @brief 归还缓冲区到 V4L2 队列（必须在 getFrame 后调用）
+     *
+     * 通过 FrameBuffer.pool_index 直接 O(1) 归还（无需遍历反查）。
+     * 调用者不应修改 buf->pool_index；getFrame 已保证其合法并校验 data 指针匹配。
+     *
      * @param buf  要归还的帧（由 getFrame 填充，调用者不修改数据）
      * @return 0 成功
      */

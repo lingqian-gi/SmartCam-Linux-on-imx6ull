@@ -467,15 +467,16 @@ int CameraCapture::getFrame(FrameBuffer* buf, int timeout_ms) {
     }
 
     // 填充 FrameBuffer
-    buf->data     = static_cast<uint8_t*>(m_buffers[vbuf.index].start);
-    buf->length   = static_cast<int>(vbuf.bytesused);
-    buf->width    = m_width;
-    buf->height   = m_height;
-    buf->format   = (m_pixfmt == V4L2_PIX_FMT_YUYV)
-                        ? PixelFormat::FMT_YUYV
-                        : PixelFormat::FMT_MJPEG;
-    buf->index    = m_frameCount++;
-    buf->timestamp = std::chrono::steady_clock::now();
+    buf->data       = static_cast<uint8_t*>(m_buffers[vbuf.index].start);
+    buf->length     = static_cast<int>(vbuf.bytesused);
+    buf->width      = m_width;
+    buf->height     = m_height;
+    buf->format     = (m_pixfmt == V4L2_PIX_FMT_YUYV)
+                          ? PixelFormat::FMT_YUYV
+                          : PixelFormat::FMT_MJPEG;
+    buf->index      = m_frameCount++;
+    buf->pool_index = static_cast<int>(vbuf.index);   // 记录缓冲池索引，putFrame 直接 O(1) 归还
+    buf->timestamp  = std::chrono::steady_clock::now();
 
     // FPS 统计
     updateFPS();
@@ -487,16 +488,21 @@ int CameraCapture::putFrame(const FrameBuffer* buf) {
     if (!m_streaming || m_fd < 0) return -EIO;
     if (!buf || !buf->data) return -EINVAL;
 
-    // 从 data 指针反推缓冲区索引
-    int idx = -1;
-    for (int i = 0; i < m_nbuffers; ++i) {
-        if (m_buffers[i].start == buf->data) {
-            idx = i;
-            break;
-        }
+    // 直接使用 getFrame 记录的 pool_index（O(1) 归还，不再遍历反查）
+    const int idx = buf->pool_index;
+    if (idx < 0 || idx >= m_nbuffers || !m_buffers) {
+        LOG_ERR_("putFrame: invalid pool_index=%d (nbufs=%d)", idx, m_nbuffers);
+        return -EINVAL;
     }
-    if (idx < 0) {
-        LOG_ERR_("putFrame: buffer pointer not found in pool");
+
+    // 防御：data 指针必须与 pool_index 对应槽位一致（防外部伪造 FrameBuffer）
+    if (m_buffers[idx].start != buf->data) {
+        LOG_ERR_("putFrame: pool_index=%d data pointer mismatch", idx);
+        return -EINVAL;
+    }
+    // 防御：该槽位应处于"已出队"状态，重复归还说明调用方逻辑有误
+    if (m_buffers[idx].queued) {
+        LOG_ERR_("putFrame: buffer %d already queued (double put?)", idx);
         return -EINVAL;
     }
 
@@ -752,11 +758,12 @@ void CameraCapture::updateFPS() {
 
 FrameBuffer CameraCapture::BufferUnit::toFrameBuffer(int w, int h, uint32_t fmt) {
     FrameBuffer fb;
-    fb.data   = static_cast<uint8_t*>(start);
-    fb.length = static_cast<int>(length);
-    fb.width  = w;
-    fb.height = h;
-    fb.format = (fmt == V4L2_PIX_FMT_YUYV) ? PixelFormat::FMT_YUYV
-                                           : PixelFormat::FMT_MJPEG;
+    fb.data       = static_cast<uint8_t*>(start);
+    fb.length     = static_cast<int>(length);
+    fb.width      = w;
+    fb.height     = h;
+    fb.format     = (fmt == V4L2_PIX_FMT_YUYV) ? PixelFormat::FMT_YUYV
+                                               : PixelFormat::FMT_MJPEG;
+    fb.pool_index = index;   // 记录缓冲池索引
     return fb;
 }
