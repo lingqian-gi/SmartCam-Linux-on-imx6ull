@@ -102,10 +102,11 @@ src/display/ 显示与交互模块
 | `linuxfb` 平台插件（`QT_QPA_PLATFORM`） | 帧缓冲渲染 | 内部 mmap `/dev/fb0`，内置 evdev 触摸 |
 | `libjpeg-turbo`（`jpeglib.h`） | MJPEG 解码 / 缩略图 | `HAS_LIBJPEG` 条件编译；自定义错误处理器防坏帧崩溃 |
 | `arm_neon.h`（`__ARM_NEON`） | YUYV→RGB 加速 | 仅 ARM 交叉编译启用，x86 退化标量 |
+| `VideoProcessor`（`src/camera/processor.h`） | YUYV→RGB24 颜色转换 | `gui.cpp` include 复用，避免维护第二份转换代码；含 NEON 加速 |
 | StorageManager（`src/storage/`） | 相册数据源 | `listPhotos` / `listVideos` / `deletePhoto` / `extractAviThumbnail` |
 | 标准 C++17 | 容器/函数 | `std::function` 回调、`std::vector` |
 
-> 面试点：display 模块**唯一的跨模块依赖是 `StorageManager`**（相册需要它列文件），对 camera/network 完全靠回调——这是刻意的依赖倒置。注意 `gui.h` 里内联了一份 `yuyv_to_rgb24`/`yuyv_to_rgb565`（第 229~296 行），与 `processor.cpp` 的转换逻辑重复，是历史遗留（详见 3.1）。
+> 面试点：display 模块**对 camera/network 的控制完全靠回调**（依赖倒置），但对 StorageManager 直接持有指针（相册需要它列文件）；此外 `gui.cpp` include 了 `camera/processor.h` 复用颜色转换（`VideoProcessor::yuyvToRgb24`）。**注意**：历史上 `gui.h` 曾内联一份 `yuyv_to_rgb24`/`yuyv_to_rgb565`，与 `processor.cpp` 重复，后已删除、统一到 `VideoProcessor`（详见 3.1）。
 
 ## 1.5 核心类 / 函数列表与调用关系
 
@@ -195,7 +196,7 @@ case PixelFormat::FMT_RGB24:
     return QImage(data, w, h, w * 3, QImage::Format_RGB888).copy();
 case PixelFormat::FMT_YUYV: {
     std::vector<uint8_t> rgb(w * h * 3);
-    yuyv_to_rgb24(data, rgb.data(), w, h);       // NEON 加速（见 camera 篇）
+    VideoProcessor::yuyvToRgb24(data, rgb.data(), w, h);   // 复用 camera 模块，含 NEON 加速
     return QImage(rgb.data(), w, h, w * 3, QImage::Format_RGB888).copy();
 }
 case PixelFormat::FMT_MJPEG: {
@@ -638,6 +639,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 |----------|------|--------|------|
 | camera | `std::function` 回调（控制） | **松** | GUI 不知道 CameraCapture 类的存在 |
 | camera | `setFrame(data,len,w,h,fmt)`（数据） | **中** | main.cpp 在中间做适配，GUI 只认帧契约 |
+| camera | `VideoProcessor::yuyvToRgb24`（编译期） | **中** | `gui.cpp` include `processor.h` 复用颜色转换（纯静态工具类，无 V4L2 依赖） |
 | network | `setClientCount(int)` 单向状态 | **松** | 只收状态，不发指令 |
 | storage | 直接持有 `StorageManager*` | **紧** | 相册直接调用 `listPhotos`/`deletePhoto` 等 |
 
@@ -645,7 +647,9 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 - camera 控制频率低、语义简单（拍照/切分辨率），用回调最轻；
 - 相册需要**大量双向数据交互**（列目录、删文件、读缩略图、存空间查询），十几个方法如果全走回调会非常啰嗦，直接持有指针更务实。
 
-**改进方向**：相册对 storage 的依赖可以抽象为 `MediaProvider` 接口（`list/delete/extractThumbnail`），便于单元测试注入假存储；camera 侧保持回调即可。**松紧结合**是合理的——不同接口不同耦合策略。
+**编译期依赖说明（重要演进）**：早期版本 `gui.h` 内联了一份 `yuyv_to_rgb24`/`yuyv_to_rgb565`（BT.601 定点），与 `processor.cpp` 完全重复。重构后已删除，`gui.cpp` 统一调用 `VideoProcessor::yuyvToRgb24`（同样含 NEON 分流）。收益：颜色转换只维护一份实现，消除"两处系数不一致"的隐患；代价：display 对 camera 头文件多了一条编译期依赖（`processor.h` 是纯静态工具类，不含 V4L2 结构体，实际耦合很弱）。`gui.cpp` 本就要 include `capture.h` 用 `V4L2_CID_*` 常量，故该依赖并非新增方向。
+
+**改进方向**：相册对 storage 的依赖可以抽象为 `MediaProvider` 接口（`list/delete/extractThumbnail`），便于单元测试注入假存储；camera 侧保持回调即可。颜色转换若想彻底解耦，可将 `VideoProcessor` 从 `camera/` 目录上移到 `common/`（它本质是通用图像工具，不依赖 V4L2）——这是合理的下一步重构。**松紧结合**是合理的——不同接口不同耦合策略。
 
 ## 3.2 需求变更下的重构推演
 

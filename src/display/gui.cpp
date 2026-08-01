@@ -1,5 +1,6 @@
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
+#include "include/camera/processor.h"
 #include <QApplication>
 #include <QScreen>
 #include <QPainter>
@@ -1108,9 +1109,9 @@ QImage CameraGUI::frameToQImage(const uint8_t* data, int len, int w, int h, Pixe
         return QImage(data, w, h, w * 2, QImage::Format_RGB16).copy();
     }
     case PixelFormat::FMT_YUYV: {
-        // YUYV → RGB24 → QImage
+        // YUYV → RGB24 → QImage（复用 VideoProcessor，统一转换实现，含 NEON 加速）
         std::vector<uint8_t> rgb(w * h * 3);
-        yuyv_to_rgb24(data, rgb.data(), w, h);
+        VideoProcessor::yuyvToRgb24(data, rgb.data(), w, h);
         return QImage(rgb.data(), w, h, w * 3, QImage::Format_RGB888).copy();
     }
     case PixelFormat::FMT_MJPEG: {
