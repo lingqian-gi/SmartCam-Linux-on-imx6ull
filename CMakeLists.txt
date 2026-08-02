@@ -86,12 +86,17 @@ set(MAIN_SOURCES
     src/main.cpp
 )
 
+set(COMMON_SOURCES
+    include/common/frame_pool.h   # 帧池零拷贝（header-only：FrameSlot/FramePool/SlotGuard）
+)
+
 set(ALL_SOURCES
     ${CAMERA_SOURCES}
     ${DISPLAY_SOURCES}
     ${NETWORK_SOURCES}
     ${STORAGE_SOURCES}
     ${MAIN_SOURCES}
+    ${COMMON_SOURCES}
 )
 
 # 启用 Qt 元对象编译器自动处理
@@ -145,10 +150,12 @@ install(FILES configs/smartcam.conf
 )
 
 # ============================================================
-# 测试 (后续添加)
+# 测试
 # ============================================================
 
-# add_subdirectory(tests)
+# 单元测试（test_protocol / test_frame_pool）
+enable_testing()
+add_subdirectory(tests)
 
 # ============================================================
 # 打印构建摘要
