@@ -864,6 +864,11 @@ int main(int argc, char* argv[]) {
                     continue;  // 超时重试
                 }
 
+                // 诊断：打印采集到的帧字节数（bytesused=0 表示摄像头未输出有效数据）
+                LOG_DBG("capture: frame %d bytes fmt=%d %dx%d",
+                        fb.length, static_cast<int>(fb.format),
+                        fb.width, fb.height);
+
                 // ---- 帧率节流 ----
                 if (throttleFps > 0) {
                     auto now = std::chrono::steady_clock::now();
@@ -906,6 +911,9 @@ int main(int argc, char* argv[]) {
         // ============================================================
         std::thread* processThread = new std::thread([mjpegServer, mjpegServerOk,
                                                        rtspServer]() {
+            LOG_INF("Process thread started (mjpegServerOk=%d)",
+                    mjpegServerOk ? 1 : 0);
+            uint64_t procFrames = 0;
             while (g_state.running) {
                 // 等待采集线程通知新帧
                 {
@@ -925,12 +933,17 @@ int main(int argc, char* argv[]) {
 
                 {
                     std::lock_guard<std::mutex> lock(g_state.mtx);
-                    if (g_state.frameData.empty()) continue;
+                    if (g_state.frameData.empty()) {
+                        LOG_WRN("process: frameData empty, skipping (seq=%llu)",
+                                (unsigned long long)g_state.frameSeq.load());
+                        continue;
+                    }
                     localFrame = g_state.frameData;  // 拷贝出来，快速释放锁
                     localW   = g_state.width;
                     localH   = g_state.height;
                     localFmt = g_state.format;
                 }
+                procFrames++;
 
                 // YUYV → JPEG 编码（CPU 密集，不阻塞采集线程）
                 bool needEncode = (localFmt == PixelFormat::FMT_YUYV) &&
@@ -969,6 +982,12 @@ int main(int argc, char* argv[]) {
                             localW, localH);
                     }
                 }
+
+                LOG_DBG("process: frame %llu fmt=%d %d bytes → HTTP(%s) RTSP(%s)",
+                        (unsigned long long)procFrames, static_cast<int>(localFmt),
+                        (int)localFrame.size(),
+                        (mjpegServerOk && localFmt == PixelFormat::FMT_MJPEG) ? "fed" : "skip",
+                        rtspServer ? "fed" : "skip");
 
                 if (jpeg_out) free(jpeg_out);
 
