@@ -228,6 +228,16 @@ export QT_QPA_PLATFORM=linuxfb
 # MJPEG 模式（摄像头硬件输出 JPEG，零 CPU 编码开销，推荐）
 ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
 
+# ⚠️⚠️ 重要警告：上面的 export LD_LIBRARY_PATH=/usr/lib 会污染整个 shell！
+#   之后在这个终端里运行 git / curl / apt 等命令会报错：
+#     - git pull → "Error -50 setting GnuTLS cipher list"
+#     - curl   → "symbol curl_url_get version CURL_OPENSSL_4 not defined"
+#   原因：板子上 /usr/lib 下还有一套手动装的 OpenSSL 版 libcurl，
+#   LD_LIBRARY_PATH 让 git/curl 加载了错误版本（详见 docs/debug-summary.md #26）。
+#   解决：跑完 smartcam 后立即 unset，或改用"单行临时设置"方式：
+#     LD_LIBRARY_PATH=/usr/lib QT_QPA_PLATFORM=linuxfb ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+#   强烈建议用单行方式，避免污染后续命令。
+
 # YUYV 模式（libjpeg-turbo 软件编码后推流）
 ./smartcam --device /dev/video0 --fmt yuyv --http-port 8080
 

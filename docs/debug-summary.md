@@ -1632,3 +1632,68 @@ sudo usermod -a -G input debian      # 永久，需重新登录
 | **交叉编译与运行时一致性** | CMake 交叉编译时明确指定与板子运行时一致的 Qt（板厂套的 cmake 配置），避免"编译用 A、运行用 B" |
 | **本问题是否影响 PC** | 不影响。PC 端 xcb 平台有完整光标资源，无此问题 |
 
+---
+
+## 26. git/curl 突然报错：GnuTLS cipher list / CURL_OPENSSL_4 symbol — 根因是 LD_LIBRARY_PATH 污染 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | 开发板动态链接环境（`LD_LIBRARY_PATH` 污染） |
+| **现象** | `git pull` 报 `Error -50 setting GnuTLS cipher list starting with +VERS-TLS1.3:+SRP`；`curl` 报 `symbol curl_url_get version CURL_OPENSSL_4 not defined` |
+| **严重程度** | ❌ 严重 — 无法拉取/推送代码 |
+| **排查耗时** | 较长（多轮误判为 git/gnutls 版本问题，最终定位为环境变量污染） |
+
+### 一、现象
+
+在开发板上 `git pull origin main` 突然报错（之前一直正常）：
+
+```
+fatal: unable to access 'https://github.com/...': Error -50 setting GnuTLS cipher list starting with +VERS-TLS1.3:+SRP
+```
+
+`curl` 下载 GitHub 压缩包也报错：
+
+```
+curl: /usr/lib/libcurl.so.4: no version information available (required by curl)
+curl: relocation error: curl: symbol curl_url_get version CURL_OPENSSL_4 not defined in file libcurl.so.4 with link time reference
+```
+
+### 二、排查过程（走过的弯路）
+
+1. **误判 1：git/gnutls 版本问题** → 重装 `libgnutls30`、升级 git 均无效（git 已是 `2.20.1-2+deb10u3`）；
+2. **误判 2：代理问题** → 换回原始 GitHub 直连，仍报同样的 `Error -50`（排除代理因素）；
+3. **误判 3：cipher 列表格式** → 设置 `GIT_SSL_CIPHER_LIST="NORMAL"`、`http.sslCipherList`、`http.version HTTP/1.1` 均无效——因为**问题根本不是 cipher 列表本身**；
+4. **关键证据**：`curl` 报 `CURL_OPENSSL_4 not defined in libcurl.so.4` → 说明 curl 加载的 `libcurl.so.4` 是 **OpenSSL 版**，而 curl 程序期望 **GnuTLS 版**——板子上有**两套 libcurl**！
+5. **根因确认**：此前排查 linuxfb 光标崩溃（#25）时，为让 smartcam 使用板厂手动 Qt 套，在 shell 里执行了 `export LD_LIBRARY_PATH=/usr/lib`。该环境变量让**所有后续命令**（git/curl 等）优先从 `/usr/lib` 加载库 → 加载了 `/usr/lib/libcurl.so.4`（手动装的 OpenSSL 版）→ git/curl 崩溃。
+
+### 三、解决
+
+```bash
+# 关键：去掉污染动态链接的环境变量
+unset LD_LIBRARY_PATH
+
+# 验证已清除
+echo "LD_LIBRARY_PATH=[$LD_LIBRARY_PATH]"   # 应输出 LD_LIBRARY_PATH=[]
+
+# git / curl 恢复正常
+git pull origin main
+```
+
+### 四、经验教训（重要）
+
+| 教训 | 说明 |
+|------|------|
+| **LD_LIBRARY_PATH 是全局毒药** | 它影响 shell 中**所有**动态链接程序（git/curl/apt 等），不只是当前程序。临时设置后必须立即 unset |
+| **两个程序同时报"库符号错误"要想到环境** | git 报 GnuTLS、curl 报 CURL_OPENSSL，方向完全不同却同时出现 → 一定是共享环境被污染 |
+| **优先单行临时设置，避免 export** | 用 `VAR=xx command` 单行前缀，只影响单条命令，不污染 shell |
+| **错误信息要看库路径** | `curl: /usr/lib/libcurl.so.4` 明确指出了加载路径 → 直接暴露 `/usr/lib` 是问题目录 |
+
+### 五、正确用法（README 已同步更新）
+
+- **运行 smartcam**（需要板厂手动 Qt 套）：推荐**单行临时设置**，避免污染后续命令：
+  ```bash
+  LD_LIBRARY_PATH=/usr/lib QT_QPA_PLATFORM=linuxfb \
+    ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+  ```
+- **git / curl / apt 等**：保持 `LD_LIBRARY_PATH` 为空。
+
