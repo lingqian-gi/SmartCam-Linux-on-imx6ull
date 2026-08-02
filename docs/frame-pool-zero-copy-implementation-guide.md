@@ -1,6 +1,6 @@
 # SmartCam 帧池零拷贝优化 — 实施指南与性能验证文档
 
-> 版本: v1.1 | 日期: 2026-08-03 | 状态: **Phase 1~3 已完成（RGB 池已实现并验证）**
+> 版本: v1.2 | 日期: 2026-08-03 | 状态: **Phase 1~3 已完成（RGB 池已实现并验证）**
 > 对应计划: `docs/plan-frame-pool-zero-copy.md`（设计稿）
 > 本文档定位: **实施 + 验证的完整操作手册**，包含基线数据、对比方案、实现步骤、实测结论、风险对策，供后续维护与复现。
 >
@@ -25,6 +25,7 @@
 9. [附：实测基线数据（改进前）](#九附实测基线数据改进前)
 10. [附：改造后实测数据与对比（Phase 3）](#十附改造后实测数据与对比phase-3)
 11. [附：git/curl 报错排查（LD_LIBRARY_PATH 污染）](#十一附gitcurl报错排查ld_library_path-污染)
+12. [新增/修改代码完整内容](#十二新增修改代码完整内容)
 
 ---
 
@@ -639,6 +640,789 @@ git pull origin main   # 恢复正常
 
 ---
 
+## 十二、新增/修改代码完整内容
+
+> 本章记录本次帧池优化（Phase 1~3）涉及的**全部新增/修改代码**，与仓库 commit `9755549` 完全一致，供回溯与复现。
+> 涉及文件：`include/common/frame_pool.h`（新增）、`tests/test_frame_pool.cpp`（新增）、
+> `src/main.cpp`（修改）、`src/display/gui.h`（修改）、`src/display/gui.cpp`（修改）、
+> `src/camera/processor.h`（修改）、`src/camera/processor.cpp`（修改）、
+> `src/camera/processor_neon.cpp`（修改）、`CMakeLists.txt`（修改）、`tests/CMakeLists.txt`（修改）。
+
+### 12.1 新增文件：`include/common/frame_pool.h`（完整）
+
+```cpp
+#ifndef SMART_CAM_COMMON_FRAME_POOL_H
+#define SMART_CAM_COMMON_FRAME_POOL_H
+
+/**
+ * @file    frame_pool.h
+ * @brief   帧池零拷贝（双缓冲 + 引用计数）
+ *
+ * 核心思想："数据共享，而非数据搬移"。
+ * 生产者在池槽中写数据并发布，消费者通过共享引用读取同一份数据，
+ * 谁最后用完谁释放。核心不变量只有一条：
+ *
+ *   **acquire 只借空闲槽（refs==0）**
+ *
+ * 由此天然实现：
+ *   - 读写分离（双缓冲）：生产者写 refs==1 的槽，消费者读已发布槽，永不冲突；
+ *   - 多消费者共享：引用计数让多个线程同时持有同一帧；
+ *   - 池满丢帧（反压）：acquire 失败返回 nullptr → 调用方丢帧，不阻塞。
+ *
+ * 内存序：
+ *   - publish  用 release 语义（写完 data 再发布指针）
+ *   - share    用 acquire 语义（先取指针再读 data）
+ *   保证"看到指针就一定看到完整数据"。
+ *
+ * 配套 RAII 句柄 SlotGuard：所有 share() 结果必须包进句柄，
+ * 编译器保证任何返回路径都归还引用（防漏 release）。
+ */
+
+#include <cstdint>
+#include <vector>
+#include <memory>
+#include <atomic>
+
+#include "include/common/types.h"
+
+/**
+ * @brief 帧槽：一块可被多线程共享的帧缓冲
+ *
+ * refs 引用计数语义：
+ *   - 0 = 空闲，可被 acquire() 借出
+ *   - >0 = 正在被生产者写入或被消费者读取
+ * 生产者写完发布；消费者用完 release；最后一个 release 使槽回到空闲。
+ */
+struct FrameSlot {
+    std::vector<uint8_t> data;          // 帧数据（预分配，稳态零 realloc）
+    std::atomic<int>     refs{0};       // 引用计数
+    uint64_t             seq{0};        // 帧序号（消费者去重）
+    int                  width{0};
+    int                  height{0};
+    PixelFormat          format{PixelFormat::FMT_RGB24};
+};
+
+/**
+ * @brief 帧池：管理固定数量帧槽的多线程共享池
+ *
+ * 线程安全：acquire/share/release/publish 均为原子操作，无外部锁。
+ */
+class FramePool {
+public:
+    /**
+     * @brief 构造帧池，预分配 capacity 个槽
+     * @param capacity 槽数量（原始帧池建议 3，RGB 显示池建议 2）
+     */
+    explicit FramePool(int capacity) {
+        m_slots.reserve(capacity);
+        for (int i = 0; i < capacity; ++i)
+            m_slots.push_back(std::make_unique<FrameSlot>());
+    }
+
+    FramePool(const FramePool&) = delete;
+    FramePool& operator=(const FramePool&) = delete;
+
+    /**
+     * @brief 借一个空闲槽（refs 0→1）
+     * @return 空闲槽指针；无空闲返回 nullptr（调用方应丢帧，勿等待）
+     */
+    FrameSlot* acquire() {
+        for (auto& s : m_slots) {
+            int expected = 0;
+            if (s->refs.compare_exchange_strong(expected, 1))
+                return s.get();
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief 取得当前发布槽的共享引用（refs+1）
+     * @return 当前槽指针；无发布槽返回 nullptr
+     *
+     * 注意：返回的指针必须由调用方通过 release() 归还
+     * （推荐包进 SlotGuard）。
+     */
+    FrameSlot* share() {
+        FrameSlot* cur = m_current.load(std::memory_order_acquire);
+        if (cur)
+            cur->refs.fetch_add(1, std::memory_order_relaxed);
+        return cur;
+    }
+
+    /**
+     * @brief 归还引用（refs-1）；归 0 后该槽重新可被 acquire
+     */
+    void release(FrameSlot* s) {
+        if (!s) return;
+        s->refs.fetch_sub(1, std::memory_order_release);
+    }
+
+    /**
+     * @brief 发布一个新槽为"当前"（原子替换指针）
+     *
+     * 调用前必须已完成对 s->data 的写入；s 必须是刚 acquire 的槽（refs==1）。
+     *
+     * ⚠️ 所有权语义：
+     *   - publish **不释放** s 的引用——s 以 refs==1 持续被"池持有"（current 槽），
+     *     保证发布期间不会被生产者重写；
+     *   - 同时**释放旧 current 槽的池持有引用**（refs 1→0），旧槽归零后可被复用；
+     *   - 消费者 share 使 current 槽 refs 1→2，release 后回到 1；
+     *     生产者 acquire 借不到 refs≠0 的槽 → current 槽不会被写。
+     *
+     * publish 用 release 语义保证数据可见性先于指针可见性。
+     */
+    void publish(FrameSlot* s) {
+        // 先确保 data 写完整，再发布指针（release fence 与消费者 acquire 配对）
+        std::atomic_thread_fence(std::memory_order_release);
+        FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);
+        if (old)
+            release(old);   // 释放旧 current 的池持有引用（可复用）
+    }
+
+    /** @brief 当前槽的帧序号（无发布槽返回 0） */
+    uint64_t currentSeq() const {
+        FrameSlot* cur = m_current.load(std::memory_order_acquire);
+        return cur ? cur->seq : 0;
+    }
+
+private:
+    std::vector<std::unique_ptr<FrameSlot>> m_slots;
+    std::atomic<FrameSlot*>                 m_current{nullptr};
+};
+
+/**
+ * @brief RAII 句柄：离开作用域自动 release
+ *
+ * 用法：
+ *   SlotGuard g(pool, pool->share());
+ *   if (!g.get()) { ... 丢帧 ... }
+ *   // 使用 g.get()->data ...
+ *   // 离开作用域自动 release，任何返回路径都不会漏
+ */
+class SlotGuard {
+public:
+    SlotGuard(FramePool* pool, FrameSlot* slot) : m_pool(pool), m_slot(slot) {}
+    ~SlotGuard() {
+        if (m_slot && m_pool) m_pool->release(m_slot);
+    }
+
+    SlotGuard(const SlotGuard&) = delete;
+    SlotGuard& operator=(const SlotGuard&) = delete;
+
+    FrameSlot* get() const { return m_slot; }
+    explicit operator bool() const { return m_slot != nullptr; }
+
+    /** @brief 释放所有权（主动归还并置空，防止析构二次 release） */
+    FrameSlot* releaseOwnership() {
+        FrameSlot* s = m_slot;
+        m_slot = nullptr;
+        return s;
+    }
+
+private:
+    FramePool* m_pool;
+    FrameSlot* m_slot;
+};
+
+#endif // SMART_CAM_COMMON_FRAME_POOL_H
+```
+
+### 12.2 新增文件：`tests/test_frame_pool.cpp`（完整）
+
+```cpp
+/**
+ * @file    test_frame_pool.cpp
+ * @brief   FramePool 帧池单元测试
+ *
+ * 测试内容:
+ *   1. 借还循环：capacity 个槽反复 acquire/release 不泄漏、refs 守恒
+ *   2. 池满：acquire 返回 nullptr
+ *   3. publish/share：share 到的一定是已发布且数据完整（用 seq 校验）
+ *   4. 并发：多线程混合 share/release 下 refs 守恒（无 data race）
+ *   5. SlotGuard RAII：作用域结束自动 release，不泄漏
+ *
+ * 编译（PC）:
+ *   cd build/pc && cmake .. && make test_frame_pool && ./test_frame_pool
+ * 或直接:
+ *   g++ -std=c++17 -O2 -pthread -I.. -o /tmp/test_frame_pool \
+ *       tests/test_frame_pool.cpp && /tmp/test_frame_pool
+ */
+
+#include <cstdio>
+#include <cstring>
+#include <cassert>
+#include <thread>
+#include <vector>
+#include <atomic>
+
+#include "include/common/frame_pool.h"
+
+static int testsPassed = 0;
+static int testsFailed = 0;
+
+#define TEST(name) \
+    printf("  [TEST] %s ... ", name)
+
+#define PASS() \
+    do { printf("PASS\n"); testsPassed++; } while(0)
+
+#define FAIL(msg) \
+    do { printf("FAIL: %s\n", msg); testsFailed++; } while(0)
+
+// ============================================================
+// 1. 借还循环：槽反复 acquire/release，refs 守恒
+// ============================================================
+static void test_acquire_release_loop() {
+    TEST("借还循环 refs 守恒");
+    FramePool pool(3);
+    const int N = 1000;
+    for (int i = 0; i < N; ++i) {
+        FrameSlot* s = pool.acquire();
+        if (!s) { FAIL("循环中 acquire 意外失败"); return; }
+        s->data.assign(100, (uint8_t)i);   // 写入数据
+        pool.release(s);                   // 归还 → refs 归 0
+    }
+    // 全部归还后，3 槽都应再次可借出
+    int borrowCount = 0;
+    while (pool.acquire()) borrowCount++;
+    if (borrowCount != 3) { FAIL("归还后应能借出全部 3 槽"); return; }
+    PASS();
+}
+
+// ============================================================
+// 2. 池满：acquire 返回 nullptr
+// ============================================================
+static void test_pool_full() {
+    TEST("池满 acquire 返回 nullptr");
+    FramePool pool(2);
+    FrameSlot* a = pool.acquire();
+    FrameSlot* b = pool.acquire();
+    if (!a || !b) { FAIL("借前两槽失败"); return; }
+    FrameSlot* c = pool.acquire();
+    if (c != nullptr) { FAIL("池满应返回 nullptr"); return; }
+    pool.release(a);
+    pool.release(b);
+    PASS();
+}
+
+// ============================================================
+// 3. publish/share：share 到已发布且数据完整
+// ============================================================
+static void test_publish_share() {
+    TEST("publish/share 数据完整性");
+    FramePool pool(3);
+    FrameSlot* s = pool.acquire();
+    if (!s) { FAIL("acquire 失败"); return; }
+    // 写数据
+    s->data.assign({1, 2, 3, 4, 5, 6, 7, 8});
+    s->seq    = 42;
+    s->width  = 8;
+    s->height = 1;
+    s->format = PixelFormat::FMT_MJPEG;
+    pool.publish(s);   // publish 自动释放生产者写引用（refs 1→0），槽归消费者所有
+
+    // share 应拿到发布槽且数据完整
+    FrameSlot* cur = pool.share();
+    if (!cur) { FAIL("share 返回 nullptr"); return; }
+    if (cur->seq != 42) { FAIL("seq 不一致"); return; }
+    if (cur->data.size() != 8 || cur->data[7] != 8) { FAIL("数据不一致"); return; }
+    if (cur->width != 8 || cur->height != 1) { FAIL("宽高不一致"); return; }
+    if (cur->format != PixelFormat::FMT_MJPEG) { FAIL("格式不一致"); return; }
+
+    // share 期间该槽 refs==1（仅消费者），再次 acquire 不应借出它
+    FrameSlot* a = pool.acquire();
+    FrameSlot* b = pool.acquire();
+    if (!a || !b) { FAIL("剩余 2 槽应可借出"); pool.release(cur); return; }
+    FrameSlot* c = pool.acquire();
+    if (c != nullptr) { FAIL("share 持有时该槽不应被借出"); pool.release(a); pool.release(b); pool.release(cur); return; }
+    pool.release(a);
+    pool.release(b);
+    pool.release(cur);
+    PASS();
+}
+
+// ============================================================
+// 4. 并发：多线程混合 share/release，refs 守恒
+// ============================================================
+static void test_concurrent() {
+    TEST("并发 share/release refs 守恒");
+    FramePool pool(4);
+    // 先发布一帧
+    FrameSlot* prod = pool.acquire();
+    if (!prod) { FAIL("acquire 失败"); return; }
+    prod->data.assign(64, 0xAB);
+    prod->seq = 7;
+    pool.publish(prod);   // publish 自动释放生产者引用
+
+    // 生产者继续循环发布新帧
+    std::atomic<bool> stop{false};
+    std::atomic<int>  errors{0};
+
+    std::thread producer([&]() {
+        uint64_t seq = 8;
+        while (!stop.load()) {
+            FrameSlot* s = pool.acquire();
+            if (!s) { std::this_thread::yield(); continue; }  // 池满丢帧
+            s->data.assign(64, (uint8_t)(seq & 0xFF));
+            s->seq = seq++;
+            pool.publish(s);   // publish 自动释放生产者引用
+            std::this_thread::yield();
+        }
+    });
+
+    // 4 个消费者 share → 读数据 → release
+    std::vector<std::thread> consumers;
+    for (int t = 0; t < 4; ++t) {
+        consumers.emplace_back([&]() {
+            int iterations = 0;
+            while (!stop.load()) {
+                FrameSlot* s = pool.share();
+                if (!s) { std::this_thread::yield(); continue; }
+                // 校验读取的帧数据与 seq 低字节一致（数据完整性抽查）
+                if (!s->data.empty() &&
+                    s->data[0] != (uint8_t)(s->seq & 0xFF) &&
+                    s->seq > 8) {
+                    errors.fetch_add(1);
+                }
+                pool.release(s);
+                iterations++;
+                if (iterations >= 2000) break;
+            }
+        });
+    }
+
+    // 运行一段时间后停止
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stop.store(true);
+    producer.join();
+    for (auto& c : consumers) c.join();
+
+    if (errors.load() != 0) { FAIL("并发数据校验出错"); return; }
+    // 结束后：消费者的 share 引用应已全部归还。
+    // 池中除 current 槽（refs=1 被池持有）外，其余 3 槽应可全部借出。
+    int borrow = 0;
+    while (pool.acquire()) borrow++;
+    if (borrow != 3) { FAIL("并发结束后 refs 未守恒（应剩 current 槽被持有）"); return; }
+    PASS();
+}
+
+// ============================================================
+// 5. SlotGuard RAII：作用域结束自动 release
+// ============================================================
+static void test_slot_guard() {
+    TEST("SlotGuard RAII 自动归还");
+    FramePool pool(1);
+    {
+        FrameSlot* s = pool.share();   // 无发布槽 → nullptr
+        SlotGuard g(&pool, s);
+        if (g.get() != nullptr) { FAIL("未发布时 share 应返回 nullptr"); return; }
+    }
+    // 发布一帧
+    FrameSlot* prod = pool.acquire();
+    prod->seq = 1;
+    pool.publish(prod);   // current 槽 refs 保持 1（池持有）
+    {
+        SlotGuard g(&pool, pool.share());   // share → refs 2
+        if (!g) { FAIL("share 应返回槽"); return; }
+        (void)g.get()->seq;
+        // 离开作用域自动 release → refs 回到 1
+    }
+    // SlotGuard 已归还消费者的引用；但 current 槽仍被池持有（refs=1），
+    // 单槽池中无其他空闲槽可借 → acquire 应返回 nullptr（这是正确的双缓冲行为）
+    FrameSlot* s = pool.acquire();
+    if (s != nullptr) { FAIL("单槽池 current 槽应被池持有，不可再借"); pool.release(s); return; }
+    PASS();
+}
+
+int main() {
+    printf("=== FramePool 单元测试 ===\n");
+    test_acquire_release_loop();
+    test_pool_full();
+    test_publish_share();
+    test_concurrent();
+    test_slot_guard();
+    printf("=========================\n");
+    printf("通过: %d, 失败: %d\n", testsPassed, testsFailed);
+    return testsFailed == 0 ? 0 : 1;
+}
+```
+
+### 12.3 `src/main.cpp` 修改（帧池相关）
+
+**① 全局声明（g_rgbPool，位于 g_perf 之后）**：
+
+```cpp
+// ============================================================
+// RGB 显示帧池（帧池零拷贝路径）
+// ============================================================
+// 生产者：displayTimer（GUI 线程内解码 → 写入槽 → publish）
+// 消费者：GUI refreshFrame（share → 浅引用 QImage 绘制 → release）
+// 容量 2：GUI 持 1 槽 + 解码写 1 槽，天然双缓冲，无需锁。
+FramePool* g_rgbPool = nullptr;
+```
+
+**② 创建池（真实相机模式入口处）**：
+
+```cpp
+    if (!device.isEmpty()) {
+        // ============================================================
+        // 初始化 RGB 显示帧池（容量 2：GUI 持 1 + 解码写 1）
+        // ============================================================
+        g_rgbPool = new FramePool(2);
+```
+
+**③ displayTimer 改为帧池路径（核心改造）**：
+
+```cpp
+        // ============================================================
+        // 显示定时器（Qt 主线程，33ms ≈ 30fps）— 帧池零拷贝路径
+        // ============================================================
+        // 流程：借 rgb 槽 → 解码/转换入槽 → publish → share → setFrameShared
+        // 消除了旧路径的 2 次 RGB24 深拷贝（setFrame 内 assign + QImage.copy()）。
+        // 解码仍在 GUI 线程（单核板上线程无并行收益，见 docs 实施指南 §2.3）。
+        displayTimer = new QTimer(&gui);
+        displayTimer->setInterval(33);
+        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
+            // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
+            FrameSlot* slot = g_rgbPool->acquire();
+            if (!slot) return;
+
+            // 2. 取原始帧数据（短锁拷贝出共享区）
+            std::vector<uint8_t> raw;
+            int srcW = 0, srcH = 0;
+            PixelFormat srcFmt = PixelFormat::FMT_RGB24;
+            {
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                if (g_state.frameData.empty()) {
+                    g_rgbPool->release(slot);
+                    return;
+                }
+                raw    = g_state.frameData;   // 原始帧拷贝（JPEG ~0.1MB，唯一）
+                srcW   = g_state.width;
+                srcH   = g_state.height;
+                srcFmt = g_state.format;
+            }
+
+            // 3. 解码/转换为 RGB24，直接写入池槽（消除 setFrame 的二次拷贝）
+            slot->width  = srcW;
+            slot->height = srcH;
+            slot->format = PixelFormat::FMT_RGB24;
+            if (srcFmt == PixelFormat::FMT_MJPEG) {
+#ifdef HAS_LIBJPEG
+                int dw = 0, dh = 0;
+                if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
+                                                    slot->data, dw, dh)) {
+                    slot->width  = dw;
+                    slot->height = dh;
+                } else {
+                    g_rgbPool->release(slot);   // 坏帧丢帧
+                    return;
+                }
+#endif
+            } else if (srcFmt == PixelFormat::FMT_YUYV) {
+                slot->data.resize(static_cast<size_t>(srcW) * srcH * 3);
+                VideoProcessor::yuyvToRgb24(raw.data(), slot->data.data(), srcW, srcH);
+            } else {   // FMT_RGB24：直拷
+                slot->data = std::move(raw);
+            }
+
+            // [PERF] ③④ 已消除：解码直接写池槽（零拷贝），不再有 setFrame assign / QImage.copy()
+            // [PERF] 本函数 raw = g_state.frameData 是一次原始帧拷贝（JPEG ~0.1MB），计入
+            g_perf.copyBytes += raw.size();
+            // [PERF] ⑤ 上屏拷贝：QImage 浅引用构造（不拷贝）→ setPixmap 时 QPixmap::fromImage
+            //          做一次 RGB24 拷贝（上屏必需），计入 pixBytes
+            g_perf.pixBytes += static_cast<uint64_t>(slot->width) *
+                               slot->height * 3;
+
+            // 4. 发布并交 GUI 共享（setFrameShared 内部持有引用，零拷贝上屏）
+            slot->seq++;
+            g_rgbPool->publish(slot);
+            FrameSlot* displaySlot = g_rgbPool->share();
+            if (displaySlot) {
+                gui.setFrameShared(displaySlot);   // GUI 接管此引用
+            }
+
+            gui.setFPS(g_state.fps);
+            gui.setClientCount(mjpegServer->clientCount());
+        });
+        displayTimer->start();
+```
+
+**④ 清理部分**（不 delete 池的说明注释）：
+
+```cpp
+    // g_rgbPool 不在此 delete：GUI(gui) 是栈对象，其 m_heldSlot 引用在函数返回后
+    // 的析构中释放；若在此 delete 池，gui 析构时 g_rgbPool 已悬垂。
+    // 池内存极小（2 槽 ≈ 1.84MB），进程退出时由 OS 回收。
+```
+
+### 12.4 `include/display/gui.h` 修改
+
+```cpp
+#include "include/common/frame_pool.h"   // 新增 include
+
+// 新增方法声明（setFrame 之后）：
+    /**
+     * @brief 接收一帧共享槽（帧池零拷贝路径）
+     *
+     * GUI 持有该槽引用（m_heldSlot），refreshFrame 用 QImage 浅引用直接绘制，
+     * 消除 setFrame 的 m_frameBuffer.assign 与 frameToQImage 的 .copy() 两次深拷贝。
+     * 调用方须保证 slot 是 RGB24 格式。
+     *
+     * @param slot 共享帧槽（调用方通过 FramePool::share 取得，GUI 接管引用）
+     */
+    void setFrameShared(FrameSlot* slot);
+
+// 新增成员（m_frameBuffer 之后）：
+    FrameSlot*   m_heldSlot       = nullptr;  // 帧池共享槽引用（零拷贝路径，GUI 持有）
+```
+
+### 12.5 `src/display/gui.cpp` 修改
+
+**① 顶部 extern 声明**：
+
+```cpp
+// RGB 显示帧池（在 main.cpp 定义）：帧池零拷贝路径的共享池
+// GUI 通过它 share/release 显示槽
+extern FramePool* g_rgbPool;
+```
+
+**② 析构函数释放槽引用**：
+
+```cpp
+CameraGUI::~CameraGUI() {
+    // 释放帧池共享槽引用（防泄漏；此时 g_rgbPool 可能已析构，需判空）
+    if (m_heldSlot && g_rgbPool) {
+        g_rgbPool->release(m_heldSlot);
+        m_heldSlot = nullptr;
+    }
+}
+```
+
+**③ setFrameShared 实现**（setFrame 之后新增）：
+
+```cpp
+void CameraGUI::setFrameShared(FrameSlot* slot) {
+    if (!slot) return;
+
+    // 1. 释放上一帧持有的槽引用（若有）
+    if (m_heldSlot) {
+        if (g_rgbPool) g_rgbPool->release(m_heldSlot);
+        m_heldSlot = nullptr;
+    }
+
+    // 2. 持有新帧槽引用（slot 的 refs 已由 share() +1，GUI 接管）
+    m_heldSlot = slot;
+
+    // 3. m_currentFrame 直接指向共享数据（零拷贝）
+    m_currentFrame.data   = slot->data.data();
+    m_currentFrame.length = static_cast<int>(slot->data.size());
+    m_currentFrame.width  = slot->width;
+    m_currentFrame.height = slot->height;
+    m_currentFrame.format = PixelFormat::FMT_RGB24;   // 显示槽固定 RGB24
+    m_currentFrame.index++;
+
+    m_mockMode = false;
+}
+```
+
+**④ refreshFrame 中浅引用路径**（替换原 `frameToQImage` 调用）：
+
+```cpp
+    // 转换为 QImage 并渲染
+    QImage img;
+    if (m_heldSlot) {
+        // ---- 零拷贝路径：QImage 浅引用共享槽（不 .copy()）----
+        // m_heldSlot 保证数据生命周期有效；QImage 是临时对象，作用域结束即毁
+        const int w = m_currentFrame.width;
+        const int h = m_currentFrame.height;
+        img = QImage(m_currentFrame.data, w, h, w * 3, QImage::Format_RGB888);
+    } else {
+        img = frameToQImage(m_currentFrame.data,
+                            m_currentFrame.length,
+                            m_currentFrame.width,
+                            m_currentFrame.height,
+                            m_currentFrame.format);
+    }
+    if (!img.isNull()) {
+        m_videoDisplay->setPixmap(QPixmap::fromImage(img));
+    }
+```
+
+### 12.6 `include/camera/processor.h` 修改（新增声明）
+
+```cpp
+    // ============================================================
+    // JPEG 解码（libjpeg-turbo，静默坏帧）
+    // ============================================================
+
+    /**
+     * @brief 将 JPEG/MJPEG 单帧解码为 RGB24
+     *
+     * 用于帧池显示路径：解码结果直接写入池槽，消除上屏前二次拷贝。
+     * 坏帧时静默返回 false（不输出 stderr 警告）。
+     *
+     * @param jpeg_data  JPEG 数据
+     * @param jpeg_len   数据长度
+     * @param rgb        输出：RGB24 像素 (w*h*3 字节，自动分配)
+     * @param out_w      输出：图像宽度
+     * @param out_h      输出：图像高度
+     * @return true 解码成功；false 解码失败（坏帧/未编译 HAS_LIBJPEG）
+     */
+    static bool decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                std::vector<uint8_t>& rgb, int& out_w, int& out_h);
+```
+
+### 12.7 `src/camera/processor.cpp` 修改（新增实现）
+
+```cpp
+// ============================================================
+// JPEG 解码（libjpeg-turbo，静默坏帧）
+// ============================================================
+
+#ifdef HAS_LIBJPEG
+namespace {
+
+// libjpeg 自定义错误管理器：坏帧时 longjmp 回 setjmp 点，避免默认 exit()
+struct JpegErrorMgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+void jpegSilentErrorExit(j_common_ptr cinfo) {
+    JpegErrorMgr* myerr = reinterpret_cast<JpegErrorMgr*>(cinfo->err);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+void jpegSilentOutputMessage(j_common_ptr /*cinfo*/) {
+    /* 完全静默 — 不输出任何警告（坏帧在实时流中是常态） */
+}
+
+} // namespace
+#endif // HAS_LIBJPEG
+
+bool VideoProcessor::decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                     std::vector<uint8_t>& rgb, int& out_w, int& out_h) {
+#ifdef HAS_LIBJPEG
+    struct jpeg_decompress_struct cinfo;
+    JpegErrorMgr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit     = jpegSilentErrorExit;      // 替换默认 exit()
+    jerr.pub.output_message = jpegSilentOutputMessage;  // 静默 stderr 警告
+
+    // 解码错误时 longjmp 回到这里（先 destroy，避免泄漏，再返回失败）
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+
+    out_w = static_cast<int>(cinfo.output_width);
+    out_h = static_cast<int>(cinfo.output_height);
+    rgb.resize(static_cast<size_t>(out_w) * out_h * 3);
+
+    // 逐行解码到 RGB24
+    while (cinfo.output_scanline < static_cast<JDIMENSION>(out_h)) {
+        JSAMPROW row = rgb.data() + cinfo.output_scanline * out_w * 3;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+#else
+    (void)jpeg_data;
+    (void)jpeg_len;
+    (void)rgb;
+    (void)out_w;
+    (void)out_h;
+    return false;
+#endif
+}
+```
+
+### 12.8 `src/camera/processor_neon.cpp` 修改（ARM 条件保护）
+
+```cpp
+// 文件开头加：
+#ifdef __ARM_NEON
+
+// ...（原有 NEON 实现不变）...
+
+// 文件末尾加：
+#else  // !__ARM_NEON（x86 PC 调试模式）
+
+// 非 ARM 平台无 NEON 加速：提供空实现避免链接错误。
+// 调用方（gui.h yuyv_to_rgb24）在非 ARM 下走标量版本，不会调用本函数。
+#include <cstdint>
+void yuyv_to_rgb24_neon(const uint8_t* /*yuyv*/, uint8_t* /*rgb*/,
+                         int /*width*/, int /*height*/) {
+    // 非 ARM 平台不应被调用；空实现仅为满足符号存在性。
+}
+
+#endif // __ARM_NEON
+```
+
+### 12.9 CMake 配置修改
+
+**主 `CMakeLists.txt`**：
+
+```cmake
+# 新增 COMMON_SOURCES（FramePool 为 header-only）：
+set(COMMON_SOURCES
+    include/common/frame_pool.h   # 帧池零拷贝（header-only：FrameSlot/FramePool/SlotGuard）
+)
+
+# ALL_SOURCES 加入：
+set(ALL_SOURCES
+    ${CAMERA_SOURCES}
+    ${DISPLAY_SOURCES}
+    ${NETWORK_SOURCES}
+    ${STORAGE_SOURCES}
+    ${MAIN_SOURCES}
+    ${COMMON_SOURCES}
+)
+
+# 测试部分（原注释掉的 add_subdirectory 启用）：
+# 单元测试（test_protocol / test_frame_pool）
+enable_testing()
+add_subdirectory(tests)
+```
+
+**`tests/CMakeLists.txt`**：
+
+```cmake
+# ============================================================
+# 帧池单元测试（FramePool：双缓冲 + 引用计数）
+# 纯 C++17 + Qt 头文件（types.h 的 PixelFormat 依赖 QtCore）
+# ============================================================
+add_executable(test_frame_pool
+    test_frame_pool.cpp
+)
+
+target_include_directories(test_frame_pool PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+find_package(Qt5 REQUIRED COMPONENTS Core)
+target_link_libraries(test_frame_pool PRIVATE
+    Threads::Threads
+    Qt5::Core
+)
+
+add_test(NAME test_frame_pool COMMAND test_frame_pool)
+set_tests_properties(test_frame_pool PROPERTIES
+    TIMEOUT 30
+)
+```
+
+---
+
 ## 附：变更历史
 
 | 日期 | commit | 内容 |
@@ -648,6 +1432,7 @@ git pull origin main   # 恢复正常
 | 2026-08-03 | `f0d9ce0` | **Phase 2**：RGB 显示池接入 GUI（setFrameShared + m_heldSlot） |
 | 2026-08-03 | `9755549` | 修正 PERF 插桩（帧池路径下 RGB 零拷贝不入 copyBytes） |
 | 2026-08-03 | `4c634e6` | 文档：#26 git/curl 排查（LD_LIBRARY_PATH 污染）+ README 单行运行建议 |
-| 2026-08-03 | 本文档 v1.1 | Phase 1~3 完成 + 实测数据（§8/§10）+ git 排查（§11） |
+| 2026-08-03 | `59ad5de` | 实施指南 v1.1（Phase 1~3 完成 + 实测数据） |
+| 2026-08-03 | 本文档 v1.2 | 新增 §12 全部新增/修改代码完整内容 |
 | 待定 | Phase 4 | 稳定性验证（1h 运行、720p 压测）+ 同步 plan/面试文档 |
 | 待定 | P0 主线 | 低分辨率显示解码（320x240） |
