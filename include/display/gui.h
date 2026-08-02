@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "include/common/types.h"
+#include "include/common/frame_pool.h"
 #include "include/display/gallery.h"
 
 /**
@@ -48,6 +49,17 @@ public:
      * @param fmt     格式
      */
     void setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
+
+    /**
+     * @brief 接收一帧共享槽（帧池零拷贝路径）
+     *
+     * GUI 持有该槽引用（m_heldSlot），refreshFrame 用 QImage 浅引用直接绘制，
+     * 消除 setFrame 的 m_frameBuffer.assign 与 frameToQImage 的 .copy() 两次深拷贝。
+     * 调用方须保证 slot 是 RGB24 格式。
+     *
+     * @param slot 共享帧槽（调用方通过 FramePool::share 取得，GUI 接管引用）
+     */
+    void setFrameShared(FrameSlot* slot);
 
     /**
      * @brief 更新状态栏信息
@@ -171,7 +183,8 @@ private:
 
     // ====== 数据 ======
     FrameBuffer  m_currentFrame;
-    std::vector<uint8_t> m_frameBuffer;  // 内部帧数据拷贝（避免指针悬垂）
+    std::vector<uint8_t> m_frameBuffer;  // 内部帧数据拷贝（避免指针悬垂，旧路径）
+    FrameSlot*   m_heldSlot       = nullptr;  // 帧池共享槽引用（零拷贝路径，GUI 持有）
     bool         m_isRecording    = false;
     bool         m_mockMode       = false;
 

@@ -1,6 +1,10 @@
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
 #include <QApplication>
+
+// RGB 显示帧池（在 main.cpp 定义）：帧池零拷贝路径的共享池
+// GUI 通过它 share/release 显示槽
+extern FramePool* g_rgbPool;
 #include <QScreen>
 #include <QPainter>
 #include <QImage>
@@ -106,7 +110,13 @@ CameraGUI::CameraGUI(QWidget* parent)
     m_labelRecording->setStyleSheet("color: gray;");
 }
 
-CameraGUI::~CameraGUI() = default;
+CameraGUI::~CameraGUI() {
+    // 释放帧池共享槽引用（防泄漏；此时 g_rgbPool 可能已析构，需判空）
+    if (m_heldSlot && g_rgbPool) {
+        g_rgbPool->release(m_heldSlot);
+        m_heldSlot = nullptr;
+    }
+}
 
 // ============================================================
 // UI 构建
@@ -289,11 +299,20 @@ void CameraGUI::refreshFrame() {
     }
 
     // 转换为 QImage 并渲染
-    QImage img = frameToQImage(m_currentFrame.data,
-                                m_currentFrame.length,
-                                m_currentFrame.width,
-                                m_currentFrame.height,
-                                m_currentFrame.format);
+    QImage img;
+    if (m_heldSlot) {
+        // ---- 零拷贝路径：QImage 浅引用共享槽（不 .copy()）----
+        // m_heldSlot 保证数据生命周期有效；QImage 是临时对象，作用域结束即毁
+        const int w = m_currentFrame.width;
+        const int h = m_currentFrame.height;
+        img = QImage(m_currentFrame.data, w, h, w * 3, QImage::Format_RGB888);
+    } else {
+        img = frameToQImage(m_currentFrame.data,
+                            m_currentFrame.length,
+                            m_currentFrame.width,
+                            m_currentFrame.height,
+                            m_currentFrame.format);
+    }
     if (!img.isNull()) {
         m_videoDisplay->setPixmap(QPixmap::fromImage(img));
     }
@@ -462,6 +481,29 @@ void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat
     m_currentFrame.width  = w;
     m_currentFrame.height = h;
     m_currentFrame.format = fmt;
+    m_currentFrame.index++;
+
+    m_mockMode = false;
+}
+
+void CameraGUI::setFrameShared(FrameSlot* slot) {
+    if (!slot) return;
+
+    // 1. 释放上一帧持有的槽引用（若有）
+    if (m_heldSlot) {
+        if (g_rgbPool) g_rgbPool->release(m_heldSlot);
+        m_heldSlot = nullptr;
+    }
+
+    // 2. 持有新帧槽引用（slot 的 refs 已由 share() +1，GUI 接管）
+    m_heldSlot = slot;
+
+    // 3. m_currentFrame 直接指向共享数据（零拷贝）
+    m_currentFrame.data   = slot->data.data();
+    m_currentFrame.length = static_cast<int>(slot->data.size());
+    m_currentFrame.width  = slot->width;
+    m_currentFrame.height = slot->height;
+    m_currentFrame.format = PixelFormat::FMT_RGB24;   // 显示槽固定 RGB24
     m_currentFrame.index++;
 
     m_mockMode = false;

@@ -16,6 +16,8 @@
  *   尾部:   < 16 像素的残量退化为标量 C++ 循环
  */
 
+#ifdef __ARM_NEON
+
 #include <arm_neon.h>
 #include <cstdint>
 #include <cstddef>
@@ -151,3 +153,15 @@ void yuyv_to_rgb24_neon(const uint8_t* yuyv, uint8_t* rgb,
         *dst++ = clip(y1 + ((u * YUV_B + 128) >> 8));
     }
 }
+
+#else  // !__ARM_NEON（x86 PC 调试模式）
+
+// 非 ARM 平台无 NEON 加速：提供空实现避免链接错误。
+// 调用方（gui.h yuyv_to_rgb24）在非 ARM 下走标量版本，不会调用本函数。
+#include <cstdint>
+void yuyv_to_rgb24_neon(const uint8_t* /*yuyv*/, uint8_t* /*rgb*/,
+                         int /*width*/, int /*height*/) {
+    // 非 ARM 平台不应被调用；空实现仅为满足符号存在性。
+}
+
+#endif // __ARM_NEON

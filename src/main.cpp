@@ -44,6 +44,7 @@
 #include "include/storage/manager.h"
 #include "include/common/logger.h"
 #include "include/common/config.h"
+#include "include/common/frame_pool.h"
 
 // ============================================================
 // 全局共享状态（采集线程 → GUI 线程 / 存储线程）
@@ -99,6 +100,14 @@ struct PerfStats {
     double                snapTime  = 0.0;
 };
 static PerfStats g_perf;
+
+// ============================================================
+// RGB 显示帧池（帧池零拷贝路径）
+// ============================================================
+// 生产者：displayTimer（GUI 线程内解码 → 写入槽 → publish）
+// 消费者：GUI refreshFrame（share → 浅引用 QImage 绘制 → release）
+// 容量 2：GUI 持 1 槽 + 解码写 1 槽，天然双缓冲，无需锁。
+FramePool* g_rgbPool = nullptr;
 
 /** @brief 读取 /proc/self/stat 的 utime+stime（第 14+15 字段，单位 jiffies） */
 static uint64_t readSelfCpuJiffies() {
@@ -363,6 +372,11 @@ int main(int argc, char* argv[]) {
     std::thread*      rtspThread   = nullptr;
 
     if (!device.isEmpty()) {
+        // ============================================================
+        // 初始化 RGB 显示帧池（容量 2：GUI 持 1 + 解码写 1）
+        // ============================================================
+        g_rgbPool = new FramePool(2);
+
         // ============================================================
         // 初始化 V4L2 摄像头
         // ============================================================
@@ -989,29 +1003,72 @@ int main(int argc, char* argv[]) {
         });
 
         // ============================================================
-        // 显示定时器（Qt 主线程，33ms ≈ 30fps）
+        // 显示定时器（Qt 主线程，33ms ≈ 30fps）— 帧池零拷贝路径
         // ============================================================
+        // 流程：借 rgb 槽 → 解码/转换入槽 → publish → share → setFrameShared
+        // 消除了旧路径的 2 次 RGB24 深拷贝（setFrame 内 assign + QImage.copy()）。
+        // 解码仍在 GUI 线程（单核板上线程无并行收益，见 docs 实施指南 §2.3）。
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
         QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
-            std::lock_guard<std::mutex> lock(g_state.mtx);
-            if (g_state.frameData.empty()) return;
+            // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
+            FrameSlot* slot = g_rgbPool->acquire();
+            if (!slot) return;
 
-            // [PERF] ③ setFrame 内部 m_frameBuffer.assign 的深拷贝（原始帧大小）
-            g_perf.copyBytes += g_state.frameData.size();
-            // [PERF] ④ frameToQImage 解码后 QImage(...).copy()（RGB24 = w*h*3）
-            g_perf.copyBytes += static_cast<uint64_t>(g_state.width) *
-                                g_state.height * 3;
-            // [PERF] ⑤ QPixmap::fromImage 上屏拷贝（RGB24，单独标注为必需）
-            g_perf.pixBytes += static_cast<uint64_t>(g_state.width) *
-                               g_state.height * 3;
+            // 2. 取原始帧数据（短锁拷贝出共享区）
+            std::vector<uint8_t> raw;
+            int srcW = 0, srcH = 0;
+            PixelFormat srcFmt = PixelFormat::FMT_RGB24;
+            {
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                if (g_state.frameData.empty()) {
+                    g_rgbPool->release(slot);
+                    return;
+                }
+                raw    = g_state.frameData;   // 原始帧拷贝（JPEG ~0.1MB，唯一）
+                srcW   = g_state.width;
+                srcH   = g_state.height;
+                srcFmt = g_state.format;
+            }
 
-            // 直接使用 GUI 的 setFrame 接口
-            // 内部 frameToQImage() 会处理 YUYV→RGB24 转换并深拷贝到 QImage
-            gui.setFrame(g_state.frameData.data(),
-                         static_cast<int>(g_state.frameData.size()),
-                         g_state.width, g_state.height,
-                         g_state.format);
+            // 3. 解码/转换为 RGB24，直接写入池槽（消除 setFrame 的二次拷贝）
+            slot->width  = srcW;
+            slot->height = srcH;
+            slot->format = PixelFormat::FMT_RGB24;
+            if (srcFmt == PixelFormat::FMT_MJPEG) {
+#ifdef HAS_LIBJPEG
+                int dw = 0, dh = 0;
+                if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
+                                                    slot->data, dw, dh)) {
+                    slot->width  = dw;
+                    slot->height = dh;
+                } else {
+                    g_rgbPool->release(slot);   // 坏帧丢帧
+                    return;
+                }
+#endif
+            } else if (srcFmt == PixelFormat::FMT_YUYV) {
+                slot->data.resize(static_cast<size_t>(srcW) * srcH * 3);
+                VideoProcessor::yuyvToRgb24(raw.data(), slot->data.data(), srcW, srcH);
+            } else {   // FMT_RGB24：直拷
+                slot->data = std::move(raw);
+            }
+
+            // [PERF] ③④ 已消除：不再有 setFrame assign / QImage.copy()
+            // [PERF] ① 采集线程拷贝 + 本函数 raw 拷贝已在采集线程统计
+            // [PERF] ⑤ 上屏拷贝仍在 refreshFrame（浅引用 QImage → setPixmap）
+            g_perf.copyBytes += static_cast<uint64_t>(slot->width) *
+                                slot->height * 3;   // 记录上屏前最后一次 RGB 就绪
+            g_perf.pixBytes += static_cast<uint64_t>(slot->width) *
+                               slot->height * 3;    // ⑤ 上屏（浅引用构造后 setPixmap）
+
+            // 4. 发布并交 GUI 共享（setFrameShared 内部持有引用，零拷贝上屏）
+            slot->seq++;
+            g_rgbPool->publish(slot);
+            FrameSlot* displaySlot = g_rgbPool->share();
+            if (displaySlot) {
+                gui.setFrameShared(displaySlot);   // GUI 接管此引用
+            }
 
             gui.setFPS(g_state.fps);
             gui.setClientCount(mjpegServer->clientCount());
@@ -1316,6 +1373,10 @@ int main(int argc, char* argv[]) {
         capture->release();
         delete capture;
     }
+
+    // g_rgbPool 不在此 delete：GUI(gui) 是栈对象，其 m_heldSlot 引用在函数返回后
+    // 的析构中释放；若在此 delete 池，gui 析构时 g_rgbPool 已悬垂。
+    // 池内存极小（2 槽 ≈ 1.84MB），进程退出时由 OS 回收。
 
     return ret;
 }

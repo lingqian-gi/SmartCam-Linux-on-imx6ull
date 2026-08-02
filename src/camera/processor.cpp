@@ -17,6 +17,7 @@
 // libjpeg-turbo — 必须在文件作用域包含（含 extern "C" 包裹）
 #ifdef HAS_LIBJPEG
 #include <jpeglib.h>
+#include <setjmp.h>   // JPEG 解码错误跳转
 #endif
 
 // ============================================================
@@ -223,4 +224,73 @@ int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
     yuyvToRgb24(yuyv, rgb.data(), width, height);
 
     return encodeRGBtoJPEG(rgb.data(), width, height, quality, jpeg_out, jpeg_len);
+}
+
+// ============================================================
+// JPEG 解码（libjpeg-turbo，静默坏帧）
+// ============================================================
+
+#ifdef HAS_LIBJPEG
+namespace {
+
+// libjpeg 自定义错误管理器：坏帧时 longjmp 回 setjmp 点，避免默认 exit()
+struct JpegErrorMgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+void jpegSilentErrorExit(j_common_ptr cinfo) {
+    JpegErrorMgr* myerr = reinterpret_cast<JpegErrorMgr*>(cinfo->err);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+void jpegSilentOutputMessage(j_common_ptr /*cinfo*/) {
+    /* 完全静默 — 不输出任何警告（坏帧在实时流中是常态） */
+}
+
+} // namespace
+#endif // HAS_LIBJPEG
+
+bool VideoProcessor::decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                     std::vector<uint8_t>& rgb, int& out_w, int& out_h) {
+#ifdef HAS_LIBJPEG
+    struct jpeg_decompress_struct cinfo;
+    JpegErrorMgr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit     = jpegSilentErrorExit;      // 替换默认 exit()
+    jerr.pub.output_message = jpegSilentOutputMessage;  // 静默 stderr 警告
+
+    // 解码错误时 longjmp 回到这里（先 destroy，避免泄漏，再返回失败）
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+
+    out_w = static_cast<int>(cinfo.output_width);
+    out_h = static_cast<int>(cinfo.output_height);
+    rgb.resize(static_cast<size_t>(out_w) * out_h * 3);
+
+    // 逐行解码到 RGB24
+    while (cinfo.output_scanline < static_cast<JDIMENSION>(out_h)) {
+        JSAMPROW row = rgb.data() + cinfo.output_scanline * out_w * 3;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+#else
+    (void)jpeg_data;
+    (void)jpeg_len;
+    (void)rgb;
+    (void)out_w;
+    (void)out_h;
+    return false;
+#endif
 }
