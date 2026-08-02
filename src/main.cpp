@@ -458,6 +458,39 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        // ★ 最小采集诊断模式：SMARTCAM_MIN_CAPTURE=1 时只跑采集线程
+        //   （跳过控制查询/服务器/处理/解码线程），用于二分定位
+        //   "采集核心" vs "其他部分干扰摄像头"（v4l2-ctl 能持续抓帧而程序只 1 帧）
+        {
+            const char* minCapEnv = getenv("SMARTCAM_MIN_CAPTURE");
+            bool minCapture = minCapEnv && minCapEnv[0] == '1';
+            if (minCapture) {
+                if (capture->startCapture() < 0) {
+                    LOG_ERR_("MIN_CAPTURE: startCapture failed");
+                    delete capture;
+                    return 1;
+                }
+                LOG_INF("MIN_CAPTURE mode: capture-only (Ctrl+C to stop)");
+                std::thread capT([capture]() {
+                    FrameBuffer fb;
+                    uint64_t n = 0;
+                    while (g_state.running) {
+                        if (capture->getFrame(&fb, -1) < 0) continue;
+                        n++;
+                        LOG_INF("MIN_CAPTURE: frame %llu bytes=%d",
+                                (unsigned long long)n, fb.length);
+                        capture->putFrame(&fb);
+                    }
+                });
+                capT.detach();
+                gui.show();
+                int rc = app.exec();
+                g_state.running = false;
+                if (capture) capture->release();
+                return rc;
+            }
+        }
+
         Resolution curRes = capture->getCurrentResolution();
         uint32_t   curFmt = capture->getCurrentFormat();
         LOG_INF("Active format: %dx%d, fmt='%c%c%c%c'",
