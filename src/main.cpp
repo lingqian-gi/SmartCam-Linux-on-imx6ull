@@ -27,6 +27,7 @@
 #include <QDebug>
 #include <QImage>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -514,37 +515,51 @@ int main(int argc, char* argv[]) {
                 LOG_INF("Auto WB: cur=%d", val);
             }
 
-            // 自动曝光 → 查询并设置 GUI，同时强制手动模式防帧率下降
+            // 自动曝光 → 查询并更新 GUI
+            // ★ 修复：默认不再强制设置曝光——部分 UVC 摄像头（如 32e6:9221）
+            //   在手动曝光下会固件卡死（只输出首帧后停流，DQBUF 永久阻塞）。
+            //   需要强制曝光时显式设置环境变量 SMARTCAM_FORCE_EXPOSURE=<绝对值>。
             {
+                const char* forceExp = getenv("SMARTCAM_FORCE_EXPOSURE");
+                int forceExpVal = forceExp ? atoi(forceExp) : 0;
+
                 int expMin, expMax, expStep, expDef, expVal;
                 if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO,
                                            expMin, expMax, expStep, expDef) == 0) {
                     capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO, expVal);
-                    LOG_INF("Auto Exposure: cur=%d (1=manual, 3=auto)", expVal);
-                    // V4L2_EXPOSURE_MANUAL = 1，强制手动模式以保持帧率
-                    if (expVal != 1) {
+                    LOG_INF("Auto Exposure: cur=%d (1=manual, 3=auto)%s",
+                            expVal, forceExpVal > 0 ? " [will force manual]" : "");
+                    if (forceExpVal > 0 && expVal != 1) {
                         capture->setControl(
                             static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO), 1);
-                        LOG_INF("Auto Exposure disabled (set to manual) to preserve framerate");
+                        LOG_INF("Auto Exposure disabled (forced manual) per SMARTCAM_FORCE_EXPOSURE");
                     }
                     gui.setAutoExposure(false);  // 初始默认关闭自动曝光
                 }
 
-                // 曝光绝对值
-                int absMin, absMax, absStep, absDef, absCur;
+                // 曝光绝对值：查询范围供 GUI 滑块；仅显式要求时写硬件
+                int absMin, absMax, absStep, absDef;
                 if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
                                            absMin, absMax, absStep, absDef) == 0) {
-                    capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
-                    int targetExposure = (absCur > 0) ? absCur : (absDef > 0 ? absDef : 312);
-                    if (targetExposure < absMin) targetExposure = absMin;
-                    if (targetExposure > absMax) targetExposure = absMax;
-                    if (targetExposure > 300) targetExposure = 300;  // 30fps要求曝光<33ms
-                    capture->setControl(
-                        static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
-                        targetExposure);
-                    gui.setExposureRange(absMin, absMax, absStep, targetExposure);
-                    LOG_INF("Exposure: range=[%d,%d] step=%d, set to %d",
-                             absMin, absMax, absStep, targetExposure);
+                    if (forceExpVal > 0) {
+                        int target = forceExpVal;
+                        if (target < absMin) target = absMin;
+                        if (target > absMax) target = absMax;
+                        capture->setControl(
+                            static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
+                            target);
+                        gui.setExposureRange(absMin, absMax, absStep, target);
+                        LOG_INF("Exposure forced to %d (SMARTCAM_FORCE_EXPOSURE)", target);
+                    } else {
+                        // 不写硬件：GUI 滑块仅显示当前值，曝光保持自动
+                        int absCur = 0;
+                        capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
+                                            absCur);
+                        int def = (absCur > 0) ? absCur : (absDef > 0 ? absDef : absMin);
+                        gui.setExposureRange(absMin, absMax, absStep, def);
+                        LOG_INF("Exposure: not forced (auto), range=[%d,%d] cur=%d",
+                                absMin, absMax, absCur);
+                    }
                 }
             }
 
