@@ -132,6 +132,27 @@ public:
     // 工具方法
     // ============================================================
 
+    // ============================================================
+    // JPEG 解码（libjpeg-turbo，静默坏帧）
+    // ============================================================
+
+    /**
+     * @brief 将 JPEG/MJPEG 单帧解码为 RGB24
+     *
+     * 用于独立解码线程：MJPEG/YUYV → RGB24 不在 GUI 线程执行，
+     * 避免 ~25ms 解码阻塞 Qt 事件循环（掉帧/按钮无响应）。
+     * 坏帧时静默返回 false（不输出 stderr 警告）。
+     *
+     * @param jpeg_data  JPEG 数据
+     * @param jpeg_len   数据长度
+     * @param rgb        输出：RGB24 像素 (w*h*3 字节，自动分配)
+     * @param out_w      输出：图像宽度
+     * @param out_h      输出：图像高度
+     * @return true 解码成功；false 解码失败（坏帧/未编译 HAS_LIBJPEG）
+     */
+    static bool decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                std::vector<uint8_t>& rgb, int& out_w, int& out_h);
+
     /**
      * @brief 计算 RGB24 图像所需缓冲区大小
      */
