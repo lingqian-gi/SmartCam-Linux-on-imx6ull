@@ -754,7 +754,12 @@ void RTSPServer::sendRTSPResponse(
 
 void RTSPServer::feedFrame(const uint8_t* jpeg_data, size_t len,
                             int width, int height) {
-    if (!m_running) return;
+    if (!m_running) {
+        LOG_DBG("rtsp: feedFrame SKIPPED (server not running)");
+        return;
+    }
+
+    LOG_DBG("rtsp: feedFrame len=%zu %dx%d", len, width, height);
 
     // 存储最新帧（供后续客户端使用）
     {

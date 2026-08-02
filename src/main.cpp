@@ -40,6 +40,9 @@
 #include <ucontext.h>    // ucontext_t / mcontext_t（崩溃现场寄存器）
 #include <dlfcn.h>       // dladdr：解析崩溃地址所属共享库与符号
 #include <unistd.h>
+#include <ifaddrs.h>     // getifaddrs：查询本机 IP
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
@@ -143,6 +146,29 @@ static void crashSignalHandler(int sig, siginfo_t* /*si*/, void* ucontext) {
     backtrace_symbols_fd(frames, n, 2);
     dprintf(2, "===== end backtrace =====\n");
     _exit(128 + sig);
+}
+
+// 查询本机第一个非回环 IPv4 地址（用于打印访问地址，替代 <dev-ip> 占位符）
+// 失败返回空串，调用方回退占位符
+static std::string getLocalIP() {
+    struct ifaddrs* ifaddr = nullptr;
+    std::string ip;
+    if (getifaddrs(&ifaddr) == 0) {
+        for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            // 跳过回环 (127.x) 与未配置地址 (0.x)
+            const auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+            uint32_t a = ntohl(sin->sin_addr.s_addr);
+            if ((a >> 24) == 127 || (a >> 24) == 0) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+                ip = buf;
+                break;
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+    return ip;
 }
 
 // 安装崩溃信号处理器（SA_RESETHAND：处理器内二次崩溃则恢复默认，避免递归）
@@ -861,13 +887,15 @@ int main(int argc, char* argv[]) {
 
                 if (capture->getFrame(&fb, 1000) < 0) {
                     if (!g_state.running) break;
+                    LOG_DBG("capture: getFrame timeout (1000ms)");
                     continue;  // 超时重试
                 }
 
                 // 诊断：打印采集到的帧字节数（bytesused=0 表示摄像头未输出有效数据）
-                LOG_DBG("capture: frame %d bytes fmt=%d %dx%d",
+                LOG_DBG("capture: got frame %d bytes fmt=%d %dx%d seq=%llu",
                         fb.length, static_cast<int>(fb.format),
-                        fb.width, fb.height);
+                        fb.width, fb.height,
+                        (unsigned long long)(g_state.frameSeq.load() + 1));
 
                 // ---- 帧率节流 ----
                 if (throttleFps > 0) {
@@ -878,6 +906,8 @@ int main(int argc, char* argv[]) {
 
                     if (elapsedMs < minIntervalMs) {
                         capture->putFrame(&fb);
+                        LOG_DBG("capture: throttle skip frame (%d fps)",
+                                throttleFps);
                         continue;
                     }
                     lastOutputTime = now;
@@ -923,6 +953,8 @@ int main(int argc, char* argv[]) {
                     });
                     g_state.frameReady = false;
                 }
+                LOG_DBG("process: woken up (seq=%llu)",
+                        (unsigned long long)g_state.frameSeq.load());
 
                 if (!g_state.running) break;
 
@@ -1286,8 +1318,14 @@ int main(int argc, char* argv[]) {
         qInfo() << "控制端口:" << ctrlPort;
         qInfo() << "存储:" << QString::fromStdString(photoDir) << " / " << QString::fromStdString(videoDir);
         qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "❌ 启动失败");
-        qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
-        qInfo() << "VLC 播放:   rtsp://<dev-ip>:" << rtspPort << "/stream";
+        // 自动查询本机 IP，替代 <dev-ip> 占位符（查不到则回退占位符）
+        std::string devIP = getLocalIP();
+        if (devIP.empty()) {
+            LOG_WRN("getLocalIP() failed, using <dev-ip> placeholder");
+            devIP = "<dev-ip>";
+        }
+        qInfo() << "浏览器打开: http://" << devIP.c_str() << ":" << httpPort << "/";
+        qInfo() << "VLC 播放:   rtsp://" << devIP.c_str() << ":" << rtspPort << "/stream";
         qInfo() << "==============================================";
 
     } else {
