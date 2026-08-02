@@ -75,6 +75,86 @@ static std::atomic<bool> g_recording{false};
 // 存储管理器（全局单例指针，线程安全）
 static StorageManager* g_storage = nullptr;
 
+// ============================================================
+// 性能插桩：拷贝字节统计（A/B 对比帧池改造用，改造前后共用）
+// ============================================================
+// 统计一帧从摄像头到屏幕的全部 memcpy 字节数：
+//   ① 采集线程   memcpy → g_state.frameData        (原始帧 JPEG/YUYV)
+//   ② 处理线程   localFrame = g_state.frameData     (原始帧，推流/录像)
+//   ③ setFrame   m_frameBuffer.assign               (原始帧，GUI 内部)
+//   ④ 解码后     QImage(...).copy()                 (RGB24，解码结果上屏前拷贝)
+//   ⑤ QPixmap::fromImage                            (RGB24，上屏必需拷贝)
+// 每 5s 打印一次：[PERF] copy=xx.xMB/s frames=xxfps cpu=xx% rss=xxMB
+// 改造前后跑同场景直接对比输出即可。
+struct PerfStats {
+    std::atomic<uint64_t> copyBytes{0};    // 累计拷贝字节数（①②③④）
+    std::atomic<uint64_t> pixBytes{0};     // 累计上屏拷贝字节数（⑤，单独标注）
+    std::atomic<uint64_t> frames{0};       // 累计处理帧数（采集线程 +1）
+    std::atomic<uint64_t> cpuJiffies{0};   // 累计 CPU jiffies（utime+stime）
+    // 上次采样快照（仅主线程 PERF 定时器读写）
+    uint64_t              snapBytes = 0;
+    uint64_t              snapPix   = 0;
+    uint64_t              snapFrames= 0;
+    uint64_t              snapCpu   = 0;
+    double                snapTime  = 0.0;
+};
+static PerfStats g_perf;
+
+/** @brief 读取 /proc/self/stat 的 utime+stime（第 14+15 字段，单位 jiffies） */
+static uint64_t readSelfCpuJiffies() {
+    FILE* fp = fopen("/proc/self/stat", "r");
+    if (!fp) return 0;
+    char buf[512] = {0};
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return 0; }
+    fclose(fp);
+    // 跳过 "pid (comm) state ..."：comm 可能含空格/括号，从最后一个 ')' 后解析
+    char* p = strrchr(buf, ')');
+    if (!p) return 0;
+    unsigned long long utime = 0, stime = 0;
+    // ')' 后是 " state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
+    //   utime stime ..." → utime 是第 12 个字段（从 state 算起第 3 个数值）
+    // 简化：sscanf 跳过 state(1) ppid(2) pgrp(3) session(4) tty(5) tpgid(6) flags(7)
+    //        minflt(8) cminflt(9) majflt(10) cmajflt(11) utime(12) stime(13)
+    int skipped = 0; char state = 0; unsigned long long tmp = 0;
+    char* tok = p + 1;
+    while (skipped < 12 && tok) {
+        // 第 1 个 token 是 state（字符）
+        if (skipped == 0) {
+            while (*tok == ' ') ++tok;
+            state = *tok;
+            tok = strchr(tok, ' ') + 1;
+            skipped = 1;
+            continue;
+        }
+        while (*tok == ' ') ++tok;
+        sscanf(tok, "%llu", &tmp);
+        tok = strchr(tok, ' ') + 1;
+        skipped++;
+    }
+    // skipped==12 时 tmp 即 utime；再读一个为 stime
+    utime = tmp;
+    while (*tok == ' ') ++tok;
+    sscanf(tok, "%llu", &stime);
+    return utime + stime;
+}
+
+/** @brief 读取 /proc/self/status 的 VmRSS（KB） */
+static long readSelfRssKB() {
+    FILE* fp = fopen("/proc/self/status", "r");
+    if (!fp) return 0;
+    char line[256];
+    long rss = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%ld", &rss);
+            break;
+        }
+    }
+    fclose(fp);
+    return rss;
+}
+
+
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("SmartCam");
@@ -811,6 +891,9 @@ int main(int argc, char* argv[]) {
                     g_state.format = fb.format;
                     g_state.fps    = capture->getCurrentFPS();
                 }
+                // [PERF] ① 采集线程 → g_state.frameData 的 memcpy
+                g_perf.copyBytes += fb.length;
+                g_perf.frames++;   // 计为"处理帧数"（一帧的入口）
 
                 // 立即归还 V4L2 缓冲区，让硬件可以写入下一帧
                 capture->putFrame(&fb);
@@ -854,6 +937,8 @@ int main(int argc, char* argv[]) {
                     localH   = g_state.height;
                     localFmt = g_state.format;
                 }
+                // [PERF] ② 处理线程 localFrame 深拷贝（推流/录像用）
+                g_perf.copyBytes += localFrame.size();
 
                 // YUYV → JPEG 编码（CPU 密集，不阻塞采集线程）
                 bool needEncode = (localFmt == PixelFormat::FMT_YUYV) &&
@@ -912,6 +997,15 @@ int main(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lock(g_state.mtx);
             if (g_state.frameData.empty()) return;
 
+            // [PERF] ③ setFrame 内部 m_frameBuffer.assign 的深拷贝（原始帧大小）
+            g_perf.copyBytes += g_state.frameData.size();
+            // [PERF] ④ frameToQImage 解码后 QImage(...).copy()（RGB24 = w*h*3）
+            g_perf.copyBytes += static_cast<uint64_t>(g_state.width) *
+                                g_state.height * 3;
+            // [PERF] ⑤ QPixmap::fromImage 上屏拷贝（RGB24，单独标注为必需）
+            g_perf.pixBytes += static_cast<uint64_t>(g_state.width) *
+                               g_state.height * 3;
+
             // 直接使用 GUI 的 setFrame 接口
             // 内部 frameToQImage() 会处理 YUYV→RGB24 转换并深拷贝到 QImage
             gui.setFrame(g_state.frameData.data(),
@@ -923,6 +1017,50 @@ int main(int argc, char* argv[]) {
             gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
+
+        // ============================================================
+        // 性能统计定时器（每 5s 打印一次 [PERF] 行，A/B 对比用）
+        // ============================================================
+        QTimer* perfTimer = new QTimer(&gui);
+        perfTimer->setInterval(5000);
+        QObject::connect(perfTimer, &QTimer::timeout, []() {
+            uint64_t bytes  = g_perf.copyBytes.load();
+            uint64_t pix    = g_perf.pixBytes.load();
+            uint64_t frames = g_perf.frames.load();
+            uint64_t cpu    = g_perf.cpuJiffies.load();
+            double now = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            double dt = now - g_perf.snapTime;
+            if (dt <= 0.0) { g_perf.snapTime = now; return; }
+
+            double copyMB = (bytes - g_perf.snapBytes) / dt / 1e6;
+            double pixMB  = (pix   - g_perf.snapPix)   / dt / 1e6;
+            double fps    = (frames - g_perf.snapFrames) / dt;
+            double cpuPct = (cpu - g_perf.snapCpu) / dt / 100.0 * 100.0;  // jiffies=100Hz
+            long   rssKB = readSelfRssKB();
+
+            // 更新快照
+            g_perf.snapBytes  = bytes;
+            g_perf.snapPix    = pix;
+            g_perf.snapFrames = frames;
+            g_perf.snapCpu    = cpu;
+            g_perf.snapTime   = now;
+
+            // 采集线程记录 CPU 用 main 线程视角不准，改用 /proc/self 全进程统计：
+            // 此处直接用 readSelfCpuJiffies 的差值（覆盖所有线程）
+            static uint64_t lastSelfCpu = 0;
+            uint64_t selfCpu = readSelfCpuJiffies();
+            if (lastSelfCpu > 0) {
+                double cpuPctAll = (selfCpu - lastSelfCpu) / dt / 100.0 * 100.0;
+                LOG_INF("[PERF] copy=%.1fMB/s (+pix %.1f) frames=%.1ffps cpu=%.0f%% rss=%ldKB",
+                        copyMB, pixMB, fps, cpuPctAll, rssKB);
+            } else {
+                LOG_INF("[PERF] copy=%.1fMB/s (+pix %.1f) frames=%.1ffps cpu=%.0f%% rss=%ldKB",
+                        copyMB, pixMB, fps, cpuPct, rssKB);
+            }
+            lastSelfCpu = selfCpu;
+        });
+        perfTimer->start();
 
         // ============================================================
         // 连接回调：分辨率/格式变更 → 重新配置摄像头
