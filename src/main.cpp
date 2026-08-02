@@ -1410,6 +1410,12 @@ int main(int argc, char* argv[]) {
     g_state.running = false;
     g_state.procCv.notify_all();  // 唤醒处理线程使其退出
 
+    // ★ 先释放摄像头（STREAMOFF 唤醒阻塞在 DQBUF 的采集线程），再 join，
+    //   否则阻塞 DQBUF 永不返回会导致 join 卡死
+    if (capture) {
+        capture->release();
+    }
+
     if (captureThread && captureThread->joinable()) {
         captureThread->join();
         delete captureThread;
@@ -1453,8 +1459,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (capture) {
-        capture->release();
-        delete capture;
+        delete capture;   // 已在上面提前 release（STREAMOFF 唤醒采集线程）
     }
 
     return ret;

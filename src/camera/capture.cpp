@@ -699,24 +699,13 @@ int CameraCapture::dequeueBuffer(struct v4l2_buffer& buf, int timeout_ms) {
     buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    // 使用 select 实现超时
-    if (timeout_ms > 0) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(m_fd, &fds);
-
-        struct timeval tv;
-        tv.tv_sec  = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        int ret = select(m_fd + 1, &fds, nullptr, nullptr, &tv);
-        if (ret < 0) {
-            return -errno;
-        }
-        if (ret == 0) {
-            return -ETIMEDOUT;  // 超时
-        }
-    }
+    // ★ 修复：直接阻塞 DQBUF（与 v4l2-ctl 的采集方式一致）。
+    // 此前用 select 预判"fd 可读"再 DQBUF，但某些 uvcvideo/摄像头组合下，
+    // select 报告可读后 DQBUF 仍阻塞（驱动迟迟不返回完成帧），
+    // 导致采集线程卡死、只输出首帧后停流（推流/录像全链路无数据）。
+    // 阻塞 DQBUF 由内核正确等待帧完成；程序退出时通过 STREAMOFF 唤醒
+    // （DQBUF 返回错误 → getFrame<0 → 采集线程检测 running=false 退出）。
+    (void)timeout_ms;
 
     if (ioctl(m_fd, VIDIOC_DQBUF, &buf) < 0) {
         LOG_ERR_("VIDIOC_DQBUF failed: %s", strerror(errno));
