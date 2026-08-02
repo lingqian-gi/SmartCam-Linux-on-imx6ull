@@ -1054,13 +1054,13 @@ int main(int argc, char* argv[]) {
                 slot->data = std::move(raw);
             }
 
-            // [PERF] ③④ 已消除：不再有 setFrame assign / QImage.copy()
-            // [PERF] ① 采集线程拷贝 + 本函数 raw 拷贝已在采集线程统计
-            // [PERF] ⑤ 上屏拷贝仍在 refreshFrame（浅引用 QImage → setPixmap）
-            g_perf.copyBytes += static_cast<uint64_t>(slot->width) *
-                                slot->height * 3;   // 记录上屏前最后一次 RGB 就绪
+            // [PERF] ③④ 已消除：解码直接写池槽（零拷贝），不再有 setFrame assign / QImage.copy()
+            // [PERF] 本函数 raw = g_state.frameData 是一次原始帧拷贝（JPEG ~0.1MB），计入
+            g_perf.copyBytes += raw.size();
+            // [PERF] ⑤ 上屏拷贝：QImage 浅引用构造（不拷贝）→ setPixmap 时 QPixmap::fromImage
+            //          做一次 RGB24 拷贝（上屏必需），计入 pixBytes
             g_perf.pixBytes += static_cast<uint64_t>(slot->width) *
-                               slot->height * 3;    // ⑤ 上屏（浅引用构造后 setPixmap）
+                               slot->height * 3;
 
             // 4. 发布并交 GUI 共享（setFrameShared 内部持有引用，零拷贝上屏）
             slot->seq++;
