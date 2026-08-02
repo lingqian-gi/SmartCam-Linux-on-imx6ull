@@ -37,6 +37,7 @@
 #include <arpa/inet.h>
 #include <signal.h>      // 崩溃信号处理
 #include <execinfo.h>    // backtrace
+#include <ucontext.h>    // ucontext_t / mcontext_t（崩溃现场寄存器）
 #include <unistd.h>
 
 #include "include/display/gui.h"
@@ -88,11 +89,16 @@ static DisplayFrame g_display;
 static std::atomic<bool> g_recording{false};
 
 // ============================================================
-// 崩溃信号处理器：打印调用栈后退出（定位段错误/断言失败）
+// 崩溃信号处理器：打印崩溃现场后退出（定位段错误/断言失败）
 // ============================================================
 // 注意：信号处理器中只能使用 async-signal-safe 函数
-// （backtrace / backtrace_symbols_fd / dprintf / _exit 均安全）
-static void crashSignalHandler(int sig) {
+// （dprintf / _exit 安全；backtrace 可安全调用但会被信号帧截断）。
+//
+// 关键：backtrace() 在信号处理器中会停在信号返回桩（__default_sa_restorer），
+// 展开不到真正的崩溃点。真正的崩溃指令在被中断线程的 ucontext 寄存器里——
+// 因此用 3 参数 handler + SA_SIGINFO，从 ucontext 提取 PC/LR/SP。
+// PC 即崩溃指令地址，配合 arm-linux-gnueabihf-addr2line 可精确定位函数。
+static void crashSignalHandler(int sig, siginfo_t* /*si*/, void* ucontext) {
     const char* sigName = "UNKNOWN";
     switch (sig) {
     case SIGSEGV: sigName = "SIGSEGV(段错误/空指针)"; break;
@@ -102,10 +108,23 @@ static void crashSignalHandler(int sig) {
     default: break;
     }
 
+    dprintf(2, "\n===== SmartCam CRASH: signal %d (%s) =====\n", sig, sigName);
+
+#if defined(__arm__)
+    // ARM 被中断线程的崩溃现场（backtrace 会被信号帧截断，寄存器才是精确崩溃点）
+    ucontext_t* uc   = static_cast<ucontext_t*>(ucontext);
+    mcontext_t* mctx = &uc->uc_mcontext;
+    dprintf(2, "  ARM PC=%#lx LR=%#lx SP=%#lx FP=%#lx\n",
+            static_cast<unsigned long>(mctx->arm_pc),
+            static_cast<unsigned long>(mctx->arm_lr),
+            static_cast<unsigned long>(mctx->arm_sp),
+            static_cast<unsigned long>(mctx->arm_fp));
+#endif
+
+    // 辅助栈（可能被信号帧截断，仅供参考）
     void* frames[32];
     int n = backtrace(frames, 32);
-    dprintf(2, "\n===== SmartCam CRASH: signal %d (%s) =====\n", sig, sigName);
-    backtrace_symbols_fd(frames, n, 2);   // 打印调用栈到 stderr
+    backtrace_symbols_fd(frames, n, 2);
     dprintf(2, "===== end backtrace =====\n");
     _exit(128 + sig);
 }
@@ -114,9 +133,9 @@ static void crashSignalHandler(int sig) {
 static void installCrashHandlers() {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = crashSignalHandler;
+    sa.sa_sigaction = crashSignalHandler;   // 3 参数版，接收 ucontext
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND;
+    sa.sa_flags = SA_RESETHAND | SA_SIGINFO;  // SA_SIGINFO 传递崩溃现场
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGFPE,  &sa, nullptr);
@@ -971,6 +990,15 @@ int main(int argc, char* argv[]) {
                 std::vector<uint8_t> rgb;
                 if (fmt == PixelFormat::FMT_MJPEG) {
 #ifdef HAS_LIBJPEG
+                    // 防御：进 libjpeg 前校验 JPEG SOI 标记，畸形帧直接跳过
+                    // （libjpeg 对某些畸形流可能内部越界而非走 error_exit）
+                    if (!VideoProcessor::isJPEGStart(raw.data(),
+                                                     static_cast<int>(raw.size()))) {
+                        LOG_WRN("decode: 非 JPEG 帧(无 SOI)，seq=%llu 跳过",
+                                (unsigned long long)seq);
+                        lastSeq = seq;
+                        continue;
+                    }
                     int dw = 0, dh = 0;
                     if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
                                                         rgb, dw, dh)) {
