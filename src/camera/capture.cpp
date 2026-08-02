@@ -186,11 +186,13 @@ int CameraCapture::setFormat(int width, int height, uint32_t pixfmt) {
     fmt.fmt.pix.width       = static_cast<__u32>(width);
     fmt.fmt.pix.height      = static_cast<__u32>(height);
     fmt.fmt.pix.pixelformat = pixfmt;
-    // ★ 修复：用 V4L2_FIELD_NONE 替代 V4L2_FIELD_ANY。
-    //   实测（v4l2-ctl 对比）：该摄像头对 field=any 输出低质量简化帧
-    //   （~6.7KB/帧 ≈ 纯色/黑画面），field=none 输出正常帧（~41KB/帧）。
-    //   ANY(-1) 会让 UVC 固件进入异常输出模式，导致浏览器看到黑屏。
+    // ★ 修复：S_FMT 显式指定 field/colorspace，与设备默认格式一致。
+    //   实测（v4l2-ctl --get-fmt-video）：默认格式 Colorspace=sRGB。
+    //   摄像头固件对 S_FMT 时 colorspace=0(DEFAULT) 敏感——输出简化帧
+    //   （~6.7KB/帧 ≈ 纯色/黑画面）；显式指定 sRGB 后输出正常帧（~41KB/帧）。
+    //   field 同样显式用 NONE（ANY=-1 也会触发简化输出）。
     fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    fmt.fmt.pix.colorspace  = V4L2_COLORSPACE_SRGB;
 
     if (ioctl(m_fd, VIDIOC_S_FMT, &fmt) < 0) {
         LOG_ERR_("VIDIOC_S_FMT failed: %s (w=%d h=%d fmt=0x%08X)",
