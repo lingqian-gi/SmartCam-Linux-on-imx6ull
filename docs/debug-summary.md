@@ -1364,3 +1364,271 @@ gui.setExposureRange(absMin, absMax, absStep, def);   // 仅显示范围
 | **摄像头固件对参数敏感** | 该摄像头对 `S_FMT field=ANY`、强制 `exposure_absolute` 等敏感，可能输出黑帧且残留；避免在初始化时强制设置这些参数 |
 | **用户手动调节时再写曝光** | 曝光应由用户通过 GUI 滑块主动调节（临时生效），不应在启动时强制写入 |
 
+---
+
+## 25. linuxfb 启动 Segfault：Qt 5.11.3 光标初始化崩溃 ✅ 已解决
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | 系统 Qt 环境（板厂手动 Qt 套 vs Debian Qt 套） |
+| **现象** | 开发板上 `QT_QPA_PLATFORM=linuxfb ./smartcam ...` 启动时，banner 打印完后立即 `Segmentation fault`；而 `QT_QPA_PLATFORM=minimal` 正常（浏览器能看到推流） |
+| **严重程度** | ❌ 严重 — 本地 7 寸屏 GUI 完全无法显示 |
+| **排查耗时** | 极长（跨 2 天，多轮 gdb/反汇编/环境对比，最终定位为「两套 Qt 混装」） |
+
+---
+
+### 一、现象描述
+
+在开发板（i.MX6ULL + 7 寸 800x480 屏）上运行 smartcam，尝试用 linuxfb 后端显示本地 GUI：
+
+```bash
+# ❌ 直接运行 → 崩溃
+./build/arm/smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+
+# ❌ 显式指定 linuxfb → 依然崩溃
+QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0 ./build/arm/smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+```
+
+崩溃时的日志特征（每次完全一致）：
+
+```
+==============================================
+SmartCam Linux — 真实相机模式
+配置: "/home/debian/.config/smartcam/smartcam.conf"
+设备: "/dev/video0"
+格式: "mjpeg"
+HTTP 端口: 8080   |  RTSP 端口: 8554
+控制端口: 9000
+存储: "/home/debian/smartcam/photos"  /  "/home/debian/smartcam/videos"
+流媒体: ✅ 已启动
+浏览器打开: http://<dev-ip>: 8080 /
+VLC 播放:   rtsp://<dev-ip>: 8554 /stream
+==============================================
+Segmentation fault (core dumped)
+```
+
+**关键特征**：
+1. 摄像头、HTTP、RTSP、控制线程全部正常启动（采集/推流链路 OK）——崩溃发生在**全部初始化完成后、`gui.show()` 进入 Qt 事件循环的瞬间**；
+2. `QT_QPA_PLATFORM=minimal`（离屏渲染，不碰显示硬件）能正常运行，浏览器能看到画面 → **说明程序逻辑本身没有问题**，问题在 linuxfb 平台插件的显示初始化路径；
+3. 崩溃点极其稳定，每次复现都在同一位置。
+
+---
+
+### 二、初步排查（排除应用代码）
+
+#### 2.1 第一个崩溃栈：QImage::operator= 的 this 为 0
+
+用 gdb 抓取崩溃栈：
+
+```bash
+gdb -batch -ex run -ex bt -ex "info registers" 
+  --args ./build/arm/smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+```
+
+```
+Thread 1 "smartcam" received signal SIGSEGV, Segmentation fault.
+0x7691e218 in QImage::operator=(QImage const&) () from /usr/lib/arm-linux-gnueabihf/libQt5Gui.so.5
+#0  0x7691e218 in QImage::operator=(QImage const&) () from /usr/lib/arm-linux-gnueabihf/libQt5Gui.so.5
+#1  0x768e1360 in QPlatformCursorImage::set(Qt::CursorShape) () from /usr/lib/arm-linux-gnueabihf/libQt5Gui.so.5
+#2  0x73eac486 in ?? () from /usr/lib/arm-linux-gnueabihf/qt5/plugins/platforms/libqlinuxfb.so
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+```
+
+寄存器关键信息：
+
+```
+r0             0x0                 0     ← this 指针为 0！
+r1             0x0                 0     ← 源 QImage 指针为 0
+pc             0x7691e218          <QImage::operator=(QImage const&)+60>
+```
+
+**解读**：`QPlatformCursorImage::set(Qt::CursorShape)` 内部对一个**空/无效的 QImage 做赋值**（`QImage::operator=` 的 this=0）→ 空指针解引用崩溃。这个调用来自 `libqlinuxfb.so`（linuxfb 平台插件）在窗口显示时初始化鼠标光标。
+
+#### 2.2 反汇编定位崩溃机制
+
+用 `arm-linux-gnueabihf-objdump` 反汇编 Debian 套的 `libQt5Gui.so.5.11.3` 中 `QPlatformCursorImage::set(Qt::CursorShape)`（地址 `0xce340`）：
+
+```
+ce350: ldr r4, [r6, #4]        ← 从静态表取光标图像 QImage 指针
+ce352: cbz r4, ce36a           ← 若为 null 则调用 createSystemCursor
+ce36a: mov r0, r1
+ce36c: bl  createSystemCursor  ← 创建系统光标
+ce370: ldr r4, [r6, #4]        ← 重新读表
+ce372: cmp r4, #0
+ce374: bne ce354               ← 非 null 则使用
+ce376: 查第二张表（WaitCursor 等）
+ce380: mov r0, r4              ← r4 = 0（null）
+ce382: bl  createSystemCursor  ← 用 null 再调一次
+ce386: ldr r4, [r6, #4]
+ce388: b   ce354
+ce354: mov r1, r4              ← 把 r4（可能为 0）作为源 QImage
+ce35c: blx QImage::operator=   ← 对 null 源做赋值 → 崩溃
+```
+
+**根因链条**：
+```
+linuxfb 插件初始化光标
+  → QPlatformCursorImage::set(Qt::CursorShape)
+  → 静态光标表项为 null（无平台主题/无内置光标资源）
+  → createSystemCursor(shape) 返回 null（仍无资源）
+  → 二次查表仍 null
+  → 把 null QImage 传给 QImage::operator= → SIGSEGV
+```
+
+这解释了为什么 gdb 提示 `corrupt stack?`——**根本不是栈损坏**，而是 gdb 在无符号的插件帧 + 空指针调用点无法正确回溯，属于**误导性提示**。
+
+---
+
+### 三、逐项排除环境变量方案（全部无效）
+
+#### 3.1 QT_QPA_FB_HIDECURSOR=1 — 无效
+
+```bash
+QT_QPA_FB_HIDECURSOR=1 QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0 ./build/arm/smartcam ...
+# 依然 Segmentation fault
+```
+
+**原因**：`QT_QPA_FB_HIDECURSOR` 只控制 linuxfb **是否绘制光标**（`mEnableCursor`），但 `QPlatformCursorImage` 内部的静态光标图像表**在创建 QLinuxFbCursor 时仍会初始化**，与"是否显示光标"无关。即使 `mEnableCursor=false` 阻止了光标绘制，窗口显示路径仍会触发 `QPlatformCursorImage::set` 的光标图像加载。
+
+#### 3.2 hidecursor 插件参数 — 无效
+
+```bash
+QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0:hidecursor ./build/arm/smartcam ...
+# 依然 Segmentation fault
+```
+
+**原因**：`hidecursor` 参数与本插件版本对该参数的处理路径和 `QT_QPA_FB_HIDECURSOR` 环境变量相同，同样阻止不了内部光标图像加载。
+
+#### 3.3 eglfs — 平台不支持
+
+```bash
+QT_QPA_PLATFORM=eglfs ./build/arm/smartcam ...
+```
+
+```
+MESA-LOADER: failed to retrieve device information
+gbm: failed to open any driver (search paths ...)
+failed to load driver: vivante
+Could not initialize egl display
+Aborted (core dumped)
+```
+
+**原因**：i.MX6ULL **没有 GPU**（无 Vivante GPU 驱动），eglfs 依赖 EGL/DRM 硬件加速，必然失败。**eglfs 方案直接排除**。
+
+#### 3.4 字体缺失 — 不是根因（但顺带修复）
+
+排查中发现系统只有 1 个字体，尝试补字体：
+
+```bash
+sudo mkdir -p /usr/lib/arm-linux-gnueabihf/fonts
+sudo cp /usr/lib/fonts/SourceHanSerifSC-Regular.otf /usr/lib/arm-linux-gnueabihf/fonts/
+# 或
+sudo apt-get install -y fonts-dejavu-core
+```
+
+字体警告消失，但**崩溃点不变** → 证明字体不是根因。
+
+---
+
+### 四、发现两套 Qt 并存（关键转折）
+
+在排查中发现系统里存在**两套完整的 Qt 5.11.3**：
+
+| 项目 | Debian 官方套 | 板厂手动套 |
+|------|--------------|-----------|
+| **库路径** | `/usr/lib/arm-linux-gnueabihf/libQt5*.so.5.11.3` | `/usr/lib/libQt5*.so.5.11.3` |
+| **插件路径** | `/usr/lib/arm-linux-gnueabihf/qt5/plugins/platforms/` | `/usr/lib/plugins/platforms/` |
+| **安装时间** | 2022-03-26（dpkg，属主 root） | 2021-05-15（属主 `1000:render`，板厂预装） |
+| **libQt5Gui 大小** | 3.7 MB | 5.1 MB（明显更大） |
+| **linuxfb 插件依赖** | libinput / libdrm / libxkbcommon / libmtdev | libts（tslib 触摸库） |
+| **来源** | `apt install qtbase5-dev`（Debian buster） | 板厂交叉编译的定制版 Qt |
+
+验证两个 linuxfb 插件 md5 不同：
+
+```bash
+md5sum /usr/lib/arm-linux-gnueabihf/qt5/plugins/platforms/libqlinuxfb.so
+# 743a1db4cf57dd843373915ef3e0bc9c  (Debian 套)
+md5sum /usr/lib/plugins/platforms/libqlinuxfb.so
+# 2f908e7933cdbea30b18aa3224bea442  (板厂手动套)
+```
+
+**关键证据**：反汇编两套 libQt5Gui 的 `createSystemCursor`：
+
+- **Debian 套**（`0xcde20`）：依赖外部静态表，表项为空时返回 null；
+- **板厂手动套**（`0xd5a50`）：内置 switch 跳转表，每个光标形状都有**内嵌的 16x16 位图数据**（用 NEON `vst1.32` 填充像素，`setEPKhS1_iiii` 直接构造 QImage）——**完全不需要外部资源**。
+
+→ **板厂手动套才是带完整内置光标资源的 Qt**，这正是 5 月能正常显示的原因。
+
+---
+
+### 五、为什么之前（5 月）能显示、现在崩溃？
+
+1. **5 月 29 日（commit `70fa0aa`）** 板子上运行正常，`docs/debug-summary.md` 第 9 条明确记录当时用：
+   ```bash
+   ./smartcam --device /dev/video0 --fmt mjpeg -platform linuxfb
+   ```
+2. 板厂手动 Qt 套（2021 年安装）是当时**默认生效**的完整 Qt：`ld.so` 搜索 `/usr/lib/arm-linux-gnueabihf` 之前先找到 `/usr/lib` 下的手动套（或当时的编译产物 RPATH 指向手动套）；
+3. 后来**apt 安装 Debian qtbase5-dev**（或环境变量 `LD_LIBRARY_PATH` 变更）后，`libQt5Gui.so.5` 解析到 Debian 套 → 触发无内置光标资源的崩溃路径；
+4. 而我们**交叉编译时 CMake 默认找到的是 Debian 套**（`/usr/lib/arm-linux-gnueabihf/cmake/Qt5`），编译产物与板子运行时加载的库版本错位，加剧了问题。
+
+---
+
+### 六、解决：完整使用板厂手动 Qt 套环境
+
+**核心解法**：运行时用 `LD_LIBRARY_PATH` 强制加载**板厂手动 Qt 套**（带内置光标资源），并用 `QT_QPA_PLATFORM_PLUGIN_PATH` 指定配套插件，同时让 Qt 自动探测 framebuffer：
+
+```bash
+cd ~/smartcam/SmartCam-Linux-on-imx6ull
+
+# 清理可能残留的环境变量
+unset LD_LIBRARY_PATH QT_QPA_PLATFORM_PLUGIN_PATH QT_QPA_FB_HIDECURSOR
+
+# ✅ 完整手动 Qt 套环境运行（已验证通过）
+LD_LIBRARY_PATH=/usr/lib 
+QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/plugins/platforms 
+QT_QPA_PLATFORM=linuxfb 
+./build/arm/smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
+```
+
+**要点**：
+1. `LD_LIBRARY_PATH=/usr/lib` → 让 `libQt5Gui.so.5` 解析到板厂手动套（5.1MB，内置光标资源）；
+2. `QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/plugins/platforms` → 加载配套的 linuxfb 插件（带 tslib 触摸支持）；
+3. `QT_QPA_PLATFORM=linuxfb` → **不要加 `:fb=/dev/fb0`**，让 Qt 自动探测 framebuffer 设备（与 5 月成功命令一致）。
+
+如果触摸无响应，检查权限：
+
+```bash
+sudo chmod 666 /dev/input/event2     # 临时
+sudo usermod -a -G input debian      # 永久，需重新登录
+```
+
+---
+
+### 七、调试过程中走过的弯路（教训）
+
+| 弯路/误判 | 说明 | 正确认识 |
+|-----------|------|----------|
+| **以为 hook 光标函数能修复** | 写了 `LD_PRELOAD` 拦截 `QPlatformCursorImage::set(Qt::CursorShape)` 的 hook 库 | 只让崩溃点后移（`QImage::operator=` → `QImage::rect()`），未根治；且每次崩溃点变化都伴随 gdb 假象 `corrupt stack?` |
+| **以为字体缺失是根因** | 补了 DejaVu/思源字体，警告消失 | 字体与光标崩溃无关，纯属环境提示 |
+| **以为环境变量/插件参数可绕过** | `QT_QPA_FB_HIDECURSOR`、`:hidecursor`、eglfs 全试遍 | 只有**换对 Qt 库**才真正解决 |
+| **gdb 的 corrupt stack 提示** | 多次出现，误以为栈损坏/内存越界 | 实为无符号插件帧 + 空指针调用点导致的回溯失败 |
+| **未尽早对比「5 月为什么能跑」** | 一直盯着当前环境打补丁 | 反向对比历史成功配置（git 里的旧二进制、debug-summary 旧记录）才是最快路径 |
+
+**最有效的调试手段排序**：
+1. gdb 崩溃栈 + 寄存器（`info registers`）定位空指针来源；
+2. `arm-linux-gnueabihf-objdump -d` 反汇编 Qt 库，确认 `createSystemCursor` 是否内置资源；
+3. `LD_DEBUG=libs` 确认运行时实际加载哪个 `libQt5Gui.so`；
+4. **git 历史反向对比**：`git show 70fa0aa:build/arm/smartcam` 拿 5 月二进制 + `docs/debug-summary.md` 旧记录，找到"曾经成功"的配置；
+5. 检查系统是否存在**多套同名库**（`find / -name "libQt5Gui.so.5*"`、对比 md5）。
+
+---
+
+### 八、遗留风险与长期建议
+
+| 事项 | 建议 |
+|------|------|
+| **两套 Qt 并存** | 长期看建议保留一套（推荐板厂手动套，功能完整带 tslib），卸载或改名 Debian 套；或统一编译工具链与运行时库的 Qt 来源 |
+| **启动脚本固化** | 将上述环境变量组合写入 `scripts/` 启动脚本或 systemd unit，避免每次手敲 |
+| **交叉编译与运行时一致性** | CMake 交叉编译时明确指定与板子运行时一致的 Qt（板厂套的 cmake 配置），避免"编译用 A、运行用 B" |
+| **本问题是否影响 PC** | 不影响。PC 端 xcb 平台有完整光标资源，无此问题 |
+

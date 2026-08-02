@@ -214,9 +214,16 @@ sudo usermod -a -G input $USER
 # 退出重新登录后验证：
 groups | grep input
 
-# ---- 启动应用 ----
-export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0
-export QT_QPA_FB_HIDECURSOR=1
+# ---- 启动应用（重要：必须使用板厂手动 Qt 套，否则 linuxfb 光标初始化崩溃）----
+# 板子上存在两套 Qt 5.11.3：
+#   - Debian 官方套 (/usr/lib/arm-linux-gnueabihf)：无内置光标资源，linuxfb 显示时
+#     QPlatformCursorImage::set 对空 QImage 做 operator= → Segfault
+#   - 板厂手动套 (/usr/lib)：内置完整光标位图 + tslib 触摸支持（推荐）
+# 必须用 LD_LIBRARY_PATH 强制加载板厂手动套 + 配套插件，详见 docs/debug-summary.md #25
+unset LD_LIBRARY_PATH QT_QPA_PLATFORM_PLUGIN_PATH
+export LD_LIBRARY_PATH=/usr/lib
+export QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/plugins/platforms
+export QT_QPA_PLATFORM=linuxfb
 
 # MJPEG 模式（摄像头硬件输出 JPEG，零 CPU 编码开销，推荐）
 ./smartcam --device /dev/video0 --fmt mjpeg --http-port 8080
