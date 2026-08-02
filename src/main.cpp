@@ -35,6 +35,9 @@
 #include <vector>
 #include <cstring>
 #include <arpa/inet.h>
+#include <signal.h>      // 崩溃信号处理
+#include <execinfo.h>    // backtrace
+#include <unistd.h>
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
@@ -84,10 +87,47 @@ static DisplayFrame g_display;
 // 录像状态（由 main 线程设置，采集线程读取）
 static std::atomic<bool> g_recording{false};
 
+// ============================================================
+// 崩溃信号处理器：打印调用栈后退出（定位段错误/断言失败）
+// ============================================================
+// 注意：信号处理器中只能使用 async-signal-safe 函数
+// （backtrace / backtrace_symbols_fd / dprintf / _exit 均安全）
+static void crashSignalHandler(int sig) {
+    const char* sigName = "UNKNOWN";
+    switch (sig) {
+    case SIGSEGV: sigName = "SIGSEGV(段错误/空指针)"; break;
+    case SIGABRT: sigName = "SIGABRT(abort/断言)";     break;
+    case SIGFPE:  sigName = "SIGFPE(除零/整数溢出)";   break;
+    case SIGBUS:  sigName = "SIGBUS(总线错误)";        break;
+    default: break;
+    }
+
+    void* frames[32];
+    int n = backtrace(frames, 32);
+    dprintf(2, "\n===== SmartCam CRASH: signal %d (%s) =====\n", sig, sigName);
+    backtrace_symbols_fd(frames, n, 2);   // 打印调用栈到 stderr
+    dprintf(2, "===== end backtrace =====\n");
+    _exit(128 + sig);
+}
+
+// 安装崩溃信号处理器（SA_RESETHAND：处理器内二次崩溃则恢复默认，避免递归）
+static void installCrashHandlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = crashSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGFPE,  &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+}
+
 // 存储管理器（全局单例指针，线程安全）
 static StorageManager* g_storage = nullptr;
 
 int main(int argc, char* argv[]) {
+    installCrashHandlers();   // 崩溃时打印调用栈（优先于 Qt 默认处理）
     QApplication app(argc, argv);
     app.setApplicationName("SmartCam");
     app.setApplicationVersion("0.1.0");
@@ -901,6 +941,7 @@ int main(int argc, char* argv[]) {
         // 本线程拉取最新原始帧 → 解码成 RGB24 → 发布到 g_display，
         // GUI 线程只做"拷贝 RGB + setPixmap"的轻量绘制。
         decodeThread = new std::thread([]() {
+            LOG_INF("Display decode thread started");
             uint64_t lastSeq = 0;
             while (g_state.running) {
                 // 1. 拉取最新原始帧（只取最新，中间帧覆盖丢弃）
@@ -926,6 +967,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 2. 解码/转换为 RGB24（CPU 密集，不阻塞 GUI 与采集）
+                auto  t0  = std::chrono::steady_clock::now();
                 std::vector<uint8_t> rgb;
                 if (fmt == PixelFormat::FMT_MJPEG) {
 #ifdef HAS_LIBJPEG
@@ -934,6 +976,8 @@ int main(int argc, char* argv[]) {
                                                         rgb, dw, dh)) {
                         w = dw; h = dh;
                     } else {
+                        LOG_WRN("decode: bad MJPEG frame, seq=%llu skipped",
+                                (unsigned long long)seq);
                         lastSeq = seq;   // 坏帧跳过，避免死循环重解同一帧
                         continue;
                     }
@@ -944,13 +988,18 @@ int main(int argc, char* argv[]) {
                 } else {   // FMT_RGB24：无需转换
                     rgb.swap(raw);
                 }
+                double decodeMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
 
                 if (rgb.empty()) {
+                    LOG_WRN("decode: empty result, seq=%llu skipped",
+                            (unsigned long long)seq);
                     lastSeq = seq;
                     continue;
                 }
 
                 // 3. 发布到显示缓冲（GUI 每 33ms 拉取一次）
+                size_t rgbSize = rgb.size();
                 {
                     std::lock_guard<std::mutex> lock(g_display.mtx);
                     g_display.rgb.swap(rgb);
@@ -959,7 +1008,12 @@ int main(int argc, char* argv[]) {
                     g_display.seq    = seq;
                 }
                 lastSeq = seq;
+
+                LOG_DBG("decode: seq=%llu fmt=%d %dx%d rgb=%zuB %.2fms -> g_display",
+                        (unsigned long long)seq, static_cast<int>(fmt),
+                        w, h, rgbSize, decodeMs);
             }
+            LOG_INF("Display decode thread exited");
         });
 
         // ============================================================

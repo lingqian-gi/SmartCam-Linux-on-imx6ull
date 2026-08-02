@@ -11,11 +11,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 根据平台自动选择 flags
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     # ARM 交叉编译 (iMX6ULL Cortex-A7)
-    add_compile_options(-march=armv7-a -mfpu=neon -mfloat-abi=hard -O2)
+    # -funwind-tables: 提供 unwind 信息，使 backtrace() 在 ARM 上可用（崩溃诊断）
+    add_compile_options(-march=armv7-a -mfpu=neon -mfloat-abi=hard -O2 -funwind-tables)
     message(STATUS "✓ ARM 交叉编译模式 (Cortex-A7 NEON)")
 else()
     # x86 PC 开发调试
-    add_compile_options(-O2 -g)
+    add_compile_options(-O2 -g -funwind-tables)
+    add_link_options(-rdynamic)   # 导出符号表，backtrace_symbols 能显示函数名
     message(STATUS "✓ x86 本地编译模式")
 endif()
 
@@ -113,8 +115,8 @@ add_executable(smartcam ${ALL_SOURCES})
 # ARM 交叉编译时静态链接 C/C++ 标准库，消除 glibc/libstdc++ 版本不匹配问题
 # （开发板可能跑 Debian oldstable，glibc 比 Docker 里的新很多）
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc)
-    message(STATUS "✓ ARM 静态链接 libstdc++ / libgcc")
+    target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc -rdynamic)
+    message(STATUS "✓ ARM 静态链接 libstdc++ / libgcc + -rdynamic(崩溃栈符号)")
 endif()
 
 target_include_directories(smartcam PRIVATE
