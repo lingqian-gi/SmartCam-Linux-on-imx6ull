@@ -163,6 +163,17 @@ static StorageManager* g_storage = nullptr;
 
 int main(int argc, char* argv[]) {
     installCrashHandlers();   // 崩溃时打印调用栈（优先于 Qt 默认处理）
+
+    // linuxfb 下强制隐藏鼠标光标：
+    // 板子 Qt 5.11.3 在 linuxfb 初始化 QPlatformCursorImage 时，
+    // 对空 QImage 做 operator= 会空指针崩溃（SIGSEGV）。设 HIDECURSOR=1 绕过。
+    // （README 部署命令已含此环境变量，这里兜底强制设置，防止漏配）
+    QByteArray qpa = qgetenv("QT_QPA_PLATFORM");
+    if (qpa.contains("linuxfb") && !qEnvironmentVariableIsSet("QT_QPA_FB_HIDECURSOR")) {
+        qputenv("QT_QPA_FB_HIDECURSOR", "1");
+        LOG_INF("QT_QPA_FB_HIDECURSOR=1 (linuxfb 光标已隐藏，避免 QPlatformCursorImage 崩溃)");
+    }
+
     QApplication app(argc, argv);
     app.setApplicationName("SmartCam");
     app.setApplicationVersion("0.1.0");
