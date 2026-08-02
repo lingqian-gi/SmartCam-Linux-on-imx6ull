@@ -11,13 +11,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 根据平台自动选择 flags
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     # ARM 交叉编译 (iMX6ULL Cortex-A7)
-    # -funwind-tables: 提供 unwind 信息，使 backtrace() 在 ARM 上可用（崩溃诊断）
-    add_compile_options(-march=armv7-a -mfpu=neon -mfloat-abi=hard -O2 -funwind-tables)
+    add_compile_options(-march=armv7-a -mfpu=neon -mfloat-abi=hard -O2)
     message(STATUS "✓ ARM 交叉编译模式 (Cortex-A7 NEON)")
 else()
     # x86 PC 开发调试
-    add_compile_options(-O2 -g -funwind-tables)
-    add_link_options(-rdynamic)   # 导出符号表，backtrace_symbols 能显示函数名
+    add_compile_options(-O2 -g)
     message(STATUS "✓ x86 本地编译模式")
 endif()
 
@@ -56,17 +54,10 @@ endif()
 set(CAMERA_SOURCES
     src/camera/capture.cpp
     src/camera/processor.cpp
+    src/camera/processor_neon.cpp
     include/camera/capture.h
     include/camera/processor.h
 )
-
-# NEON 加速实现仅 ARM 交叉编译时启用（x86 无 arm_neon.h，且调用方用 __ARM_NEON 包裹）
-if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    list(APPEND CAMERA_SOURCES src/camera/processor_neon.cpp)
-    message(STATUS "✓ 已启用 NEON 加速源 (processor_neon.cpp)")
-else()
-    message(STATUS "✓ x86 模式：跳过 NEON 源，使用标量实现")
-endif()
 
 set(DISPLAY_SOURCES
     src/display/gui.cpp
@@ -115,8 +106,8 @@ add_executable(smartcam ${ALL_SOURCES})
 # ARM 交叉编译时静态链接 C/C++ 标准库，消除 glibc/libstdc++ 版本不匹配问题
 # （开发板可能跑 Debian oldstable，glibc 比 Docker 里的新很多）
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc -rdynamic)
-    message(STATUS "✓ ARM 静态链接 libstdc++ / libgcc + -rdynamic(崩溃栈符号)")
+    target_link_options(smartcam PRIVATE -static-libstdc++ -static-libgcc)
+    message(STATUS "✓ ARM 静态链接 libstdc++ / libgcc")
 endif()
 
 target_include_directories(smartcam PRIVATE
@@ -127,7 +118,6 @@ target_include_directories(smartcam PRIVATE
 target_link_libraries(smartcam PRIVATE
     Qt5::Widgets
     pthread
-    dl
 )
 
 # libjpeg-turbo (MJPEG 解码)
@@ -155,14 +145,10 @@ install(FILES configs/smartcam.conf
 )
 
 # ============================================================
-# 测试 (PC 构建启用; 交叉编译跳过, 需在目标板运行)
+# 测试 (后续添加)
 # ============================================================
 
-if(NOT CMAKE_CROSSCOMPILING)
-    enable_testing()
-    add_subdirectory(tests)
-    message(STATUS "✓ 单元测试已启用: 构建后运行 ctest")
-endif()
+# add_subdirectory(tests)
 
 # ============================================================
 # 打印构建摘要

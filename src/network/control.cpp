@@ -140,8 +140,18 @@ int packResponse(uint8_t cmd, uint8_t status,
         p += payload_len;
     }
 
-    // 计算 CRC16，直接覆盖已序列化的缓冲区:
-    //   magic[2] + version[1] + cmd[1] + status[1] + payload_len[2] + payload[N]
+    // 计算 CRC16（覆盖 magic → payload 末尾）
+    // 需要构建一个临时 header 来调用 calcFrameCRC
+    ProtoHeader hdr;
+    hdr.magic[0]    = kProtoMagic0;
+    hdr.magic[1]    = kProtoMagic1;
+    hdr.version     = kProtoVersion;
+    hdr.cmd         = static_cast<uint8_t>(cmd | kResponseFlag);
+    hdr.payload_len = net_payload_len;
+
+    // 注意: payload_len 在 hdr 中是网络字节序，但 calcFrameCRC 按内存字节序处理
+    // 这里我们直接用 CRC 覆盖的范围计算
+    // 覆盖: magic[2] + version[1] + cmd[1] + status[1] + payload_len[2] + payload[N]
     size_t crcLen = static_cast<size_t>(p - out_buf);
     uint16_t crc = crc16Modbus(out_buf, static_cast<int>(crcLen));
     uint16_t net_crc = htons(crc);

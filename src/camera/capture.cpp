@@ -186,10 +186,7 @@ int CameraCapture::setFormat(int width, int height, uint32_t pixfmt) {
     fmt.fmt.pix.width       = static_cast<__u32>(width);
     fmt.fmt.pix.height      = static_cast<__u32>(height);
     fmt.fmt.pix.pixelformat = pixfmt;
-    // ★ 用 V4L2_FIELD_NONE 而非 V4L2_FIELD_ANY：
-    //   与 v4l2-ctl 的 S_FMT 一致（field=0）。部分摄像头固件对 FIELD_ANY(-1)
-    //   敏感，可能导致 STREAMON 后不输出帧（v4l2-ctl 能抓帧而程序 0 帧）。
-    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    fmt.fmt.pix.field       = V4L2_FIELD_ANY;
 
     if (ioctl(m_fd, VIDIOC_S_FMT, &fmt) < 0) {
         LOG_ERR_("VIDIOC_S_FMT failed: %s (w=%d h=%d fmt=0x%08X)",
@@ -470,16 +467,15 @@ int CameraCapture::getFrame(FrameBuffer* buf, int timeout_ms) {
     }
 
     // 填充 FrameBuffer
-    buf->data       = static_cast<uint8_t*>(m_buffers[vbuf.index].start);
-    buf->length     = static_cast<int>(vbuf.bytesused);
-    buf->width      = m_width;
-    buf->height     = m_height;
-    buf->format     = (m_pixfmt == V4L2_PIX_FMT_YUYV)
-                          ? PixelFormat::FMT_YUYV
-                          : PixelFormat::FMT_MJPEG;
-    buf->index      = m_frameCount++;
-    buf->pool_index = static_cast<int>(vbuf.index);   // 记录缓冲池索引，putFrame 直接 O(1) 归还
-    buf->timestamp  = std::chrono::steady_clock::now();
+    buf->data     = static_cast<uint8_t*>(m_buffers[vbuf.index].start);
+    buf->length   = static_cast<int>(vbuf.bytesused);
+    buf->width    = m_width;
+    buf->height   = m_height;
+    buf->format   = (m_pixfmt == V4L2_PIX_FMT_YUYV)
+                        ? PixelFormat::FMT_YUYV
+                        : PixelFormat::FMT_MJPEG;
+    buf->index    = m_frameCount++;
+    buf->timestamp = std::chrono::steady_clock::now();
 
     // FPS 统计
     updateFPS();
@@ -491,9 +487,7 @@ int CameraCapture::putFrame(const FrameBuffer* buf) {
     if (!m_streaming || m_fd < 0) return -EIO;
     if (!buf || !buf->data) return -EINVAL;
 
-    // ★ 改回 O(n) 遍历反查（与 70fa0aa 一致，实测持续出帧）：
-    //   曾改为 O(1) pool_index 直接归还，但该摄像头/驱动下出现"只出首帧后停流"，
-    //   恢复按 data 指针反查索引的原始实现，规避潜在索引不一致问题。
+    // 从 data 指针反推缓冲区索引
     int idx = -1;
     for (int i = 0; i < m_nbuffers; ++i) {
         if (m_buffers[i].start == buf->data) {
@@ -542,15 +536,10 @@ int CameraCapture::openDevice(const char* device) {
         return -errno;
     }
 
-    // 先以 O_NONBLOCK 打开，避免 open 阶段阻塞（如 sensor 复位/固件下载）；
-    // 随后清除 O_NONBLOCK 转为阻塞模式（配合 select 超时取帧，语义更自然）
+    // 暂时设置为阻塞（后续用 select/poll）
     int flags = fcntl(m_fd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
-        LOG_INF("Device O_NONBLOCK cleared (flags=0x%x)", flags & ~O_NONBLOCK);
-    } else {
-        LOG_WRN("fcntl(F_GETFL) failed: %s — O_NONBLOCK may remain set",
-                strerror(errno));
     }
 
     LOG_INF("Device opened: %s, fd=%d", device, m_fd);
@@ -703,9 +692,7 @@ int CameraCapture::dequeueBuffer(struct v4l2_buffer& buf, int timeout_ms) {
     buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    // ★ 改回 select+DQBUF 模式（与 70fa0aa 一致，实测持续出帧 30fps）：
-    //   曾改成直接阻塞 DQBUF，但该摄像头/驱动下阻塞 DQBUF 只返回首帧后
-    //   永久阻塞（select 预判"fd 可读"后 DQBUF 才能持续返回帧）。
+    // 使用 select 实现超时
     if (timeout_ms > 0) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -764,12 +751,11 @@ void CameraCapture::updateFPS() {
 
 FrameBuffer CameraCapture::BufferUnit::toFrameBuffer(int w, int h, uint32_t fmt) {
     FrameBuffer fb;
-    fb.data       = static_cast<uint8_t*>(start);
-    fb.length     = static_cast<int>(length);
-    fb.width      = w;
-    fb.height     = h;
-    fb.format     = (fmt == V4L2_PIX_FMT_YUYV) ? PixelFormat::FMT_YUYV
-                                               : PixelFormat::FMT_MJPEG;
-    fb.pool_index = index;   // 记录缓冲池索引
+    fb.data   = static_cast<uint8_t*>(start);
+    fb.length = static_cast<int>(length);
+    fb.width  = w;
+    fb.height = h;
+    fb.format = (fmt == V4L2_PIX_FMT_YUYV) ? PixelFormat::FMT_YUYV
+                                           : PixelFormat::FMT_MJPEG;
     return fb;
 }

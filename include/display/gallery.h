@@ -11,8 +11,6 @@
 #include <QStackedWidget>
 #include <QPixmap>
 #include <QVector>
-#include <QCheckBox>
-#include <QSet>
 #include <vector>
 #include <string>
 
@@ -55,19 +53,11 @@ private slots:
     void onBackToGallery();
     void onVideoPlaybackFinished();
 
-    // ---- 多选模式 ----
-    void onToggleSelectMode();
-    void onSelectAll();
-    void onDeselectAll();
-    void onItemSelectionChanged(int flatIndex, bool checked);
-    void onDeleteSelected();
-
 private:
     // ---- UI 构建 ----
     void buildGalleryView();
     void buildFullscreenView();
     void loadVisibleThumbnails();     // 懒加载可见区域缩略图
-    void updateStorageInfo();         // 更新存储空间状态栏
 
     // ---- 辅助 ----
     bool createThumbnail(const std::string& jpegPath,
@@ -81,7 +71,6 @@ private:
                               QPixmap& out);
     void showFullscreen(int mediaIndex);
     void updateFullscreenDisplay();
-    void updateDeleteSelectedButton();  // 更新多选删除按钮状态
     void clearThumbnails();
     void stopVideoPlayback();
 
@@ -97,16 +86,6 @@ private:
     QGridLayout*  m_gridLayout      = nullptr;
     QLabel*       m_galleryTitle    = nullptr;
     QLabel*       m_galleryEmpty    = nullptr;   // 空相册提示
-    QLabel*       m_storageInfoLabel = nullptr;  // 存储空间状态栏
-
-    // ---- 多选模式 ----
-    bool          m_selectMode      = false;     // 是否处于多选模式
-    QSet<int>     m_selectedIndices;             // 选中的 m_flatPhotos 索引
-    QPushButton*  m_btnSelectToggle = nullptr;  // "Select" / "Cancel"
-    QPushButton*  m_btnSelectAll    = nullptr;  // "Select All"
-    QPushButton*  m_btnDeleteSelected = nullptr; // "Delete (N)"
-    QWidget*      m_selectToolBar   = nullptr;  // 多选操作工具栏
-    QVector<QCheckBox*> m_checkBoxes;          // 每个缩略图的复选框
 
     static constexpr int THUMB_COLS = 3;
     static constexpr int THUMB_W    = 170;

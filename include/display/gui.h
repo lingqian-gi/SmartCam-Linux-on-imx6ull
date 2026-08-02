@@ -52,8 +52,7 @@ public:
     /**
      * @brief 更新状态栏信息
      */
-    void setFPS(double fps);              // 硬件（摄像头）FPS
-    void setDisplayFPS(double fps);        // 软件（屏幕显示）FPS
+    void setFPS(double fps);
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -140,7 +139,6 @@ private:
 
     // 状态栏
     QLabel*      m_labelFPS       = nullptr;
-    QLabel*      m_labelDisplayFPS = nullptr;  // 软件（显示）FPS
     QLabel*      m_labelStreaming = nullptr;
     QLabel*      m_labelClients   = nullptr;
     QLabel*      m_labelRecording = nullptr;
@@ -206,5 +204,93 @@ private:
     int         m_mockFrameIndex = 0;
     std::vector<uint8_t> m_mockBuffer;        // 预分配 RGB 缓冲
 };
+
+// ============================================================
+// 颜色空间转换工具函数（inline，供 display 模块内部使用）
+// ============================================================
+
+/**
+ * @brief YUYV 4:2:2 → RGB24
+ *
+ * 公式 (BT.601):
+ *   R = Y + 1.402   * (V - 128)
+ *   G = Y - 0.34414 * (U - 128) - 0.71414 * (V - 128)
+ *   B = Y + 1.772   * (U - 128)
+ *
+ * 使用查表法 + 定点运算加速。
+ *
+ * @param yuyv  输入 YUYV 数据
+ * @param rgb   输出 RGB24 数据（调用者保证 w*h*3 足够）
+ * @param w     宽 (像素)
+ * @param h     高 (像素)
+ */
+inline void yuyv_to_rgb24(const uint8_t* yuyv, uint8_t* rgb, int w, int h) {
+#ifdef __ARM_NEON
+    // ARM 平台: 使用 NEON SIMD 加速 (processor_neon.cpp)
+    extern void yuyv_to_rgb24_neon(const uint8_t*, uint8_t*, int, int);
+    yuyv_to_rgb24_neon(yuyv, rgb, w, h);
+    return;
+#endif
+
+    // x86 / 无 NEON 退路: 标量 C++ 实现
+    const int pixels = w * h;
+    int di = 0;
+    for (int i = 0; i < pixels; i += 2) {
+        int si = i * 2;
+        int y0 = yuyv[si];
+        int u  = yuyv[si + 1] - 128;
+        int y1 = yuyv[si + 2];
+        int v  = yuyv[si + 3] - 128;
+
+        // BT.601 → RGB（clamp 到 0-255）
+        auto clip = [](int x) -> uint8_t {
+            return static_cast<uint8_t>(x < 0 ? 0 : (x > 255 ? 255 : x));
+        };
+
+        int r0 = y0 + ((v * 359) >> 8);
+        int g0 = y0 - ((u * 88) >> 8) - ((v * 183) >> 8);
+        int b0 = y0 + ((u * 454) >> 8);
+
+        int r1 = y1 + ((v * 359) >> 8);
+        int g1 = y1 - ((u * 88) >> 8) - ((v * 183) >> 8);
+        int b1 = y1 + ((u * 454) >> 8);
+
+        rgb[di++] = clip(r0); rgb[di++] = clip(g0); rgb[di++] = clip(b0);
+        rgb[di++] = clip(r1); rgb[di++] = clip(g1); rgb[di++] = clip(b1);
+    }
+}
+
+/**
+ * @brief YUYV 4:2:2 → RGB565（适配 16-bit LCD framebuffer）
+ */
+inline void yuyv_to_rgb565(const uint8_t* yuyv, uint8_t* rgb565, int w, int h) {
+    const int pixels = w * h;
+    int di = 0;
+    for (int i = 0; i < pixels; i += 2) {
+        int si = i * 2;
+        int y0 = yuyv[si];
+        int u  = yuyv[si + 1] - 128;
+        int y1 = yuyv[si + 2];
+        int v  = yuyv[si + 3] - 128;
+
+        auto clip = [](int x) -> int { return x < 0 ? 0 : (x > 255 ? 255 : x); };
+
+        auto to565 = [&](int y, int u2, int v2) -> uint16_t {
+            int r = y + ((v2 * 359) >> 8);
+            int g = y - ((u2 * 88) >> 8) - ((v2 * 183) >> 8);
+            int b = y + ((u2 * 454) >> 8);
+            return static_cast<uint16_t>(
+                ((clip(r) & 0xF8) << 8) | ((clip(g) & 0xFC) << 3) | ((clip(b) & 0xF8) >> 3)
+            );
+        };
+
+        uint16_t p0 = to565(y0, u, v);
+        uint16_t p1 = to565(y1, u, v);
+        rgb565[di++] = p0 & 0xFF;
+        rgb565[di++] = (p0 >> 8) & 0xFF;
+        rgb565[di++] = p1 & 0xFF;
+        rgb565[di++] = (p1 >> 8) & 0xFF;
+    }
+}
 
 #endif // SMART_CAM_DISPLAY_GUI_H

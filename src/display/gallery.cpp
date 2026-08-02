@@ -31,7 +31,7 @@ PhotoGallery::PhotoGallery(StorageManager* storage, QWidget* parent)
     , m_storage(storage)
 {
     setMinimumSize(700, 400);
-    setStyleSheet("background-color: #0F1117;");
+    setStyleSheet("background-color: #0a0a1a;");
 
     // ---- 视图栈 ----
     m_stack = new QStackedWidget(this);
@@ -94,23 +94,10 @@ void PhotoGallery::refresh() {
     }
 
     loadVisibleThumbnails();
-    updateStorageInfo();
 }
 
 void PhotoGallery::reset() {
     m_currentIndex = -1;
-    // 退出多选模式
-    if (m_selectMode) {
-        m_selectMode = false;
-        m_selectedIndices.clear();
-        m_btnSelectToggle->setText("Select");
-        m_btnSelectToggle->setStyleSheet(
-            "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
-            "  border: 2px solid #30363D; border-radius: 4px; }"
-            "QPushButton:pressed { background: #161B22; }");
-        m_selectToolBar->hide();
-    }
     m_stack->setCurrentIndex(0);
     refresh();
 }
@@ -132,93 +119,33 @@ void PhotoGallery::buildGalleryView() {
     auto* btnBack = new QPushButton("\u2190 Back", this);   // ←
     btnBack->setStyleSheet(
         "QPushButton { font-size: 14px; font-weight: bold;"
-        "  padding: 6px 14px; background: #21262D; color: #E6EDF3;"
-        "  border: 2px solid #30363D; border-radius: 4px; }"
-        "QPushButton:pressed { background: #161B22; }");
+        "  padding: 6px 14px; background: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+        "QPushButton:pressed { background: #1a252f; }");
     btnBack->setFixedHeight(34);
     connect(btnBack, &QPushButton::clicked, this, &PhotoGallery::backToLive);
 
     m_galleryTitle = new QLabel("Gallery", this);
     m_galleryTitle->setStyleSheet(
-        "font-size: 15px; font-weight: bold; color: #E6EDF3;"
+        "font-size: 15px; font-weight: bold; color: #e0e0e0;"
         "padding: 2px 10px;");
-
-    m_storageInfoLabel = new QLabel(this);
-    m_storageInfoLabel->setStyleSheet(
-        "font-size: 12px; color: #484F58; padding: 2px 6px;");
-
-    m_btnSelectToggle = new QPushButton("Select", this);
-    m_btnSelectToggle->setStyleSheet(
-        "QPushButton { font-size: 13px; font-weight: bold;"
-        "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
-        "  border: 2px solid #30363D; border-radius: 4px; }"
-        "QPushButton:pressed { background: #161B22; }");
-    m_btnSelectToggle->setFixedHeight(34);
-    connect(m_btnSelectToggle, &QPushButton::clicked,
-            this, &PhotoGallery::onToggleSelectMode);
 
     topBar->addWidget(btnBack);
     topBar->addWidget(m_galleryTitle);
     topBar->addStretch();
-    topBar->addWidget(m_btnSelectToggle);
-    topBar->addWidget(m_storageInfoLabel);
     layout->addLayout(topBar);
-
-    // ---- 多选操作工具栏（默认隐藏） ----
-    m_selectToolBar = new QWidget(this);
-    m_selectToolBar->setStyleSheet("background: #1A1D24; border-radius: 4px;");
-    auto* selLayout = new QHBoxLayout(m_selectToolBar);
-    selLayout->setContentsMargins(8, 4, 8, 4);
-    selLayout->setSpacing(8);
-
-    m_btnSelectAll = new QPushButton("Select All", this);
-    m_btnSelectAll->setStyleSheet(
-        "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #1F6FEB; color: white; border: 1px solid #58A6FF;"
-        "  border-radius: 3px; }"
-        "QPushButton:pressed { background: #1c6ea4; }");
-    connect(m_btnSelectAll, &QPushButton::clicked,
-            this, &PhotoGallery::onSelectAll);
-
-    QPushButton* btnDeselectAll = new QPushButton("Deselect All", this);
-    btnDeselectAll->setStyleSheet(
-        "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #484F58; color: white; border: 1px solid #484F58;"
-        "  border-radius: 3px; }"
-        "QPushButton:pressed { background: #6c7a7d; }");
-    connect(btnDeselectAll, &QPushButton::clicked,
-            this, &PhotoGallery::onDeselectAll);
-
-    m_btnDeleteSelected = new QPushButton("Delete (0)", this);
-    m_btnDeleteSelected->setStyleSheet(
-        "QPushButton { font-size: 12px; padding: 4px 10px;"
-        "  background: #F85149; color: white; border: 1px solid #F85149;"
-        "  border-radius: 3px; }"
-        "QPushButton:pressed { background: #962d22; }"
-        "QPushButton:disabled { background: #5a2d28; color: #7a5a58;"
-        "  border-color: #6a3a38; }");
-    m_btnDeleteSelected->setEnabled(false);
-    connect(m_btnDeleteSelected, &QPushButton::clicked,
-            this, &PhotoGallery::onDeleteSelected);
-
-    selLayout->addWidget(m_btnSelectAll);
-    selLayout->addWidget(btnDeselectAll);
-    selLayout->addStretch();
-    selLayout->addWidget(m_btnDeleteSelected);
-    m_selectToolBar->hide();
-    layout->addWidget(m_selectToolBar);
 
     // ---- 滚动区域 ----
     m_scrollArea = new QScrollArea(this);
     m_scrollArea->setWidgetResizable(true);
     m_scrollArea->setStyleSheet(
-        "QScrollArea { border: none; background: #0F1117; }"
-        "QScrollBar:vertical { width: 8px; background: #1A1D24; }"
-        "QScrollBar::handle:vertical { background: #30363D;"
+        "QScrollArea { border: none; background: #0a0a1a; }"
+        "QScrollBar:vertical { width: 8px; background: #16213e; }"
+        "QScrollBar::handle:vertical { background: #0f3460;"
         "  border-radius: 4px; min-height: 20px; }");
 
     auto* scrollWidget = new QWidget();
-    scrollWidget->setStyleSheet("background: #0F1117;");
+    scrollWidget->setStyleSheet("background: #0a0a1a;");
     m_gridLayout = new QGridLayout(scrollWidget);
     m_gridLayout->setContentsMargins(4, 4, 4, 4);
     m_gridLayout->setSpacing(THUMB_SPACING);
@@ -362,56 +289,12 @@ bool PhotoGallery::createVideoThumbnail(const std::string& aviPath,
 }
 
 // ============================================================
-// 存储空间状态
-// ============================================================
-
-void PhotoGallery::updateStorageInfo() {
-    if (!m_storage || !m_storageInfoLabel) return;
-
-    int freeMB = m_storage->getFreeSpaceMB();
-    int totalMB = m_storage->getTotalSpaceMB();
-
-    if (freeMB < 0 || totalMB < 0) {
-        m_storageInfoLabel->setText("Storage: N/A");
-        return;
-    }
-
-    int usedMB = totalMB - freeMB;
-    QString text;
-
-    if (totalMB >= 1024) {
-        double totalGB = totalMB / 1024.0;
-        double usedGB = usedMB / 1024.0;
-        text = QString("Storage: %1 / %2 GB").arg(usedGB, 0, 'f', 1).arg(totalGB, 0, 'f', 1);
-    } else {
-        text = QString("Storage: %1 / %2 MB").arg(usedMB).arg(totalMB);
-    }
-
-    // 空间不足时用红色警告
-    double freeRatio = (totalMB > 0) ? static_cast<double>(freeMB) / totalMB : 0.0;
-    if (freeRatio < 0.05) {
-        m_storageInfoLabel->setStyleSheet(
-            "font-size: 12px; color: #F85149; padding: 2px 6px; font-weight: bold;");
-        text += "  LOW!";
-    } else if (freeRatio < 0.15) {
-        m_storageInfoLabel->setStyleSheet(
-            "font-size: 12px; color: #f39c12; padding: 2px 6px;");
-    } else {
-        m_storageInfoLabel->setStyleSheet(
-            "font-size: 12px; color: #484F58; padding: 2px 6px;");
-    }
-
-    m_storageInfoLabel->setText(text);
-}
-
-// ============================================================
 // 加载可见缩略图
 // ============================================================
 
 void PhotoGallery::clearThumbnails() {
     // 清空网格中所有子控件
     if (!m_gridLayout) return;
-    m_checkBoxes.clear();
     QLayoutItem* item;
     while ((item = m_gridLayout->takeAt(0)) != nullptr) {
         if (item->widget()) {
@@ -457,7 +340,7 @@ void PhotoGallery::loadVisibleThumbnails() {
                 QString("  \u2014\u2014  %1  \u2014\u2014")
                     .arg(QString::fromStdString(info.dateStr)), this);
             dateLabel->setStyleSheet(
-                "font-size: 12px; color: #484F58; padding: 4px 8px;");
+                "font-size: 12px; color: #5a6c7d; padding: 4px 8px;");
             dateLabel->setAlignment(Qt::AlignCenter);
             m_gridLayout->addWidget(dateLabel, row, 0, 1, THUMB_COLS);
             row++;
@@ -468,13 +351,13 @@ void PhotoGallery::loadVisibleThumbnails() {
         btn->setFixedSize(THUMB_W, THUMB_H);
         btn->setStyleSheet(
             "QPushButton {"
-            "  background: #1A1D24;"
-            "  border: 2px solid #30363D;"
+            "  background: #16213e;"
+            "  border: 2px solid #0f3460;"
             "  border-radius: 4px;"
             "  padding: 2px;"
             "}"
             "QPushButton:pressed {"
-            "  border-color: #4493F8;"
+            "  border-color: #1a6fb5;"
             "}");
 
         if (info.isVideo) {
@@ -498,27 +381,13 @@ void PhotoGallery::loadVisibleThumbnails() {
             } else {
                 btn->setText("?");
                 btn->setStyleSheet(btn->styleSheet() +
-                    " color: #484F58; font-size: 24px;");
+                    " color: #5a6c7d; font-size: 24px;");
             }
         }
 
         // 点击 → 全屏（用 lambda 捕获索引）
         int idx = static_cast<int>(i);
         connect(btn, &QPushButton::clicked, this, [this, idx]() {
-            if (m_selectMode) {
-                // 多选模式下点击缩略图切换勾选
-                if (m_selectedIndices.contains(idx)) {
-                    m_selectedIndices.remove(idx);
-                } else {
-                    m_selectedIndices.insert(idx);
-                }
-                // 同步对应 checkbox
-                if (idx < m_checkBoxes.size() && m_checkBoxes[idx]) {
-                    m_checkBoxes[idx]->setChecked(m_selectedIndices.contains(idx));
-                }
-                updateDeleteSelectedButton();
-                return;
-            }
             m_currentIndex = idx;
             updateFullscreenDisplay();
             m_stack->setCurrentIndex(1);
@@ -539,44 +408,14 @@ void PhotoGallery::loadVisibleThumbnails() {
         auto* infoLabel = new QLabel(detail, this);
         infoLabel->setAlignment(Qt::AlignCenter);
         infoLabel->setStyleSheet(
-            "font-size: 11px; color: #484F58; padding: 2px;");
+            "font-size: 11px; color: #7f8c8d; padding: 2px;");
 
-        // 多选复选框（覆盖在缩略图左上角）
-        auto* checkBox = new QCheckBox(this);
-        checkBox->setStyleSheet(
-            "QCheckBox { spacing: 0; }"
-            "QCheckBox::indicator { width: 22px; height: 22px;"
-            "  border: 2px solid #30363D; border-radius: 3px;"
-            "  background: rgba(10,10,26,180); }"
-            "QCheckBox::indicator:checked {"
-            "  background: #1F6FEB; border-color: #58A6FF; }");
-        checkBox->setChecked(m_selectedIndices.contains(idx));
-        checkBox->setVisible(m_selectMode);
-        connect(checkBox, &QCheckBox::toggled, this, [this, idx](bool checked) {
-            onItemSelectionChanged(idx, checked);
-        });
-        m_checkBoxes.push_back(checkBox);
-
-        // 按钮 + 复选框 + 标签放入一个容器
+        // 按钮 + 标签放入一个容器
         auto* cellWidget = new QWidget(this);
-        cellWidget->setStyleSheet("position: relative;");
         auto* cellLayout = new QVBoxLayout(cellWidget);
         cellLayout->setContentsMargins(0, 0, 0, 0);
         cellLayout->setSpacing(2);
-
-        // 缩略图 + 复选框叠放
-        auto* thumbStack = new QWidget(this);
-        auto* thumbStackLayout = new QVBoxLayout(thumbStack);
-        thumbStackLayout->setContentsMargins(0, 0, 0, 0);
-        thumbStackLayout->setSpacing(0);
-        thumbStackLayout->addWidget(btn, 0, Qt::AlignCenter);
-
-        // 绝对定位复选框在缩略图左上角
-        checkBox->setParent(btn);
-        checkBox->move(4, 4);
-        checkBox->raise();
-
-        cellLayout->addWidget(thumbStack, 0, Qt::AlignCenter);
+        cellLayout->addWidget(btn, 0, Qt::AlignCenter);
         cellLayout->addWidget(infoLabel, 0, Qt::AlignCenter);
 
         int col = static_cast<int>(i) % THUMB_COLS;
@@ -603,9 +442,9 @@ void PhotoGallery::buildFullscreenView() {
     m_btnBackGal = new QPushButton("\u2190 Gallery", this);
     m_btnBackGal->setStyleSheet(
         "QPushButton { font-size: 14px; font-weight: bold;"
-        "  padding: 6px 14px; background: #21262D; color: #E6EDF3;"
-        "  border: 2px solid #30363D; border-radius: 4px; }"
-        "QPushButton:pressed { background: #161B22; }");
+        "  padding: 6px 14px; background: #2c3e50; color: #ecf0f1;"
+        "  border: 2px solid #5a6c7d; border-radius: 4px; }"
+        "QPushButton:pressed { background: #1a252f; }");
     m_btnBackGal->setFixedHeight(34);
     connect(m_btnBackGal, &QPushButton::clicked,
             this, &PhotoGallery::onBackToGallery);
@@ -621,12 +460,12 @@ void PhotoGallery::buildFullscreenView() {
 
     // ---- 媒体显示区（QStackedWidget: [0]照片 / [1]视频播放器） ----
     m_fullMediaStack = new QStackedWidget(this);
-    m_fullMediaStack->setStyleSheet("background-color: #0F1117; border: none;");
+    m_fullMediaStack->setStyleSheet("background-color: #0a0a1a; border: none;");
 
     m_fullPhotoDisplay = new QLabel(this);
     m_fullPhotoDisplay->setAlignment(Qt::AlignCenter);
     m_fullPhotoDisplay->setStyleSheet(
-        "background-color: #0F1117; border: none;");
+        "background-color: #0a0a1a; border: none;");
     m_fullPhotoDisplay->setScaledContents(false);
     m_fullPhotoDisplay->setSizePolicy(
         QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -651,23 +490,23 @@ void PhotoGallery::buildFullscreenView() {
             "  border: 2px solid %1; background-color: %2;"
             "  min-width: 80px; }"
             "QPushButton:pressed { background-color: %3; }")
-            .arg(border, bg, bg == "#1F6FEB"   ? "#1c6ea4" :
-                              bg == "#F85149"   ? "#962d22" :
-                              bg == "#27ae60"   ? "#1e8449" : "#161B22");
+            .arg(border, bg, bg == "#2980b9"   ? "#1c6ea4" :
+                              bg == "#c0392b"   ? "#962d22" :
+                              bg == "#27ae60"   ? "#1e8449" : "#1a252f");
     };
 
     m_btnPrev = new QPushButton("\u25C0 Prev", this);
-    m_btnPrev->setStyleSheet(btnStyle("#4493F8", "#58A6FF"));
+    m_btnPrev->setStyleSheet(btnStyle("#2980b9", "#5aa9e6"));
     m_btnPrev->setFixedHeight(36);
     connect(m_btnPrev, &QPushButton::clicked, this, &PhotoGallery::onPrevPhoto);
 
     m_btnNext = new QPushButton("Next \u25B6", this);
-    m_btnNext->setStyleSheet(btnStyle("#4493F8", "#58A6FF"));
+    m_btnNext->setStyleSheet(btnStyle("#2980b9", "#5aa9e6"));
     m_btnNext->setFixedHeight(36);
     connect(m_btnNext, &QPushButton::clicked, this, &PhotoGallery::onNextPhoto);
 
     m_btnDelete = new QPushButton("\u2672 Delete", this);
-    m_btnDelete->setStyleSheet(btnStyle("#F85149", "#FF6B61"));
+    m_btnDelete->setStyleSheet(btnStyle("#c0392b", "#e74c3c"));
     m_btnDelete->setFixedHeight(36);
     connect(m_btnDelete, &QPushButton::clicked,
             this, &PhotoGallery::onDeletePhoto);
@@ -727,8 +566,8 @@ void PhotoGallery::updateFullscreenDisplay() {
                     .arg(QString::fromStdString(info.filename))
                     .arg(sizeStr));
             m_fullPhotoDisplay->setStyleSheet(
-                "font-size: 18px; color: #F85149;"
-                "background-color: #0F1117; border: none;"
+                "font-size: 18px; color: #e74c3c;"
+                "background-color: #0a0a1a; border: none;"
                 "padding: 40px;");
             m_fullMediaStack->setCurrentIndex(0);
         }
@@ -741,12 +580,12 @@ void PhotoGallery::updateFullscreenDisplay() {
                 660, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation));
             m_fullPhotoDisplay->setPixmap(pix);
             m_fullPhotoDisplay->setStyleSheet(
-                "background-color: #0F1117; border: none;");
+                "background-color: #0a0a1a; border: none;");
         } else {
             m_fullPhotoDisplay->setText("Failed to load image");
             m_fullPhotoDisplay->setStyleSheet(
-                "font-size: 18px; color: #F85149;"
-                "background-color: #0F1117; border: none;"
+                "font-size: 18px; color: #e74c3c;"
+                "background-color: #0a0a1a; border: none;"
                 "padding: 40px;");
         }
     }
@@ -783,25 +622,14 @@ void PhotoGallery::onDeletePhoto() {
     const auto& info = m_flatPhotos[static_cast<size_t>(m_currentIndex)];
 
     QString typeStr = info.isVideo ? "video" : "photo";
+    auto reply = QMessageBox::question(
+        this, QString("Delete %1").arg(typeStr),
+        QString("Delete this %1?\n\n%2")
+            .arg(typeStr, QString::fromStdString(info.filename)),
+        QMessageBox::Cancel | QMessageBox::Yes,
+        QMessageBox::Cancel);
 
-    QMessageBox msgBox(this);
-    msgBox.setIcon(QMessageBox::Warning);
-    msgBox.setWindowTitle(QString("Delete %1").arg(typeStr));
-    msgBox.setText(QString("Delete this %1?").arg(typeStr));
-    msgBox.setInformativeText(QString::fromStdString(info.filename));
-    msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
-    msgBox.setDefaultButton(QMessageBox::Cancel);
-    msgBox.setStyleSheet(
-        "QMessageBox { background-color: #21262D; }"
-        "QMessageBox { border: 2px solid #FF6B61; }"
-        "QLabel { color: #E6EDF3; font-size: 14px; }"
-        "QPushButton { background-color: #30363D; color: #E6EDF3;"
-        "  border: 1px solid #30363D; border-radius: 4px;"
-        "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
-        "QPushButton:hover { background-color: #4a6785; }"
-        "QPushButton:pressed { background-color: #161B22; }");
-
-    if (msgBox.exec() != QMessageBox::Yes) return;
+    if (reply != QMessageBox::Yes) return;
 
     int result = info.isVideo
         ? m_storage->deleteVideo(info.path)
@@ -843,151 +671,6 @@ void PhotoGallery::onVideoPlaybackFinished() {
     // 视频播放到末尾，保持暂停状态（显示最后一帧）
     // 用户可以点击 Prev/Next 切换
     qDebug() << "[Gallery] Video playback finished, index:" << m_currentIndex;
-}
-
-// ============================================================
-// 多选模式
-// ============================================================
-
-void PhotoGallery::onToggleSelectMode() {
-    m_selectMode = !m_selectMode;
-
-    if (m_selectMode) {
-        // 进入多选模式
-        m_btnSelectToggle->setText("Cancel");
-        m_btnSelectToggle->setStyleSheet(
-            "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #F85149; color: #E6EDF3;"
-            "  border: 2px solid #FF6B61; border-radius: 4px; }"
-            "QPushButton:pressed { background: #962d22; }");
-        m_selectToolBar->show();
-        m_selectedIndices.clear();
-        updateDeleteSelectedButton();
-    } else {
-        // 退出多选模式
-        m_btnSelectToggle->setText("Select");
-        m_btnSelectToggle->setStyleSheet(
-            "QPushButton { font-size: 13px; font-weight: bold;"
-            "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
-            "  border: 2px solid #30363D; border-radius: 4px; }"
-            "QPushButton:pressed { background: #161B22; }");
-        m_selectToolBar->hide();
-        m_selectedIndices.clear();
-    }
-
-    // 刷新缩略图以显示/隐藏复选框
-    loadVisibleThumbnails();
-}
-
-void PhotoGallery::onSelectAll() {
-    m_selectedIndices.clear();
-    for (int i = 0; i < static_cast<int>(m_flatPhotos.size()); ++i) {
-        m_selectedIndices.insert(i);
-    }
-    // 同步所有 checkbox
-    for (int i = 0; i < m_checkBoxes.size() && i < static_cast<int>(m_flatPhotos.size()); ++i) {
-        if (m_checkBoxes[i]) m_checkBoxes[i]->setChecked(true);
-    }
-    updateDeleteSelectedButton();
-}
-
-void PhotoGallery::onDeselectAll() {
-    m_selectedIndices.clear();
-    for (int i = 0; i < m_checkBoxes.size(); ++i) {
-        if (m_checkBoxes[i]) m_checkBoxes[i]->setChecked(false);
-    }
-    updateDeleteSelectedButton();
-}
-
-void PhotoGallery::onItemSelectionChanged(int flatIndex, bool checked) {
-    if (checked) {
-        m_selectedIndices.insert(flatIndex);
-    } else {
-        m_selectedIndices.remove(flatIndex);
-    }
-    updateDeleteSelectedButton();
-}
-
-void PhotoGallery::updateDeleteSelectedButton() {
-    int count = m_selectedIndices.size();
-    m_btnDeleteSelected->setText(QString("Delete (%1)").arg(count));
-    m_btnDeleteSelected->setEnabled(count > 0);
-}
-
-void PhotoGallery::onDeleteSelected() {
-    if (m_selectedIndices.isEmpty()) return;
-
-    int count = m_selectedIndices.size();
-
-    QMessageBox msgBox(this);
-    msgBox.setIcon(QMessageBox::Warning);
-    msgBox.setWindowTitle("Delete Selected");
-    msgBox.setText(QString("Delete %1 selected item(s)?").arg(count));
-    msgBox.setInformativeText("This cannot be undone.");
-    msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
-    msgBox.setDefaultButton(QMessageBox::Cancel);
-    msgBox.setStyleSheet(
-        "QMessageBox { background-color: #21262D; }"
-        "QMessageBox { border: 2px solid #FF6B61; }"
-        "QLabel { color: #E6EDF3; font-size: 14px; }"
-        "QPushButton { background-color: #30363D; color: #E6EDF3;"
-        "  border: 1px solid #30363D; border-radius: 4px;"
-        "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
-        "QPushButton:hover { background-color: #4a6785; }"
-        "QPushButton:pressed { background-color: #161B22; }");
-
-    if (msgBox.exec() != QMessageBox::Yes) return;
-
-    // 收集要删除的路径
-    QStringList failedItems;
-    int deletedCount = 0;
-
-    for (int idx : m_selectedIndices) {
-        if (idx < 0 || idx >= static_cast<int>(m_flatPhotos.size())) continue;
-
-        const auto& info = m_flatPhotos[static_cast<size_t>(idx)];
-        int result = info.isVideo
-            ? m_storage->deleteVideo(info.path)
-            : m_storage->deletePhoto(info.path);
-
-        if (result == 0) {
-            deletedCount++;
-        } else {
-            failedItems << QString::fromStdString(info.filename);
-        }
-    }
-
-    if (!failedItems.isEmpty()) {
-        QMessageBox msgBox(this);
-        msgBox.setIcon(QMessageBox::Critical);
-        msgBox.setWindowTitle("Delete Partially Failed");
-        msgBox.setText(QString("Deleted %1 item(s).").arg(deletedCount));
-        msgBox.setInformativeText(QString("Failed to delete:\n%1").arg(failedItems.join("\n")));
-        msgBox.setStandardButtons(QMessageBox::Ok);
-        msgBox.setStyleSheet(
-            "QMessageBox { background-color: #21262D; }"
-            "QMessageBox { border: 2px solid #e67e22; }"
-            "QLabel { color: #E6EDF3; font-size: 14px; }"
-            "QPushButton { background-color: #30363D; color: #E6EDF3;"
-            "  border: 1px solid #30363D; border-radius: 4px;"
-            "  padding: 6px 16px; font-size: 13px; min-width: 80px; }"
-            "QPushButton:hover { background-color: #4a6785; }"
-            "QPushButton:pressed { background-color: #161B22; }");
-        msgBox.exec();
-    }
-
-    // 退出多选模式并刷新
-    m_selectMode = false;
-    m_btnSelectToggle->setText("Select");
-    m_btnSelectToggle->setStyleSheet(
-        "QPushButton { font-size: 13px; font-weight: bold;"
-        "  padding: 6px 12px; background: #21262D; color: #E6EDF3;"
-        "  border: 2px solid #30363D; border-radius: 4px; }"
-        "QPushButton:pressed { background: #161B22; }");
-    m_selectToolBar->hide();
-    m_selectedIndices.clear();
-
-    refresh();
 }
 
 // ============================================================

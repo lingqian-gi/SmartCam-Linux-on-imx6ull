@@ -27,23 +27,13 @@
 #include <QDebug>
 #include <QImage>
 #include <cstdio>
-#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
-#include <chrono>
 #include <vector>
 #include <cstring>
 #include <arpa/inet.h>
-#include <signal.h>      // 崩溃信号处理
-#include <execinfo.h>    // backtrace
-#include <ucontext.h>    // ucontext_t / mcontext_t（崩溃现场寄存器）
-#include <dlfcn.h>       // dladdr：解析崩溃地址所属共享库与符号
-#include <unistd.h>
-#include <ifaddrs.h>     // getifaddrs：查询本机 IP
-#include <netinet/in.h>
-#include <sys/socket.h>
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
@@ -71,7 +61,6 @@ struct CaptureState {
     std::condition_variable pauseCv;         // 暂停同步条件变量
     std::atomic<bool>       pausedAck{false}; // 采集线程已确认暂停
     std::atomic<int>        targetFps{0};    // 用户设定的目标帧率（0=不限制，跟随硬件）
-    std::atomic<uint64_t>   frameSeq{0};     // 帧序号（每次写入新帧 +1），解码线程据此检测新帧
 
     // 帧处理线程同步
     std::mutex              procMtx;           // 处理线程专用锁
@@ -80,127 +69,13 @@ struct CaptureState {
 };
 static CaptureState g_state;
 
-// 显示帧缓冲（解码线程写，GUI 线程拉取）— 独立解码 + 轻量 GUI 绘制的桥梁
-struct DisplayFrame {
-    std::mutex              mtx;
-    std::vector<uint8_t>    rgb;      // RGB24 像素（解码线程产出）
-    int                     width  = 0;
-    int                     height = 0;
-    uint64_t                seq    = 0;  // 对应 g_state.frameSeq，GUI 用于去重
-};
-static DisplayFrame g_display;
-
 // 录像状态（由 main 线程设置，采集线程读取）
 static std::atomic<bool> g_recording{false};
-
-// ============================================================
-// 崩溃信号处理器：打印崩溃现场后退出（定位段错误/断言失败）
-// ============================================================
-// 注意：信号处理器中只能使用 async-signal-safe 函数
-// （dprintf / _exit 安全；backtrace 可安全调用但会被信号帧截断）。
-//
-// 关键：backtrace() 在信号处理器中会停在信号返回桩（__default_sa_restorer），
-// 展开不到真正的崩溃点。真正的崩溃指令在被中断线程的 ucontext 寄存器里——
-// 因此用 3 参数 handler + SA_SIGINFO，从 ucontext 提取 PC/LR/SP。
-// PC 即崩溃指令地址，配合 arm-linux-gnueabihf-addr2line 可精确定位函数。
-static void crashSignalHandler(int sig, siginfo_t* /*si*/, void* ucontext) {
-    const char* sigName = "UNKNOWN";
-    switch (sig) {
-    case SIGSEGV: sigName = "SIGSEGV(段错误/空指针)"; break;
-    case SIGABRT: sigName = "SIGABRT(abort/断言)";     break;
-    case SIGFPE:  sigName = "SIGFPE(除零/整数溢出)";   break;
-    case SIGBUS:  sigName = "SIGBUS(总线错误)";        break;
-    default: break;
-    }
-
-    dprintf(2, "\n===== SmartCam CRASH: signal %d (%s) =====\n", sig, sigName);
-
-#if defined(__arm__)
-    // ARM 被中断线程的崩溃现场（backtrace 会被信号帧截断，寄存器才是精确崩溃点）
-    ucontext_t* uc   = static_cast<ucontext_t*>(ucontext);
-    mcontext_t* mctx = &uc->uc_mcontext;
-    dprintf(2, "  ARM PC=%#lx LR=%#lx SP=%#lx FP=%#lx\n",
-            static_cast<unsigned long>(mctx->arm_pc),
-            static_cast<unsigned long>(mctx->arm_lr),
-            static_cast<unsigned long>(mctx->arm_sp),
-            static_cast<unsigned long>(mctx->arm_fp));
-
-    // 用 dladdr 解析 PC/LR 所属共享库 + 库内偏移 + 函数名
-    // （崩溃常发生在动态库（如 Qt）内部，裸地址需换算成库内偏移才能 addr2line）
-    void* pcAddrs[2] = { reinterpret_cast<void*>(mctx->arm_pc),
-                         reinterpret_cast<void*>(mctx->arm_lr) };
-    for (int i = 0; i < 2; ++i) {
-        Dl_info di;
-        if (dladdr(pcAddrs[i], &di) && di.dli_fname) {
-            unsigned long off = reinterpret_cast<unsigned long>(pcAddrs[i])
-                              - reinterpret_cast<unsigned long>(di.dli_fbase);
-            dprintf(2, "    addr[%d] %p → %s + 0x%lx  (%s)\n",
-                    i, pcAddrs[i], di.dli_fname, off,
-                    di.dli_sname ? di.dli_sname : "?");
-        }
-    }
-#endif
-
-    // 辅助栈（可能被信号帧截断，仅供参考）
-    void* frames[32];
-    int n = backtrace(frames, 32);
-    backtrace_symbols_fd(frames, n, 2);
-    dprintf(2, "===== end backtrace =====\n");
-    _exit(128 + sig);
-}
-
-// 查询本机第一个非回环 IPv4 地址（用于打印访问地址，替代 <dev-ip> 占位符）
-// 失败返回空串，调用方回退占位符
-static std::string getLocalIP() {
-    struct ifaddrs* ifaddr = nullptr;
-    std::string ip;
-    if (getifaddrs(&ifaddr) == 0) {
-        for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-            // 跳过回环 (127.x) 与未配置地址 (0.x)
-            const auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-            uint32_t a = ntohl(sin->sin_addr.s_addr);
-            if ((a >> 24) == 127 || (a >> 24) == 0) continue;
-            char buf[INET_ADDRSTRLEN] = {0};
-            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
-                ip = buf;
-                break;
-            }
-        }
-        freeifaddrs(ifaddr);
-    }
-    return ip;
-}
-
-// 安装崩溃信号处理器（SA_RESETHAND：处理器内二次崩溃则恢复默认，避免递归）
-static void installCrashHandlers() {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = crashSignalHandler;   // 3 参数版，接收 ucontext
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND | SA_SIGINFO;  // SA_SIGINFO 传递崩溃现场
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGFPE,  &sa, nullptr);
-    sigaction(SIGBUS,  &sa, nullptr);
-}
 
 // 存储管理器（全局单例指针，线程安全）
 static StorageManager* g_storage = nullptr;
 
 int main(int argc, char* argv[]) {
-    installCrashHandlers();   // 崩溃时打印调用栈（优先于 Qt 默认处理）
-
-    // linuxfb 下强制隐藏鼠标光标：
-    // 板子 Qt 5.11.3 在 linuxfb 初始化 QPlatformCursorImage 时，
-    // 对空 QImage 做 operator= 会空指针崩溃（SIGSEGV）。设 HIDECURSOR=1 绕过。
-    // （README 部署命令已含此环境变量，这里兜底强制设置，防止漏配）
-    QByteArray qpa = qgetenv("QT_QPA_PLATFORM");
-    if (qpa.contains("linuxfb") && !qEnvironmentVariableIsSet("QT_QPA_FB_HIDECURSOR")) {
-        qputenv("QT_QPA_FB_HIDECURSOR", "1");
-        LOG_INF("QT_QPA_FB_HIDECURSOR=1 (linuxfb 光标已隐藏，避免 QPlatformCursorImage 崩溃)");
-    }
-
     QApplication app(argc, argv);
     app.setApplicationName("SmartCam");
     app.setApplicationVersion("0.1.0");
@@ -400,7 +275,6 @@ int main(int argc, char* argv[]) {
     CameraCapture*    capture      = nullptr;
     std::thread*      captureThread = nullptr;
     std::thread*      processThread = nullptr;
-    std::thread*      decodeThread  = nullptr;  // 显示解码线程（MJPEG/YUYV → RGB24）
     QTimer*           displayTimer = nullptr;
     MJPEGStreamServer* mjpegServer = nullptr;
     ControlServer*    controlSrv   = nullptr;
@@ -458,39 +332,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // ★ 最小采集诊断模式：SMARTCAM_MIN_CAPTURE=1 时只跑采集线程
-        //   （跳过控制查询/服务器/处理/解码线程），用于二分定位
-        //   "采集核心" vs "其他部分干扰摄像头"（v4l2-ctl 能持续抓帧而程序只 1 帧）
-        {
-            const char* minCapEnv = getenv("SMARTCAM_MIN_CAPTURE");
-            bool minCapture = minCapEnv && minCapEnv[0] == '1';
-            if (minCapture) {
-                if (capture->startCapture() < 0) {
-                    LOG_ERR_("MIN_CAPTURE: startCapture failed");
-                    delete capture;
-                    return 1;
-                }
-                LOG_INF("MIN_CAPTURE mode: capture-only (Ctrl+C to stop)");
-                std::thread capT([capture]() {
-                    FrameBuffer fb;
-                    uint64_t n = 0;
-                    while (g_state.running) {
-                        if (capture->getFrame(&fb, -1) < 0) continue;
-                        n++;
-                        LOG_INF("MIN_CAPTURE: frame %llu bytes=%d",
-                                (unsigned long long)n, fb.length);
-                        capture->putFrame(&fb);
-                    }
-                });
-                capT.detach();
-                gui.show();
-                int rc = app.exec();
-                g_state.running = false;
-                if (capture) capture->release();
-                return rc;
-            }
-        }
-
         Resolution curRes = capture->getCurrentResolution();
         uint32_t   curFmt = capture->getCurrentFormat();
         LOG_INF("Active format: %dx%d, fmt='%c%c%c%c'",
@@ -498,10 +339,6 @@ int main(int argc, char* argv[]) {
                  (curFmt >> 0) & 0xFF, (curFmt >> 8) & 0xFF,
                  (curFmt >> 16) & 0xFF, (curFmt >> 24) & 0xFF);
 
-        // ★ startCapture() 放在控制查询之前（与 70fa0aa 一致，实测持续出帧）
-        // ============================================================
-        // 启动 V4L2 采集流（STREAMON）
-        // ============================================================
         if (capture->startCapture() < 0) {
             LOG_ERR_("Failed to start capture");
             delete capture;
@@ -552,51 +389,29 @@ int main(int argc, char* argv[]) {
                 LOG_INF("Auto WB: cur=%d", val);
             }
 
-            // 自动曝光 → 查询并更新 GUI
-            // ★ 修复：默认不再强制设置曝光——部分 UVC 摄像头（如 32e6:9221）
-            //   在手动曝光下会固件卡死（只输出首帧后停流，DQBUF 永久阻塞）。
-            //   需要强制曝光时显式设置环境变量 SMARTCAM_FORCE_EXPOSURE=<绝对值>。
+            // 自动曝光 → 仅查询并更新 GUI，不写硬件（保留摄像头自动曝光）。
+            // ★ 修复：强制手动曝光(Exposure=300)会让该摄像头固件进入异常状态
+            //   （输出黑帧且状态残留，退出程序后 v4l2-ctl 抓帧也黑）。
+            //   v4l2-ctl 实证：不设曝光 → 正常大帧(~100KB)，设曝光300 → 黑帧(~6.7KB)。
             {
-                const char* forceExp = getenv("SMARTCAM_FORCE_EXPOSURE");
-                int forceExpVal = forceExp ? atoi(forceExp) : 0;
-
                 int expMin, expMax, expStep, expDef, expVal;
                 if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO,
                                            expMin, expMax, expStep, expDef) == 0) {
                     capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_AUTO, expVal);
-                    LOG_INF("Auto Exposure: cur=%d (1=manual, 3=auto)%s",
-                            expVal, forceExpVal > 0 ? " [will force manual]" : "");
-                    if (forceExpVal > 0 && expVal != 1) {
-                        capture->setControl(
-                            static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_AUTO), 1);
-                        LOG_INF("Auto Exposure disabled (forced manual) per SMARTCAM_FORCE_EXPOSURE");
-                    }
-                    gui.setAutoExposure(false);  // 初始默认关闭自动曝光
+                    LOG_INF("Auto Exposure: cur=%d (1=manual, 3=auto), not forced",
+                            expVal);
+                    gui.setAutoExposure(expVal != 1);  // 反映当前自动/手动状态
                 }
 
-                // 曝光绝对值：查询范围供 GUI 滑块；仅显式要求时写硬件
-                int absMin, absMax, absStep, absDef;
+                // 曝光绝对值：只查询范围供 GUI 滑块显示，不写硬件
+                int absMin, absMax, absStep, absDef, absCur;
                 if (capture->queryControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
                                            absMin, absMax, absStep, absDef) == 0) {
-                    if (forceExpVal > 0) {
-                        int target = forceExpVal;
-                        if (target < absMin) target = absMin;
-                        if (target > absMax) target = absMax;
-                        capture->setControl(
-                            static_cast<int>(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE),
-                            target);
-                        gui.setExposureRange(absMin, absMax, absStep, target);
-                        LOG_INF("Exposure forced to %d (SMARTCAM_FORCE_EXPOSURE)", target);
-                    } else {
-                        // 不写硬件：GUI 滑块仅显示当前值，曝光保持自动
-                        int absCur = 0;
-                        capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE,
-                                            absCur);
-                        int def = (absCur > 0) ? absCur : (absDef > 0 ? absDef : absMin);
-                        gui.setExposureRange(absMin, absMax, absStep, def);
-                        LOG_INF("Exposure: not forced (auto), range=[%d,%d] cur=%d",
-                                absMin, absMax, absCur);
-                    }
+                    capture->getControl(CameraCapture::V4L2_CID_EXPOSURE_ABSOLUTE, absCur);
+                    int def = (absCur > 0) ? absCur : (absDef > 0 ? absDef : absMin);
+                    gui.setExposureRange(absMin, absMax, absStep, def);
+                    LOG_INF("Exposure: not forced (auto kept), range=[%d,%d] cur=%d",
+                            absMin, absMax, absCur);
                 }
             }
 
@@ -923,6 +738,11 @@ int main(int argc, char* argv[]) {
             // 帧率节流：记录上次输出帧的时间戳
             auto lastOutputTime = std::chrono::steady_clock::now();
             int  throttleFps    = g_state.targetFps.load();
+            // 诊断：记录实际帧间隔用于定位硬件帧率
+            auto  diagLastTime  = std::chrono::steady_clock::now();
+            int   diagFrameCount = 0;
+            double diagMinInterval = 9999.0, diagMaxInterval = 0.0;
+
             while (g_state.running) {
                 // 暂停期间等待恢复（分辨率/格式切换中）
                 if (g_state.paused) {
@@ -939,15 +759,8 @@ int main(int argc, char* argv[]) {
 
                 if (capture->getFrame(&fb, 1000) < 0) {
                     if (!g_state.running) break;
-                    LOG_DBG("capture: getFrame timeout (1000ms)");
                     continue;  // 超时重试
                 }
-
-                // 诊断：打印采集到的帧字节数（bytesused=0 表示摄像头未输出有效数据）
-                LOG_DBG("capture: got frame %d bytes fmt=%d %dx%d seq=%llu",
-                        fb.length, static_cast<int>(fb.format),
-                        fb.width, fb.height,
-                        (unsigned long long)(g_state.frameSeq.load() + 1));
 
                 // ---- 帧率节流 ----
                 if (throttleFps > 0) {
@@ -958,11 +771,35 @@ int main(int argc, char* argv[]) {
 
                     if (elapsedMs < minIntervalMs) {
                         capture->putFrame(&fb);
-                        LOG_DBG("capture: throttle skip frame (%d fps)",
-                                throttleFps);
                         continue;
                     }
                     lastOutputTime = now;
+                }
+
+                // 诊断：测量实际帧间隔（每 100 帧输出一次）
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    double interval = std::chrono::duration<double>(now - diagLastTime).count();
+                    if (interval < diagMinInterval) diagMinInterval = interval;
+                    if (interval > diagMaxInterval) diagMaxInterval = interval;
+                    diagLastTime = now;
+                    diagFrameCount++;
+
+                    if (diagFrameCount % 100 == 0) {
+                        double avgMs = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(g_state.mtx);
+                            avgMs = (g_state.fps > 0) ? 1000.0 / g_state.fps : 0;
+                        }
+                        LOG_INF("[FPS Diag] avg=%.1f fps (%.1f ms/frame), "
+                                "raw interval: min=%.1f ms, max=%.1f ms, "
+                                "frame size=%d bytes, throttle=%d fps",
+                                (avgMs > 0 ? 1000.0/avgMs : 0), avgMs,
+                                diagMinInterval * 1000.0, diagMaxInterval * 1000.0,
+                                fb.length, throttleFps);
+                        diagMinInterval = 9999.0;
+                        diagMaxInterval = 0.0;
+                    }
                 }
 
                 // 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
@@ -973,7 +810,6 @@ int main(int argc, char* argv[]) {
                     g_state.height = fb.height;
                     g_state.format = fb.format;
                     g_state.fps    = capture->getCurrentFPS();
-                    g_state.frameSeq.fetch_add(1);   // 新帧就绪，解码线程据此拉取
                 }
 
                 // 立即归还 V4L2 缓冲区，让硬件可以写入下一帧
@@ -993,9 +829,6 @@ int main(int argc, char* argv[]) {
         // ============================================================
         std::thread* processThread = new std::thread([mjpegServer, mjpegServerOk,
                                                        rtspServer]() {
-            LOG_INF("Process thread started (mjpegServerOk=%d)",
-                    mjpegServerOk ? 1 : 0);
-            uint64_t procFrames = 0;
             while (g_state.running) {
                 // 等待采集线程通知新帧
                 {
@@ -1005,8 +838,6 @@ int main(int argc, char* argv[]) {
                     });
                     g_state.frameReady = false;
                 }
-                LOG_DBG("process: woken up (seq=%llu)",
-                        (unsigned long long)g_state.frameSeq.load());
 
                 if (!g_state.running) break;
 
@@ -1017,17 +848,12 @@ int main(int argc, char* argv[]) {
 
                 {
                     std::lock_guard<std::mutex> lock(g_state.mtx);
-                    if (g_state.frameData.empty()) {
-                        LOG_WRN("process: frameData empty, skipping (seq=%llu)",
-                                (unsigned long long)g_state.frameSeq.load());
-                        continue;
-                    }
+                    if (g_state.frameData.empty()) continue;
                     localFrame = g_state.frameData;  // 拷贝出来，快速释放锁
                     localW   = g_state.width;
                     localH   = g_state.height;
                     localFmt = g_state.format;
                 }
-                procFrames++;
 
                 // YUYV → JPEG 编码（CPU 密集，不阻塞采集线程）
                 bool needEncode = (localFmt == PixelFormat::FMT_YUYV) &&
@@ -1067,12 +893,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                LOG_DBG("process: frame %llu fmt=%d %d bytes → HTTP(%s) RTSP(%s)",
-                        (unsigned long long)procFrames, static_cast<int>(localFmt),
-                        (int)localFrame.size(),
-                        (mjpegServerOk && localFmt == PixelFormat::FMT_MJPEG) ? "fed" : "skip",
-                        rtspServer ? "fed" : "skip");
-
                 if (jpeg_out) free(jpeg_out);
 
                 // 录像写入（磁盘 I/O，不阻塞采集线程）
@@ -1084,146 +904,22 @@ int main(int argc, char* argv[]) {
         });
 
         // ============================================================
-        // 显示解码线程（JPEG/YUYV → RGB24，独立于 GUI 线程，专供本地显示）
+        // 显示定时器（Qt 主线程，33ms ≈ 30fps）
         // ============================================================
-        // 动机：MJPEG 解码 ~25ms 若留在 GUI 线程会阻塞事件循环（掉帧/按钮无响应）。
-        // 本线程拉取最新原始帧 → 解码成 RGB24 → 发布到 g_display，
-        // GUI 线程只做"拷贝 RGB + setPixmap"的轻量绘制。
-        decodeThread = new std::thread([]() {
-            LOG_INF("Display decode thread started");
-            uint64_t lastSeq = 0;
-            while (g_state.running) {
-                // 1. 拉取最新原始帧（只取最新，中间帧覆盖丢弃）
-                std::vector<uint8_t> raw;
-                int      w = 0, h = 0;
-                PixelFormat fmt = PixelFormat::FMT_RGB24;
-                uint64_t seq = 0;
-                {
-                    std::lock_guard<std::mutex> lock(g_state.mtx);
-                    if (g_state.frameData.empty()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-                    seq = g_state.frameSeq.load();
-                    if (seq == lastSeq) {   // 无新帧，短暂等待
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-                    raw = g_state.frameData;   // 深拷贝（mmap 缓冲不可长期持有）
-                    w   = g_state.width;
-                    h   = g_state.height;
-                    fmt = g_state.format;
-                }
-
-                // 2. 解码/转换为 RGB24（CPU 密集，不阻塞 GUI 与采集）
-                auto  t0  = std::chrono::steady_clock::now();
-                std::vector<uint8_t> rgb;
-                if (fmt == PixelFormat::FMT_MJPEG) {
-#ifdef HAS_LIBJPEG
-                    // 防御：进 libjpeg 前校验 JPEG SOI 标记，畸形帧直接跳过
-                    // （libjpeg 对某些畸形流可能内部越界而非走 error_exit）
-                    if (!VideoProcessor::isJPEGStart(raw.data(),
-                                                     static_cast<int>(raw.size()))) {
-                        LOG_WRN("decode: 非 JPEG 帧(无 SOI)，seq=%llu 跳过",
-                                (unsigned long long)seq);
-                        lastSeq = seq;
-                        continue;
-                    }
-                    int dw = 0, dh = 0;
-                    if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
-                                                        rgb, dw, dh)) {
-                        w = dw; h = dh;
-                    } else {
-                        LOG_WRN("decode: bad MJPEG frame, seq=%llu skipped",
-                                (unsigned long long)seq);
-                        lastSeq = seq;   // 坏帧跳过，避免死循环重解同一帧
-                        continue;
-                    }
-#endif
-                } else if (fmt == PixelFormat::FMT_YUYV) {
-                    rgb.resize(static_cast<size_t>(w) * h * 3);
-                    VideoProcessor::yuyvToRgb24(raw.data(), rgb.data(), w, h);
-                } else {   // FMT_RGB24：无需转换
-                    rgb.swap(raw);
-                }
-                double decodeMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count();
-
-                if (rgb.empty()) {
-                    LOG_WRN("decode: empty result, seq=%llu skipped",
-                            (unsigned long long)seq);
-                    lastSeq = seq;
-                    continue;
-                }
-
-                // 3. 发布到显示缓冲（GUI 每 33ms 拉取一次）
-                size_t rgbSize = rgb.size();
-                {
-                    std::lock_guard<std::mutex> lock(g_display.mtx);
-                    g_display.rgb.swap(rgb);
-                    g_display.width  = w;
-                    g_display.height = h;
-                    g_display.seq    = seq;
-                }
-                lastSeq = seq;
-
-                LOG_DBG("decode: seq=%llu fmt=%d %dx%d rgb=%zuB %.2fms -> g_display",
-                        (unsigned long long)seq, static_cast<int>(fmt),
-                        w, h, rgbSize, decodeMs);
-            }
-            LOG_INF("Display decode thread exited");
-        });
-
-        // ============================================================
-        // 显示定时器（Qt 主线程，33ms ≈ 30fps）— 仅拷贝，无解码
-        // ============================================================
-        // 显示帧率统计变量
-        int         dispFrameCount    = 0;
-        double      dispLastTime      = 0.0;
-        double      dispCurrentFps    = 0.0;
-
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
-        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer,
-                             &dispFrameCount, &dispLastTime, &dispCurrentFps]() {
-            // 从解码线程产出的 RGB 显示缓冲取最新帧（GUI 只做轻量拷贝，无解码）
-            std::vector<uint8_t> rgb;
-            int w = 0, h = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_display.mtx);
-                if (g_display.rgb.empty()) return;
-                rgb = g_display.rgb;   // 深拷贝（RGB24 640x480 ≈ 0.92MB, ~1ms）
-                w = g_display.width;
-                h = g_display.height;
-            }
+        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            if (g_state.frameData.empty()) return;
 
-            // 直接使用 GUI 的 setFrame 接口（RGB24 → Format_RGB888，无需解码）
-            gui.setFrame(rgb.data(), static_cast<int>(rgb.size()), w, h,
-                         PixelFormat::FMT_RGB24);
+            // 直接使用 GUI 的 setFrame 接口
+            // 内部 frameToQImage() 会处理 YUYV→RGB24 转换并深拷贝到 QImage
+            gui.setFrame(g_state.frameData.data(),
+                         static_cast<int>(g_state.frameData.size()),
+                         g_state.width, g_state.height,
+                         g_state.format);
 
-            // 硬件（摄像头）FPS（短锁读取，不与 g_display 锁嵌套）
-            {
-                std::lock_guard<std::mutex> lock(g_state.mtx);
-                gui.setFPS(g_state.fps);
-            }
-
-            // 软件（显示）FPS — 每 30 次刷新计算一次平均帧率
-            dispFrameCount++;
-            double now = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
-            if (dispFrameCount >= 30) {
-                double elapsed = now - dispLastTime;
-                if (elapsed > 0.0 && dispLastTime > 0.0) {
-                    dispCurrentFps = dispFrameCount / elapsed;
-                }
-                dispLastTime = now;
-                dispFrameCount = 0;
-            } else if (dispLastTime <= 0.0) {
-                dispLastTime = now;   // 首次初始化时间戳
-            }
-            gui.setDisplayFPS(dispCurrentFps);
-
+            gui.setFPS(g_state.fps);
             gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
@@ -1370,14 +1066,8 @@ int main(int argc, char* argv[]) {
         qInfo() << "控制端口:" << ctrlPort;
         qInfo() << "存储:" << QString::fromStdString(photoDir) << " / " << QString::fromStdString(videoDir);
         qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "❌ 启动失败");
-        // 自动查询本机 IP，替代 <dev-ip> 占位符（查不到则回退占位符）
-        std::string devIP = getLocalIP();
-        if (devIP.empty()) {
-            LOG_WRN("getLocalIP() failed, using <dev-ip> placeholder");
-            devIP = "<dev-ip>";
-        }
-        qInfo() << "浏览器打开: http://" << devIP.c_str() << ":" << httpPort << "/";
-        qInfo() << "VLC 播放:   rtsp://" << devIP.c_str() << ":" << rtspPort << "/stream";
+        qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
+        qInfo() << "VLC 播放:   rtsp://<dev-ip>:" << rtspPort << "/stream";
         qInfo() << "==============================================";
 
     } else {
@@ -1447,12 +1137,6 @@ int main(int argc, char* argv[]) {
     g_state.running = false;
     g_state.procCv.notify_all();  // 唤醒处理线程使其退出
 
-    // ★ 先释放摄像头（STREAMOFF 唤醒阻塞在 DQBUF 的采集线程），再 join，
-    //   否则阻塞 DQBUF 永不返回会导致 join 卡死
-    if (capture) {
-        capture->release();
-    }
-
     if (captureThread && captureThread->joinable()) {
         captureThread->join();
         delete captureThread;
@@ -1461,11 +1145,6 @@ int main(int argc, char* argv[]) {
     if (processThread && processThread->joinable()) {
         processThread->join();
         delete processThread;
-    }
-
-    if (decodeThread && decodeThread->joinable()) {
-        decodeThread->join();
-        delete decodeThread;
     }
 
     if (mjpegServer) {
@@ -1496,7 +1175,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (capture) {
-        delete capture;   // 已在上面提前 release（STREAMOFF 唤醒采集线程）
+        capture->release();
+        delete capture;
     }
 
     return ret;

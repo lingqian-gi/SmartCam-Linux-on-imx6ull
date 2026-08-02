@@ -248,14 +248,7 @@ int MJPEGStreamServer::clientCount() const {
 }
 
 void MJPEGStreamServer::updateFrame(const uint8_t* data, size_t len) {
-    if (!m_running || !data || len == 0) {
-        LOG_DBG("mjpeg: updateFrame REJECTED (running=%d data=%p len=%zu)",
-                m_running ? 1 : 0, (const void*)data, len);
-        return;
-    }
-
-    LOG_DBG("mjpeg: updateFrame len=%zu → m_currentFrame (idx=%llu)",
-            len, (unsigned long long)(m_frameIndex.load() + 1));
+    if (!m_running || !data || len == 0) return;
 
     {
         std::lock_guard<std::mutex> lock(m_frameMtx);
@@ -588,8 +581,6 @@ bool MJPEGStreamServer::sendMJPEGFrame(int client_fd,
     // Content-Length: N\r\n
     // \r\n
     // [JPEG DATA]\r\n
-
-    LOG_DBG("mjpeg: sendMJPEGFrame fd=%d len=%zu", client_fd, len);
 
     char header[256];
     int headerLen = snprintf(header, sizeof(header),
