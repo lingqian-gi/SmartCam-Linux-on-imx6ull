@@ -498,10 +498,18 @@ int main(int argc, char* argv[]) {
                  (curFmt >> 0) & 0xFF, (curFmt >> 8) & 0xFF,
                  (curFmt >> 16) & 0xFF, (curFmt >> 24) & 0xFF);
 
-        // ★ startCapture() 已移到下方"所有 V4L2 控制查询之后"再调用：
-        //   某些 uvcvideo 摄像头在 STREAMON 后执行 queryControl/getControl/
-        //   enumFrameRates 等 ioctl 会干扰驱动状态，导致只输出首帧后停流
-        //   （v4l2-ctl 全程不做控制查询，故能正常抓帧）。
+        // ★ startCapture() 放在控制查询之前（与 70fa0aa 一致，实测持续出帧）
+        // ============================================================
+        // 启动 V4L2 采集流（STREAMON）
+        // ============================================================
+        if (capture->startCapture() < 0) {
+            LOG_ERR_("Failed to start capture");
+            delete capture;
+            return 1;
+        }
+
+        gui.setStreamingStatus(true);
+        g_state.running = true;
 
         // ============================================================
         // 查询 V4L2 控制参数范围 & 注册相机控制回调
@@ -695,20 +703,6 @@ int main(int argc, char* argv[]) {
                 }
             });
         }
-
-        // ============================================================
-        // 启动 V4L2 采集流（STREAMON）
-        //   放在所有控制查询之后：避免 STREAMON 后执行 ioctl 查询干扰
-        //   某些 uvcvideo 摄像头驱动（导致只输出首帧后停流）
-        // ============================================================
-        if (capture->startCapture() < 0) {
-            LOG_ERR_("Failed to start capture");
-            delete capture;
-            return 1;
-        }
-
-        gui.setStreamingStatus(true);
-        g_state.running = true;
 
         // ============================================================
         // 启动 MJPEG-over-HTTP 流媒体服务器

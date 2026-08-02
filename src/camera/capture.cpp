@@ -491,21 +491,18 @@ int CameraCapture::putFrame(const FrameBuffer* buf) {
     if (!m_streaming || m_fd < 0) return -EIO;
     if (!buf || !buf->data) return -EINVAL;
 
-    // 直接使用 getFrame 记录的 pool_index（O(1) 归还，不再遍历反查）
-    const int idx = buf->pool_index;
-    if (idx < 0 || idx >= m_nbuffers || !m_buffers) {
-        LOG_ERR_("putFrame: invalid pool_index=%d (nbufs=%d)", idx, m_nbuffers);
-        return -EINVAL;
+    // ★ 改回 O(n) 遍历反查（与 70fa0aa 一致，实测持续出帧）：
+    //   曾改为 O(1) pool_index 直接归还，但该摄像头/驱动下出现"只出首帧后停流"，
+    //   恢复按 data 指针反查索引的原始实现，规避潜在索引不一致问题。
+    int idx = -1;
+    for (int i = 0; i < m_nbuffers; ++i) {
+        if (m_buffers[i].start == buf->data) {
+            idx = i;
+            break;
+        }
     }
-
-    // 防御：data 指针必须与 pool_index 对应槽位一致（防外部伪造 FrameBuffer）
-    if (m_buffers[idx].start != buf->data) {
-        LOG_ERR_("putFrame: pool_index=%d data pointer mismatch", idx);
-        return -EINVAL;
-    }
-    // 防御：该槽位应处于"已出队"状态，重复归还说明调用方逻辑有误
-    if (m_buffers[idx].queued) {
-        LOG_ERR_("putFrame: buffer %d already queued (double put?)", idx);
+    if (idx < 0) {
+        LOG_ERR_("putFrame: buffer pointer not found in pool");
         return -EINVAL;
     }
 
