@@ -160,7 +160,7 @@ displayTimer.timeout (main, 锁内)         m_refreshTimer.timeout (GUI 线程)
 
 【面试官追问】"为什么跨线程不能用信号直接驱动 QLabel？"
 
-> 【理想应答】Qt 信号跨线程默认用 `Qt::AutoConnection`，会依据"发射线程 ≠ 接收对象所在线程"自动转成 `QueuedConnection`，把调用包装成事件投递到 GUI 线程队列——本质是安全的，但**每帧一次事件投递在慢速采集下会积累延迟**（事件队列堆积）。本项目刻意不用"采集线程 → 每帧 emit 信号"，而是用定时器**拉模式**主动取最新帧，从根源上避免事件堆积。拉模式 = 主动轮询，推模式 = 事件驱动，本项目选前者保实时性。
+> 【理想应答】Qt 信号跨线程默认用 `Qt::AutoConnection`，会依据"发射线程 ≠ 接收对象所在线程"自动转成 `QueuedConnection`，把调用包装成事件投递到 GUI 线程队列——本质是安全的，但有一个关键前提：**事件是否堆积取决于"生产速率 vs 消费速率"**。跨线程事件投递就是一个生产者-消费者队列（类似 M/M/1 排队模型，平均延迟 \(W = 1/(\mu - \lambda)\)），只有**采集帧率（λ）超过 GUI 线程的处理能力（μ，受单帧解码耗时约束）**时，队列才会无限堆积、延迟不断增长；**慢速采集（λ < μ）下队列是稳定的，不会堆积**。真正触发堆积的是"快速采集 + 慢显示"：例如采集 60fps、GUI 解码一帧 25ms（μ≈40fps），λ > μ，每帧一次事件投递就越积越多。所以本项目刻意不用"采集线程 → 每帧 emit 信号"，而是用定时器**拉模式**主动取最新帧：无论采集多快，每次定时器触发只取"最新"一帧、中间帧被覆盖丢弃，**延迟有界（最多一个周期）**，从根源上规避了 λ > μ 时的无限堆积；即使慢速采集下推模式本来也不会堆积，拉模式仍带来**节拍固定**（显示帧率钉在定时器周期，不受采集波动影响、无抖动）和**省去每帧元对象序列化/事件循环调度开销**的收益。拉模式 = 主动轮询，推模式 = 事件驱动，本项目选前者保实时性。
 
 ---
 
@@ -248,11 +248,11 @@ QObject::connect(displayTimer, &QTimer::timeout, [&gui, ...]() {
 displayTimer->start();
 ```
 
-**核心设计：拉模式 + 覆盖旧帧，天然防堆积。** 采集线程每帧都写 `g_state`，但 GUI 每 33ms 只取一次——两帧之间的中间帧被"覆盖丢弃"。比"采集线程每帧直接推送刷新"好在：
+**核心设计：拉模式 + 覆盖旧帧，天然防堆积。** 采集线程每帧都写 `g_state`，但 GUI 每 33ms 只取一次——两帧之间的中间帧被"覆盖丢弃"。比"采集线程每帧直接推送刷新（emit 信号）"好在：
 
-- 不会因为显示慢导致 `g_state` 无限堆积（没有队列）；
-- 显示帧率稳定在定时器周期，不受采集波动影响；
-- 没有跨线程事件投递，无事件队列延迟漂移。
+- **不存在队列，就没有"堆积"这一说**：`g_state` 是"最新一帧"共享状态而非事件队列，无论采集多快（λ 多大）、显示多慢（μ 多小），都没有东西排队等待，天然规避了 λ > μ 时事件队列无限堆积的问题；
+- 显示帧率稳定在定时器周期，不受采集波动影响（推模式下显示节拍跟随采集、有抖动）；
+- 没有跨线程事件投递，无元对象序列化与事件循环调度开销、无事件队列延迟漂移。
 
 **双 FPS 设计**：`setFPS` 显示采集侧（硬件/采集线程算的）FPS，`setDisplayFPS` 显示显示侧（GUI 每 30 次刷新自己统计的）FPS。两个数对比能直接暴露"采集 30、显示 15"的瓶颈——这是排查显示性能的关键仪表。
 
@@ -267,7 +267,7 @@ displayTimer->start();
 ### 面试追问与应答
 
 **Q1：为什么用 QTimer 33ms 而不是在采集线程里直接调 setFrame？**
-**A**：① **线程安全**：Qt 控件只能在 GUI 线程操作，跨线程改 QLabel 必须通过 queued connection 或定时器转发；QTimer 天然运行在 GUI 线程。② **节流防堆积**：如果每帧都跨线程投递，慢的时候事件队列会堆积、延迟越来越大；拉模式固定 33ms 取最新帧，天然丢弃中间帧，延迟稳定。这是生产者-消费者模型里"**推模式保每帧、拉模式保实时性**"的经典取舍。
+**A**：① **线程安全**：Qt 控件只能在 GUI 线程操作，跨线程改 QLabel 必须通过 queued connection 或定时器转发；QTimer 天然运行在 GUI 线程。② **节流防堆积**：每帧跨线程投递时，事件队列是否堆积取决于"采集速率 vs GUI 消费速率"——**只有采集快于 GUI 处理能力时**（如 60fps 采集、解码 25ms/帧）队列才会无限堆积、延迟越来越大；慢速采集（λ < μ）下队列稳定、不会堆积，但推模式仍有显示节拍随采集波动、每次投递带元对象序列化开销的缺点。拉模式固定 33ms 取最新帧，无论采集多快都天然丢弃中间帧、延迟有界且节拍稳定。这是生产者-消费者模型里"**推模式保每帧、拉模式保实时性**"的经典取舍。
 
 **Q2：锁 `g_state.mtx` 期间如果 setFrame 内部做解码（25ms），采集线程会卡住吗？**
 **A**：不会卡 25ms。`setFrame` 拿锁后只做**深拷贝**（`assign`），**解码发生在锁外**的 `frameToQImage`（由 GUI 自己的 `m_refreshTimer` 调用）。也就是说**锁内只拷贝、锁外解码**，锁持有时间就是一次 memcpy（~1ms 级），采集线程最多等 1ms。这个"锁内轻活、锁外重活"的划分是本题的得分点。
@@ -761,6 +761,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 - Q1：Direct 连接在发射线程执行槽，如果槽很重会怎样？→ 发射方阻塞，可能卡住采集线程。
 - Q2：Queued 连接的参数怎么传递？→ 必须是 Qt 元类型（Q_DECLARE_METATYPE），跨线程传 `Resolution` 等自定义结构需注册。
 - Q3：为什么本项目 `captureClicked` 等信号在同线程（都是 GUI 线程 emit + slot）？→ 默认 Auto=Direct，同步执行，无排队延迟。
+- Q4：跨线程每帧 emit 一个帧事件，事件队列会无限堆积吗？→ 不一定。堆积的边界条件是**生产速率 λ > 消费速率 μ**（采集帧率超过 GUI 线程处理事件的能力，类似 M/M/1 排队模型）。慢速采集（λ < μ）下队列稳定、延迟有界，**不会堆积**；只有"快速采集 + 慢显示"（如 60fps 采集、GUI 解码 25ms/帧，μ≈40fps）时 λ > μ，队列才会无限增长。这正是"拉模式防堆积"的真正适用范围——它通过"只取最新帧、覆盖中间帧"把延迟钉在有界区间，无论 λ 多大都不堆。
 
 ## 补充 2：QImage / QPixmap / QLabel 的内存与性能差异
 
@@ -881,3 +882,79 @@ gui.onFormatChanged([capture, device](PixelFormat fmt) {
 ## 6. 面试一句话总结
 
 > "CameraControl 走 `VIDIOC_S_CTRL`，是调 sensor 的图像参数（亮度/白平衡/曝光），写寄存器即时生效、不断流；Format 走 `VIDIOC_S_FMT`，是改像素格式（YUYV/MJPEG），因为要重新分配缓冲池且 S_FMT 在 STREAMON 下会 EBUSY，所以必须先停流再重启。GUI 层对应两个回调：`onCameraControlChanged(cid, value)` 即时透传，`onFormatChanged(fmt)` 触发完整的暂停→停流→设置→重启握手。"
+
+---
+
+# 补充：MJPEG 直出模式下的解码路径（推流/录像 vs 本地显示）
+
+> 定位：display 模块的 MJPEG 解码（`decodeMjpegToRgb`）常被面试官追问"MJPEG 直出是不是就完全不用解码了？"——答案要按**数据链路**区分。
+
+## 1. 一句话回答
+
+**MJPEG 直出模式下，推流（HTTP/RTSP）和录像完全不需要解码（JPEG 字节流原样转发/写盘，零拷贝零处理）；但本地屏幕显示必须解码**——屏幕是像素设备，JPEG 是压缩流，`frameToQImage` 的 `FMT_MJPEG` 分支必然走 `decodeMjpegToRgb`（libjpeg-turbo，~25ms）。
+
+## 2. 两条链路的代码证据
+
+**链路 A：采集 → 处理线程 → 推流/录像（无需解码）**
+
+`main.cpp` 处理线程（835-879 行）的核心判断：
+
+```cpp
+// YUYV → JPEG 编码（CPU 密集，不阻塞采集线程）
+bool needEncode = (localFmt == PixelFormat::FMT_YUYV) && (mjpegServerOk || rtspServer);
+...
+if (needEncode) { VideoProcessor::encodeYUYVtoJPEG(...); }  // 仅 YUYV 才编码
+
+// 推流到 MJPEG HTTP 服务器
+if (mjpegServerOk) {
+    if (localFmt == PixelFormat::FMT_MJPEG) {
+        mjpegServer->updateFrame(localFrame.data(), ...);    // MJPEG 直通，不解码
+    }
+}
+...
+// 录像写入（仅 MJPEG 模式支持）
+if (g_recording && localFmt == PixelFormat::FMT_MJPEG && g_storage) {
+    g_storage->writeRecordFrame(localFrame.data(), ...);     // JPEG 直接进 AVI
+}
+```
+
+- HTTP：`multipart/x-mixed-replace` 直接把 JPEG 原样发给浏览器；
+- RTSP：RTP 按 RFC 2435 把 JPEG 分片，**无需解码也无需再编码**；
+- 录像：JPEG 帧直接写进 AVI 的 `00dc` chunk（且**录像只支持 MJPEG 模式**，YUYV 不录像）。
+
+**链路 B：采集 → GUI 显示（必须解码）**
+
+`gui.cpp` `frameToQImage` 的 `FMT_MJPEG` 分支：
+
+```cpp
+case PixelFormat::FMT_MJPEG: {
+    std::vector<uint8_t> rgb;
+    if (decodeMjpegToRgb(data, len, rgb, dw, dh))   // libjpeg-turbo 解码 JPEG→RGB
+        return QImage(rgb.data(), dw, dh, dw * 3, QImage::Format_RGB888).copy();
+    ...
+}
+```
+
+## 3. 两种模式的真实开销对比
+
+| 环节 | MJPEG 模式 | YUYV 模式 |
+|------|-----------|-----------|
+| 处理线程（推流/录像用） | **0**（直通） | 编码 JPEG ~25ms/帧 |
+| GUI 显示 | 解码 JPEG ~25ms/帧 | YUV→RGB ~5ms/帧 |
+| 录像 | 支持（直写） | 不支持 |
+
+**反直觉点**：MJPEG 模式下本地显示的解码（~25ms）反而比 YUYV 模式的显示转换（~5ms）更贵。MJPEG 直出的优势**不在省解码**——解码一样存在——而在**省掉了处理线程那 25ms 的编码**，且推流/存储零拷贝。README 说"MJPEG 硬件输出 <1ms、零 CPU 编码开销"指的是**推流路径**，不是显示路径。
+
+## 4. 面试追问与应答
+
+**Q1：MJPEG 直出是不是完全不用 CPU 处理了？**
+**A**：不是。网络推流和录像确实零处理（JPEG 直通），但本地预览每帧仍要 libjpeg 解码一次（~25ms）才能上屏。CPU 开销从"编码"转移成了"显示解码"，总量仍然比 YUYV（编码 25ms + 显示转换 5ms）少，但绝不是零。
+
+**Q2：为什么 YUYV 模式不能录像？**
+**A**：AVI 容器里存的是 MJPEG 帧（`00dc` 压缩 chunk）。YUYV 是未压缩原始格式，要录像就得先编码成 JPEG，而 YUYV 模式下的 JPEG 编码结果只用于推流，录像代码干脆只在 `FMT_MJPEG` 时写盘（`main.cpp:876`）——既避免重复编码，也保证 AVI 格式统一。
+
+**Q3：既然显示解码 25ms 在 GUI 线程，MJPEG 模式为什么还能跑 30fps？**
+**A**：与 YUYV 模式相同的原因——640x480 的 MJPEG 帧通常小于 100KB，解码耗时往往低于 25ms 的理论值，33ms 定时器有富余；且坏帧被静默跳过。如果升 720p，解码会超过 33ms，必须先"解码移出 GUI 线程"（见 3.2 场景 A）。
+
+**Q4：如果让处理线程解码成 RGB 再推给 GUI，能省掉显示解码吗？**
+**A**：能省掉 GUI 线程的解码，但**总量不省**——解码还是要做一次，只是从 GUI 线程挪到处理线程（还多一次 RGB 数据的跨线程拷贝）。真正的收益是"GUI 线程不再被 25ms 阻塞"（事件循环不再卡顿、按钮响应恢复），这正是 3.2 里"解码移出 GUI 线程"重构的核心动机。注意推流路径要的是 JPEG，处理线程解码成 RGB 反而要再编码回去，所以正确做法是：**推流保持 JPEG 直通，另起一个解码线程只服务显示**。

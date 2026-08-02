@@ -41,8 +41,8 @@ SmartCam Linux 将低成本的 ARM Cortex-A7 开发板变成了功能完备的�
 ### 安装依赖
 
 ```bash
-# Ubuntu / Debian
-sudo apt install build-essential cmake qt5-default libjpeg-dev
+# Ubuntu / Debian（qt5-default 在较新发行版已废弃，使用 qtbase5-dev）
+sudo apt install build-essential cmake qtbase5-dev libjpeg-dev
 
 # Fedora
 sudo dnf install gcc-c++ cmake qt5-qtbase-devel libjpeg-turbo-devel
@@ -63,9 +63,36 @@ cmake ../.. && make -j$(nproc)
 ./smartcam                # Mock 模式 — 显示彩色测试条
 ```
 
+运行单元测试：
+
+```bash
+cd build/pc
+ctest --output-on-failure   # TCP 控制协议单元测试
+```
+
 ### ARM 交叉编译
 
-SmartCam 提供两种交叉编译方式，根据你的开发环境选择：
+SmartCam 提供两种交叉编译方式，根据你的开发环境选择。`scripts/` 下提供了一整套配套脚本：
+
+| 脚本 | 在哪执行 | 职责 |
+|------|---------|------|
+| `scripts/sysroot-from-board.sh` | 开发板上 | 打包板子根文件系统 → `npi-sysroot.tar.gz`（>90MB 自动分包）→ git push 中转 |
+| `scripts/setup-sysroot.sh` | x86 宿主 | 通过 ssh 直连开发板打包并拉回 sysroot（替代 GitHub 中转，适合能连到板子） |
+| `scripts/sysroot-setup.sh` | 云编译环境 | **一键总控**：解压 sysroot + docker build + docker run 编译 |
+| `scripts/cross-build.sh` | Docker 容器内 | **编译执行体**：patch sysroot cmake 配置 + cmake + make（被 Dockerfile CMD 调用） |
+| `scripts/build.sh` | 宿主机 | PC 本地编译（`build.sh pc`）/ 宿主机交叉编译（`build.sh arm`） |
+| `scripts/check-deps.sh` | 宿主机 | 检查编译依赖是否齐全 |
+
+**sysroot 获取的两种路径**：
+
+```
+路径 A（GitHub 中转，适合云环境无法直连板子）:
+  板子: sysroot-from-board.sh → git push → GitHub
+  云上: git pull → sysroot-setup.sh（Step1 自动合并分包解压）
+
+路径 B（ssh 直连，能连到板子时）:
+  宿主: setup-sysroot.sh debian@<IP> → 板子打包 → scp 拉回 → 同样用 sysroot-setup.sh 继续
+```
 
 ---
 
@@ -106,28 +133,41 @@ git -c pack.window=0 -c pack.depth=0 push
 
 **step 2 — 在编译环境拉取并交叉编译**
 
+推荐直接用一键脚本（自动完成"合并分包 → 构建镜像 → 编译"三步）：
+
 ```bash
-# 拉取 sysroot 分包
 cd SmartCam-Linux-on-imx6ull
 git pull
+./scripts/sysroot-setup.sh          # 一键：解压 sysroot + docker build + docker run
+# 产物: build/arm/smartcam
+```
 
-# 合并分包
+分步执行（了解内部机制时用）：
+
+```bash
+# ① 合并分包并解压
 cat npi-sysroot.part-* > npi-sysroot.tar.gz
 mkdir -p npi-sysroot
 tar xzf npi-sysroot.tar.gz -C npi-sysroot
 
-# 构建 Docker 镜像（基于 Debian Bullseye，装交叉编译器 + cmake，无 armhf 依赖）
+# ② 构建 Docker 镜像（Debian Buster = glibc 2.28 / Qt 5.11.3，与开发板完全一致）
 docker build -f Dockerfile.arm-sysroot -t smartcam-cross-sysroot .
 
-# 编译（挂载 sysroot 作为 ARM 库搜索路径）
+# ③ 编译（容器内执行 scripts/cross-build.sh：patch sysroot → cmake → make）
 docker run --rm -v $(pwd):/workspace smartcam-cross-sysroot
-# 产物: build/arm/smartcam
-
-# 也可用一键脚本
-./scripts/sysroot-setup.sh
 ```
 
-> `Dockerfile.arm-sysroot` 只安装交叉编译器和 cmake，所有 ARM 库来自开发板 sysroot，**不可能出现版本不匹配**。
+> **为什么用 Debian Buster**：`Dockerfile.arm-sysroot` 基于 `debian:buster`（glibc 2.28 / Qt 5.11.3），与 i.MX6ULL 开发板逐版本一致。镜像内安装**宿主 x86_64 的 Qt5 工具**（moc/rcc/uic，版本 5.11），配合 ARM gcc-8 交叉编译；`cross-build.sh` 会自动把 sysroot 里的 ARM 工具软链替换为宿主工具、并 patch cmake 配置——**moc 生成代码与板子 Qt 头文件版本严格匹配**，避免"新版本 moc 生成 `QMetaObject::SuperData` 等新 API 导致编译失败"的问题。
+
+**产物验证**：
+
+```bash
+readelf -d build/arm/smartcam | grep NEEDED    # 依赖 Qt 5.11 soname + glibc
+readelf --version-info build/arm/smartcam | grep -oE 'GLIBC_[0-9.]+' | sort -V | uniq | tail
+# 最高应为 GLIBC_2.28（与板子一致）；libjpeg / libstdc++ / libgcc 已静态链接
+```
+
+> **注意**：`npi-sysroot/` 目录在编译过程中会被 `cross-build.sh` 修改（工具软链 + cmake 配置 patch，均有 `.bak` 备份、幂等），可随时从 `npi-sysroot.tar.gz` 重建。`.dockerignore` 已排除 sysroot 与分包，避免拖慢镜像构建。
 
 ---
 
@@ -226,47 +266,60 @@ journalctl -u smartcam -f   # 查看日志
 SmartCam-Linux-on-imx6ull/
 ├── src/
 │   ├── camera/
-│   │   ├── capture.cpp        # V4L2 采集引擎（mmap 零拷贝、双格式）
-│   │   └── processor.cpp      # 图像处理（YUV 转换、libjpeg-turbo 编解码）
+│   │   ├── capture.cpp          # V4L2 采集引擎（mmap 零拷贝、4 缓冲池、双格式）
+│   │   ├── processor.cpp        # 图像处理（YUV 转换、libjpeg-turbo 编解码、JPEG 解码）
+│   │   └── processor_neon.cpp   # YUYV→RGB NEON SIMD 加速（仅 ARM 交叉编译启用）
 │   ├── display/
-│   │   ├── gui.cpp            # Qt5 相机界面（预览、拍照、录像、设置弹窗）
-│   │   └── gallery.cpp        # 相册组件（缩略图网格 + 全屏查看）
+│   │   ├── gui.cpp              # Qt5 相机界面（预览、拍照、录像、设置弹窗）
+│   │   ├── gallery.cpp          # 相册组件（缩略图网格 + 全屏查看 + 多选删除）
+│   │   └── video_player.cpp     # 轻量 AVI 播放器（手写 RIFF 解析，无 ffmpeg 依赖）
 │   ├── network/
-│   │   ├── mjpeg_server.cpp   # MJPEG-over-HTTP 流（multipart/x-mixed-replace）
-│   │   ├── rtsp_server.cpp    # RFC 2326 RTSP 服务器（RTP/RTCP、RFC 2435 JPEG 载荷）
-│   │   └── control.cpp        # TCP 二进制控制协议（CRC16、epoll ET、命令分发）
+│   │   ├── mjpeg_server.cpp     # MJPEG-over-HTTP 流（multipart/x-mixed-replace）
+│   │   ├── rtsp_server.cpp      # RFC 2326 RTSP 服务器（RTP/RTCP、RFC 2435 JPEG 载荷）
+│   │   └── control.cpp          # TCP 二进制控制协议（CRC16、epoll ET、命令分发）
 │   ├── storage/
-│   │   └── manager.cpp        # 存储管理（拍照、AVI 录像、磁盘空间管理）
-│   └── main.cpp               # 程序入口，各模块编排和线程管理
+│   │   └── manager.cpp          # 存储管理（拍照、AVI 录像、磁盘空间管理）
+│   └── main.cpp                 # 程序入口，线程编排（采集/处理/解码/网络/显示）
 ├── include/
 │   ├── camera/    (capture.h, processor.h)
-│   ├── display/   (gui.h, gallery.h)
+│   ├── display/   (gui.h, gallery.h, video_player.h)
 │   ├── network/   (mjpeg_server.h, rtsp_server.h, control.h)
 │   ├── storage/   (manager.h)
 │   └── common/    (types.h, ringbuf.h, logger.h, config.h)
 ├── configs/
-│   ├── smartcam.conf          # 主配置文件（INI 格式）
-│   └── smartcam.service       # systemd 服务单元
+│   ├── smartcam.conf            # 主配置文件（INI 格式）
+│   ├── smartcam.service         # systemd 服务单元
+│   └── toolchain.arm.cmake      # ARM 交叉编译工具链文件
 ├── scripts/
-│   └── build.sh               # 构建脚本（PC / ARM 交叉编译）
+│   ├── build.sh                 # PC / 宿主机 ARM 编译
+│   ├── check-deps.sh            # 编译依赖检查
+│   ├── cross-build.sh           # Docker 容器内编译（patch sysroot + cmake + make）
+│   ├── setup-sysroot.sh         # ssh 直连板子导出 sysroot
+│   ├── sysroot-from-board.sh    # 板端打包 sysroot 并 git push
+│   └── sysroot-setup.sh         # 一键总控（解压 sysroot + docker build + run）
 ├── tests/
-│   └── test_protocol.cpp      # TCP 二进制协议单元测试
+│   ├── CMakeLists.txt
+│   └── test_protocol.cpp        # TCP 二进制协议单元测试
 ├── docs/
-│   ├── 01-display-module-implementation.md
-│   ├── 02-video-capture-module-implementation.md
-│   ├── 03-mjpeg-stream-module-implementation.md
-│   ├── 04-storage-module-implementation.md
-│   ├── 05-control-module-implementation.md
-│   ├── 06-common-module-implementation.md
-│   ├── 07-video-processor-module-implementation.md
-│   ├── 08-rtsp-module-implementation.md
-│   ├── 09-gallery-module-implementation.md
-│   ├── 10-settings-panel-implementation.md
-│   ├── 11-framerate-control-implementation.md
-│   ├── debug-summary.md
-│   ├── plan-gallery-module.md
+│   ├── 01~11-*-implementation.md         # 各模块实现文档（display/camera/mjpeg/…）
+│   ├── 02-cmake-build-system-tutorial.md # CMake 构建系统教程
+│   ├── debug-summary.md                  # 调试问题总结
+│   ├── rtsp-protocol-learning-notes.md   # RTSP 协议学习笔记
+│   ├── changelog-2026-05-29.md           # 更新日志
+│   ├── plan-gallery-module.md            # 相册模块实现计划
+│   ├── plan-pxp-acceleration.md          # PXP 硬件加速计划（当前未启用）
+│   ├── plan-frame-pool-zero-copy.md      # 帧池零拷贝计划（双缓冲 + 引用计数）
+│   ├── interview/                        # 面试问答
+│   │   └── 01-模拟面试问答-嵌入式Linux.md
+│   ├── learn/                            # 模块面试复习
+│   │   ├── 面试复习-camera模块.md
+│   │   ├── 面试复习-display模块.md
+│   │   └── 面试项目介绍.md
 │   └── 求职项目-智能相机流媒体系统.md
+├── CODE_WALKTHROUGH.md        # 逐文件源代码精读
 ├── CMakeLists.txt
+├── Dockerfile.arm-sysroot     # ARM 交叉编译 Docker 镜像（Debian Buster）
+├── .dockerignore              # 排除 sysroot/分包进 Docker 构建上下文
 └── README.md
 ```
 
@@ -274,23 +327,33 @@ SmartCam-Linux-on-imx6ull/
 
 ## 系统架构
 
+共 **6 个线程**：Qt 主线程（GUI）+ 采集线程 + 处理线程 + **解码线程** + RTSP 线程 + 控制线程。
+
 ```
- 采集线程                   Qt 主线程                    网络线程
- =========                 ==========                  ==========
- V4L2 dqbuf               displayTimer (33ms)         epoll_wait
-   |                          |                          |
-   |-> frameData.assign()     |-> lock(g_state)          |-> HTTP: 推送 JPEG
-   |-> MJPEG: 直接推流         |-> setFrame()             |-> RTSP: RTP 分片
-   |-> YUYV: 编码为 JPEG      |-> unlock                 |-> TCP: 命令分发
-   |-> Storage: 拍照/录像     |-> refreshFrame()         |
-   |-> unlock(g_state)        |-> QImage -> QLabel       |
+采集线程 (captureThread)              处理线程 (processThread)            网络线程
+=======================             ===========================          ==========
+V4L2 dqbuf → mmap 帧                等 procCv 通知                      epoll_wait
+  ├─► g_state.frameData             ├─ MJPEG: JPEG 直通推流             ├─ HTTP: multipart JPEG
+  │    (mutex + frameSeq 序号)       ├─ YUYV: encodeYUYVtoJPEG           ├─ RTSP: RTP 分片
+  └─► putFrame 归还 mmap             └─ 录像: 写 AVI（仅 MJPEG）          └─ TCP: 命令分发
+
+解码线程 (decodeThread)              GUI 线程 (Qt 主线程)
+=====================              ====================
+  ├─ share() 最新原始帧              ├─ displayTimer(33ms)
+  ├─ MJPEG 解码 / YUYV→RGB24         │    └─ 拉 g_display → setFrame(RGB24)
+  └─ publish → g_display (RGB)       └─ m_refreshTimer(33ms)
+                                        └─ QImage 浅引用 → setPixmap → 上屏
 ```
 
-**线程同步**：使用 `std::mutex` 保护共享帧数据；`setFrame()` 内部深拷贝数据，避免悬垂指针。
+**线程同步**：
+- 采集线程把帧深拷贝进 `g_state.frameData`（`std::mutex` 保护），写完递增 `frameSeq` 序号后立即归还 V4L2 mmap 缓冲；
+- 处理线程与解码线程各自从 `g_state` 取最新帧（互不阻塞），处理线程推流/录像，解码线程负责显示转换；
+- **解码线程是独立 `std::thread`**（MJPEG ~25ms 解码不再占用 GUI 线程），解码结果发布到 `g_display`（RGB24 + mutex）；
+- GUI 线程从 `g_display` 取 RGB24 帧，`setFrame()` 内深拷贝一次（`m_frameBuffer`），`refreshFrame()` 里 `QImage` 构造后 `.copy()` 深拷贝，**双重深拷贝避免悬垂指针**。
 
 **零拷贝路径**：
-- MJPEG 模式：摄像头硬件直接输出 JPEG，无需编码即推送到 HTTP 和 RTSP。
-- YUYV 模式：每帧调用一次 `encodeYUYVtoJPEG()`，编码结果供 HTTP 和 RTSP 共用。
+- MJPEG 模式推流/录像：摄像头硬件直接输出 JPEG，处理线程**原样转发**到 HTTP/RTSP、直写 AVI——完全零编码零解码（仅本地显示需解一次码，在解码线程进行）。
+- YUYV 模式：处理线程每帧调用一次 `encodeYUYVtoJPEG()`，编码结果供 HTTP 和 RTSP 共用；显示路径由解码线程做 YUYV→RGB24。
 
 ---
 
@@ -343,11 +406,13 @@ use_syslog = true
 | V4L2 采集 | mmap 零拷贝、4 缓冲区轮转池、运行时格式/分辨率切换 |
 | MJPEG 流 | HTTP multipart/x-mixed-replace、条件变量广播、`/snapshot` 和 `/status` 端点 |
 | RTSP 流 | 自实现 RFC 2326 协议栈（DESCRIBE/SETUP/PLAY/TEARDOWN）、RTP RFC 2435 JPEG 载荷、epoll 边缘触发 |
-| 图像处理 | YUYV 转 RGB24（定点运算 BT.601）、libjpeg-turbo 编解码（NEON 加速）、自定义静默错误处理器 |
+| 图像处理 | YUYV 转 RGB24（定点运算 BT.601）、libjpeg-turbo 编解码（NEON 加速）、JPEG 解码（自定义静默错误处理器） |
+| **显示解码线程** | MJPEG/YUYV → RGB24 在独立 `std::thread` 完成（`VideoProcessor::decodeJPEGtoRGB`），GUI 线程只做拷贝 + `setPixmap`，事件循环不被解码阻塞 |
 | 存储管理 | AVI RIFF 容器格式（含 idx1 索引块）、按修改时间自动清理、按日期分目录存储 |
 | 配置解析 | Header-only INI 解析器，支持分段、注释、bool/int/string 类型 |
 | systemd 服务 | Type=simple、崩溃自动重启、安全加固（ProtectSystem、RestrictAddressFamilies 等） |
 | 相册 | 3 列缩略图网格、libjpeg scale_denom 快速解码、触摸滑动翻页、删除确认弹窗 |
+| AVI 播放 | 手写 RIFF 解析 + idx1 索引 O(1) seek，复用 libjpeg 解码，零 ffmpeg 依赖 |
 
 ---
 
@@ -358,9 +423,12 @@ use_syslog = true
 | MJPEG 硬件输出 | < 1ms | USB UVC 摄像头直出 |
 | YUYV 转 RGB24 | ~5ms | 定点运算，无查表法 |
 | libjpeg-turbo 编码 | ~25ms | NEON 加速 |
+| JPEG 显示解码 | ~25ms | 在**独立解码线程**执行，不阻塞 GUI |
 | JPEG 缩略图解码 | ~15ms | Scale 1/2 缩小到 170px |
 | 运行内存（推流） | ~8 MB | 帧缓冲 + JPEG 拷贝 |
 | 相册峰值内存 | ~2.5 MB | 6 张可见缩略图 + 1 张全尺寸 |
+
+> **显示帧率上限**：本地预览受 `m_refreshTimer` 固定 33ms 节拍限制，最多 30fps（匹配 MJPEG 解码能力）；**推流/录像帧率不受此限制**，跟随采集目标帧率（最高 60fps）。升 720p 需先"解码移出 GUI 线程"（已完成）并评估 CPU。
 
 ---
 

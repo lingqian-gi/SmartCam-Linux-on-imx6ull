@@ -129,6 +129,27 @@ public:
                                 unsigned long* jpeg_len);
 
     // ============================================================
+    // JPEG 解码（libjpeg-turbo，静默坏帧）
+    // ============================================================
+
+    /**
+     * @brief JPEG/MJPEG → RGB24 解码
+     *
+     * 内置 setjmp/longjmp 自定义错误处理器：坏帧返回 false，不崩溃、
+     * 不向 stderr 输出警告（libjpeg 默认 error_exit 会直接 exit 进程）。
+     * 线程安全（全部使用局部状态），可在独立解码线程中调用。
+     *
+     * @param jpeg_data  输入 JPEG 数据
+     * @param jpeg_len   JPEG 数据长度
+     * @param rgb        输出 RGB24 像素 (out_w*out_h*3 字节，自动分配)
+     * @param out_w      输出：图像宽度
+     * @param out_h      输出：图像高度
+     * @return true 解码成功；false 解码失败（坏帧/未编译 HAS_LIBJPEG）
+     */
+    static bool decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                std::vector<uint8_t>& rgb, int& out_w, int& out_h);
+
+    // ============================================================
     // 工具方法
     // ============================================================
 

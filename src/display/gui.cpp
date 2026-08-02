@@ -15,66 +15,10 @@
 #include <algorithm>
 
 // ============================================================
-// libjpeg-turbo 解码（自定义错误处理器，静默坏帧）
-// ============================================================
-#ifdef HAS_LIBJPEG
-#include <jpeglib.h>
-#include <setjmp.h>
-
-struct jpegErrorMgr {
-    struct jpeg_error_mgr pub;
-    jmp_buf setjmp_buffer;
-};
-
-static void jpegSilentErrorExit(j_common_ptr cinfo) {
-    jpegErrorMgr* myerr = reinterpret_cast<jpegErrorMgr*>(cinfo->err);
-    longjmp(myerr->setjmp_buffer, 1);
-}
-
-static void jpegSilentOutputMessage(j_common_ptr /*cinfo*/) {
-    /* 完全静默 — 不输出任何警告 */
-}
-
-/**
- * @brief 将 MJPEG/JPEG 数据解码为 RGB24
- * @return true=成功, false=解码失败
- */
-static bool decodeMjpegToRgb(const uint8_t* jpeg_data, size_t jpeg_len,
-                              std::vector<uint8_t>& rgb, int& out_w, int& out_h) {
-    struct jpeg_decompress_struct cinfo;
-    jpegErrorMgr jerr;
-
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit       = jpegSilentErrorExit;
-    jerr.pub.output_message   = jpegSilentOutputMessage;
-
-    if (setjmp(jerr.setjmp_buffer)) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
-    jpeg_read_header(&cinfo, TRUE);
-    jpeg_start_decompress(&cinfo);
-
-    out_w = cinfo.output_width;
-    out_h = cinfo.output_height;
-    rgb.resize(static_cast<size_t>(out_w * out_h * 3));
-
-    while (cinfo.output_scanline < static_cast<JDIMENSION>(out_h)) {
-        JSAMPROW row = rgb.data() + cinfo.output_scanline * out_w * 3;
-        jpeg_read_scanlines(&cinfo, &row, 1);
-    }
-
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    return true;
-}
-#endif // HAS_LIBJPEG
-
-// ============================================================
 // 构造 / 析构
+// ============================================================
+// 注：MJPEG 解码已迁移至 VideoProcessor::decodeJPEGtoRGB
+// （独立解码线程调用），GUI 主路径只接收 RGB24 帧做轻量绘制。
 // ============================================================
 
 CameraGUI::CameraGUI(QWidget* parent)
@@ -1116,11 +1060,12 @@ QImage CameraGUI::frameToQImage(const uint8_t* data, int len, int w, int h, Pixe
     }
     case PixelFormat::FMT_MJPEG: {
         // MJPEG → JPEG 解码 → QImage
-        // 优先用 libjpeg-turbo（自定义错误处理器，不输出坏帧警告）
+        // 优先用 libjpeg-turbo（VideoProcessor::decodeJPEGtoRGB，静默坏帧）
+        // 注：主流程（解码线程）已把 MJPEG 解成 RGB24 再投递，此分支仅作兜底
 #ifdef HAS_LIBJPEG
         std::vector<uint8_t> rgb;
         int dw = 0, dh = 0;
-        if (decodeMjpegToRgb(data, static_cast<size_t>(len), rgb, dw, dh)) {
+        if (VideoProcessor::decodeJPEGtoRGB(data, static_cast<size_t>(len), rgb, dw, dh)) {
             return QImage(rgb.data(), dw, dh, dw * 3, QImage::Format_RGB888).copy();
         }
 #else

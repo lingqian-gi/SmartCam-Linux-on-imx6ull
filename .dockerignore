@@ -1,0 +1,10 @@
+# sysroot 与打包文件：仅 docker run 时通过 -v 挂载，不需进镜像
+npi-sysroot/
+npi-sysroot.tar.gz
+npi-sysroot.part-*
+
+# 构建产物与仓库元数据
+build/
+.git/
+docs/
+*.md
