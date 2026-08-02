@@ -180,17 +180,36 @@ int CameraCapture::setFormat(int width, int height, uint32_t pixfmt) {
         return -EBUSY;
     }
 
+    // ★ 修复：若设备当前格式已是目标格式，则跳过 VIDIOC_S_FMT。
+    //   实测（v4l2-ctl 对比）：该摄像头固件在 S_FMT 后输出简化帧
+    //   （~6.7KB/帧 ≈ 纯色/黑画面），不调 S_FMT（设备默认格式）则输出
+    //   正常帧（~41KB/帧）。设备默认格式恰为 640x480 MJPG(sRGB)，
+    //   与程序目标一致时直接复用，避免触发固件 bug。
+    struct v4l2_format cur;
+    memset(&cur, 0, sizeof(cur));
+    cur.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(m_fd, VIDIOC_G_FMT, &cur) == 0 &&
+        static_cast<int>(cur.fmt.pix.width)  == width &&
+        static_cast<int>(cur.fmt.pix.height) == height &&
+        cur.fmt.pix.pixelformat == pixfmt) {
+        m_width  = static_cast<int>(cur.fmt.pix.width);
+        m_height = static_cast<int>(cur.fmt.pix.height);
+        m_pixfmt = cur.fmt.pix.pixelformat;
+        LOG_INF("Format already at target %dx%d '%c%c%c%c', skip S_FMT "
+                "(avoid firmware simplified-frame bug), colorspace=%u",
+                m_width, m_height,
+                (m_pixfmt >> 0) & 0xFF, (m_pixfmt >> 8) & 0xFF,
+                (m_pixfmt >> 16) & 0xFF, (m_pixfmt >> 24) & 0xFF,
+                cur.fmt.pix.colorspace);
+        return 0;
+    }
+
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width       = static_cast<__u32>(width);
     fmt.fmt.pix.height      = static_cast<__u32>(height);
     fmt.fmt.pix.pixelformat = pixfmt;
-    // ★ 修复：S_FMT 显式指定 field/colorspace，与设备默认格式一致。
-    //   实测（v4l2-ctl --get-fmt-video）：默认格式 Colorspace=sRGB。
-    //   摄像头固件对 S_FMT 时 colorspace=0(DEFAULT) 敏感——输出简化帧
-    //   （~6.7KB/帧 ≈ 纯色/黑画面）；显式指定 sRGB 后输出正常帧（~41KB/帧）。
-    //   field 同样显式用 NONE（ANY=-1 也会触发简化输出）。
     fmt.fmt.pix.field       = V4L2_FIELD_NONE;
     fmt.fmt.pix.colorspace  = V4L2_COLORSPACE_SRGB;
 
