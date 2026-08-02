@@ -186,7 +186,10 @@ int CameraCapture::setFormat(int width, int height, uint32_t pixfmt) {
     fmt.fmt.pix.width       = static_cast<__u32>(width);
     fmt.fmt.pix.height      = static_cast<__u32>(height);
     fmt.fmt.pix.pixelformat = pixfmt;
-    fmt.fmt.pix.field       = V4L2_FIELD_ANY;
+    // ★ 用 V4L2_FIELD_NONE 而非 V4L2_FIELD_ANY：
+    //   与 v4l2-ctl 的 S_FMT 一致（field=0）。部分摄像头固件对 FIELD_ANY(-1)
+    //   敏感，可能导致 STREAMON 后不输出帧（v4l2-ctl 能抓帧而程序 0 帧）。
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
 
     if (ioctl(m_fd, VIDIOC_S_FMT, &fmt) < 0) {
         LOG_ERR_("VIDIOC_S_FMT failed: %s (w=%d h=%d fmt=0x%08X)",
@@ -547,6 +550,10 @@ int CameraCapture::openDevice(const char* device) {
     int flags = fcntl(m_fd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
+        LOG_INF("Device O_NONBLOCK cleared (flags=0x%x)", flags & ~O_NONBLOCK);
+    } else {
+        LOG_WRN("fcntl(F_GETFL) failed: %s — O_NONBLOCK may remain set",
+                strerror(errno));
     }
 
     LOG_INF("Device opened: %s, fd=%d", device, m_fd);
