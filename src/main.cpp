@@ -55,7 +55,6 @@ struct CaptureState {
     int                     height = 0;
     PixelFormat             format = PixelFormat::FMT_RGB24;
     double                  fps    = 0.0;
-    std::atomic<uint64_t>   frameSeq{0}; // 帧序号（每次写入新帧 +1），解码线程据此检测新帧
     std::atomic<bool>       running{false};
     std::atomic<bool>       paused{false};   // 暂停采集（分辨率/格式切换等需要）
     std::mutex              pauseMtx;        // 暂停同步锁
@@ -69,16 +68,6 @@ struct CaptureState {
     std::atomic<bool>       frameReady{false}; // 有新帧待处理
 };
 static CaptureState g_state;
-
-// 显示帧缓冲（解码线程写，GUI 线程拉取）— 独立解码 + 轻量 GUI 绘制的桥梁
-struct DisplayFrame {
-    std::mutex              mtx;
-    std::vector<uint8_t>    rgb;      // RGB24 像素（解码线程产出）
-    int                     width  = 0;
-    int                     height = 0;
-    uint64_t                seq    = 0;  // 对应 g_state.frameSeq，GUI 用于去重
-};
-static DisplayFrame g_display;
 
 // 录像状态（由 main 线程设置，采集线程读取）
 static std::atomic<bool> g_recording{false};
@@ -286,7 +275,6 @@ int main(int argc, char* argv[]) {
     CameraCapture*    capture      = nullptr;
     std::thread*      captureThread = nullptr;
     std::thread*      processThread = nullptr;
-    std::thread*      decodeThread  = nullptr;  // 显示解码线程（MJPEG/YUYV → RGB24）
     QTimer*           displayTimer = nullptr;
     MJPEGStreamServer* mjpegServer = nullptr;
     ControlServer*    controlSrv   = nullptr;
@@ -822,7 +810,6 @@ int main(int argc, char* argv[]) {
                     g_state.height = fb.height;
                     g_state.format = fb.format;
                     g_state.fps    = capture->getCurrentFPS();
-                    g_state.frameSeq.fetch_add(1);   // 新帧就绪，解码线程据此拉取
                 }
 
                 // 立即归还 V4L2 缓冲区，让硬件可以写入下一帧
@@ -917,100 +904,22 @@ int main(int argc, char* argv[]) {
         });
 
         // ============================================================
-        // 显示解码线程（JPEG/YUYV → RGB24，独立于 GUI 线程，专供本地显示）
-        // ============================================================
-        // 动机：MJPEG 解码 ~25ms 若留在 GUI 线程会阻塞事件循环（掉帧/按钮无响应）。
-        // 本线程拉取最新原始帧 → 解码成 RGB24 → 发布到 g_display，
-        // GUI 线程只做"拷贝 RGB + setPixmap"的轻量绘制。
-        decodeThread = new std::thread([]() {
-            uint64_t lastSeq = 0;
-            while (g_state.running) {
-                // 1. 拉取最新原始帧（只取最新，中间帧覆盖丢弃）
-                std::vector<uint8_t> raw;
-                int      w = 0, h = 0;
-                PixelFormat fmt = PixelFormat::FMT_RGB24;
-                uint64_t seq = 0;
-                {
-                    std::lock_guard<std::mutex> lock(g_state.mtx);
-                    if (g_state.frameData.empty()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-                    seq = g_state.frameSeq.load();
-                    if (seq == lastSeq) {   // 无新帧，短暂等待
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-                    raw = g_state.frameData;   // 深拷贝（mmap 缓冲不可长期持有）
-                    w   = g_state.width;
-                    h   = g_state.height;
-                    fmt = g_state.format;
-                }
-
-                // 2. 解码/转换为 RGB24（CPU 密集，不阻塞 GUI 与采集）
-                std::vector<uint8_t> rgb;
-                if (fmt == PixelFormat::FMT_MJPEG) {
-#ifdef HAS_LIBJPEG
-                    int dw = 0, dh = 0;
-                    if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
-                                                        rgb, dw, dh)) {
-                        w = dw; h = dh;
-                    } else {
-                        lastSeq = seq;   // 坏帧跳过，避免死循环重解同一帧
-                        continue;
-                    }
-#endif
-                } else if (fmt == PixelFormat::FMT_YUYV) {
-                    rgb.resize(static_cast<size_t>(w) * h * 3);
-                    VideoProcessor::yuyvToRgb24(raw.data(), rgb.data(), w, h);
-                } else {   // FMT_RGB24：无需转换
-                    rgb.swap(raw);
-                }
-
-                if (rgb.empty()) {
-                    lastSeq = seq;
-                    continue;
-                }
-
-                // 3. 发布到显示缓冲（GUI 每 33ms 拉取一次）
-                {
-                    std::lock_guard<std::mutex> lock(g_display.mtx);
-                    g_display.rgb.swap(rgb);
-                    g_display.width  = w;
-                    g_display.height = h;
-                    g_display.seq    = seq;
-                }
-                lastSeq = seq;
-            }
-        });
-
-        // ============================================================
-        // 显示定时器（Qt 主线程，33ms ≈ 30fps）— 仅拷贝，无解码
+        // 显示定时器（Qt 主线程，33ms ≈ 30fps）
         // ============================================================
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
         QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
-            // 从解码线程产出的 RGB 显示缓冲取最新帧（GUI 只做轻量拷贝，无解码）
-            std::vector<uint8_t> rgb;
-            int w = 0, h = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_display.mtx);
-                if (g_display.rgb.empty()) return;
-                rgb = g_display.rgb;   // 深拷贝（RGB24 640x480 ≈ 0.92MB, ~1ms）
-                w = g_display.width;
-                h = g_display.height;
-            }
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            if (g_state.frameData.empty()) return;
 
-            // 直接使用 GUI 的 setFrame 接口（RGB24 → Format_RGB888，无需解码）
-            gui.setFrame(rgb.data(), static_cast<int>(rgb.size()), w, h,
-                         PixelFormat::FMT_RGB24);
+            // 直接使用 GUI 的 setFrame 接口
+            // 内部 frameToQImage() 会处理 YUYV→RGB24 转换并深拷贝到 QImage
+            gui.setFrame(g_state.frameData.data(),
+                         static_cast<int>(g_state.frameData.size()),
+                         g_state.width, g_state.height,
+                         g_state.format);
 
-            // 硬件（摄像头）FPS（短锁读取，不与 g_display 锁嵌套）
-            {
-                std::lock_guard<std::mutex> lock(g_state.mtx);
-                gui.setFPS(g_state.fps);
-            }
-
+            gui.setFPS(g_state.fps);
             gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
@@ -1236,11 +1145,6 @@ int main(int argc, char* argv[]) {
     if (processThread && processThread->joinable()) {
         processThread->join();
         delete processThread;
-    }
-
-    if (decodeThread && decodeThread->joinable()) {
-        decodeThread->join();
-        delete decodeThread;
     }
 
     if (mjpegServer) {
