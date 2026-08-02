@@ -127,6 +127,7 @@ target_include_directories(smartcam PRIVATE
 target_link_libraries(smartcam PRIVATE
     Qt5::Widgets
     pthread
+    dl
 )
 
 # libjpeg-turbo (MJPEG 解码)

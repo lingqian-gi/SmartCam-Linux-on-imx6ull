@@ -38,6 +38,7 @@
 #include <signal.h>      // 崩溃信号处理
 #include <execinfo.h>    // backtrace
 #include <ucontext.h>    // ucontext_t / mcontext_t（崩溃现场寄存器）
+#include <dlfcn.h>       // dladdr：解析崩溃地址所属共享库与符号
 #include <unistd.h>
 
 #include "include/display/gui.h"
@@ -119,6 +120,21 @@ static void crashSignalHandler(int sig, siginfo_t* /*si*/, void* ucontext) {
             static_cast<unsigned long>(mctx->arm_lr),
             static_cast<unsigned long>(mctx->arm_sp),
             static_cast<unsigned long>(mctx->arm_fp));
+
+    // 用 dladdr 解析 PC/LR 所属共享库 + 库内偏移 + 函数名
+    // （崩溃常发生在动态库（如 Qt）内部，裸地址需换算成库内偏移才能 addr2line）
+    void* pcAddrs[2] = { reinterpret_cast<void*>(mctx->arm_pc),
+                         reinterpret_cast<void*>(mctx->arm_lr) };
+    for (int i = 0; i < 2; ++i) {
+        Dl_info di;
+        if (dladdr(pcAddrs[i], &di) && di.dli_fname) {
+            unsigned long off = reinterpret_cast<unsigned long>(pcAddrs[i])
+                              - reinterpret_cast<unsigned long>(di.dli_fbase);
+            dprintf(2, "    addr[%d] %p → %s + 0x%lx  (%s)\n",
+                    i, pcAddrs[i], di.dli_fname, off,
+                    di.dli_sname ? di.dli_sname : "?");
+        }
+    }
 #endif
 
     // 辅助栈（可能被信号帧截断，仅供参考）
