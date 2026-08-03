@@ -981,6 +981,17 @@ int main(int argc, char* argv[]) {
 
                 if (!g_state.running) break;
 
+                // ---- 低风险优化：无人观看时跳过推流分发与深拷贝 ----
+                // 若没有 HTTP 客户端、没有 RTSP 客户端、且未录像，则本帧无人消费，
+                // 跳过深拷贝/编码/推流，给单核 CPU 减负（提高采集帧率）。
+                const bool hasHttpViewer = mjpegServerOk &&
+                                           mjpegServer->clientCount() > 0;
+                const bool hasRtspViewer = rtspServer &&
+                                           rtspServer->clientCount() > 0;
+                if (!hasHttpViewer && !hasRtspViewer && !g_recording) {
+                    continue;   // 无人消费，直接进入下一轮等待（frameReady 已清）
+                }
+
                 // 从共享状态读取帧数据（独立锁，不阻塞采集线程）
                 std::vector<uint8_t> localFrame;
                 int localW = 0, localH = 0;
@@ -1012,7 +1023,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 推流到 MJPEG HTTP 服务器
-                if (mjpegServerOk) {
+                if (hasHttpViewer) {
                     if (localFmt == PixelFormat::FMT_MJPEG) {
                         mjpegServer->updateFrame(localFrame.data(),
                             static_cast<size_t>(localFrame.size()));
@@ -1023,7 +1034,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 推流到 RTSP 服务器
-                if (rtspServer) {
+                if (hasRtspViewer) {
                     if (localFmt == PixelFormat::FMT_MJPEG) {
                         rtspServer->feedFrame(localFrame.data(),
                             static_cast<size_t>(localFrame.size()),
