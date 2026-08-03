@@ -470,6 +470,12 @@ int main(int argc, char* argv[]) {
                  (curFmt >> 0) & 0xFF, (curFmt >> 8) & 0xFF,
                  (curFmt >> 16) & 0xFF, (curFmt >> 24) & 0xFF);
 
+        // 把实际生效的采集格式同步到设置面板的 Format 下拉框
+        // （避免命令行 --fmt mjpeg 与 GUI 默认显示的 YUYV 不一致）
+        gui.setCurrentFormat((curFmt == CameraCapture::V4L2_PIX_FMT_MJPEG)
+                                 ? PixelFormat::FMT_MJPEG
+                                 : PixelFormat::FMT_YUYV);
+
         if (capture->startCapture() < 0) {
             LOG_ERR_("Failed to start capture");
             delete capture;

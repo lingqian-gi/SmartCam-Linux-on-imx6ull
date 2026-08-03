@@ -938,6 +938,16 @@ void CameraGUI::setFramerateRange(int minFps, int maxFps, int currentFps) {
     m_framerateValue->setText(QString("%1 fps").arg(currentFps));
 }
 
+void CameraGUI::setCurrentFormat(PixelFormat fmt) {
+    if (!m_formatCombo) return;
+    // 在 combo 中查找对应格式的索引（blockSignals 防止触发 onFormatComboChanged 回调）
+    int idx = m_formatCombo->findData(static_cast<int>(fmt));
+    if (idx < 0) return;
+    m_formatCombo->blockSignals(true);
+    m_formatCombo->setCurrentIndex(idx);
+    m_formatCombo->blockSignals(false);
+}
+
 // ============================================================
 // 相机控制槽函数
 // ============================================================

@@ -100,6 +100,10 @@ public:
     // ---- 帧率设置 ----
     void setFramerateRange(int minFps, int maxFps, int currentFps);
 
+    // ---- 格式同步 ----
+    /// 把当前采集格式同步到设置面板的 Format 下拉框（启动时 main 调用）
+    void setCurrentFormat(PixelFormat fmt);
+
     // ---- 相册集成 ----
     void setGalleryStorage(StorageManager* storage);
     void showGallery();
