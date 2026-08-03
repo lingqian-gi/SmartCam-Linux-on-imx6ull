@@ -45,7 +45,8 @@ src/display/ 显示与交互模块
 │
 ├── CameraGUI（主界面）                  gui.h / gui.cpp (~1140 行)
 │   ├── 帧渲染：setFrameShared() 零拷贝路径（m_heldSlot + QImage 浅引用）
-│   │            + setFrame() 旧深拷贝路径 + frameToQImage() / refreshFrame()
+│   │            + frameToQImage() 兜底路径（Mock/无槽时）+ refreshFrame() 主渲染
+│   │            （setFrame() 已废弃——定义仍在但无任何调用点，为死代码）
 │   ├── 帧池交互：extern FramePool* g_rgbPool；setFrameShared 持有槽引用，refreshFrame 浅引用上屏
 │   ├── 帧率控制：m_refreshTimer (GUI 内) + displayTimer (main 注入) / 双 FPS
 │   ├── 回调注入：onCaptureRequest / onRecordToggle / onResolutionChanged
@@ -87,7 +88,7 @@ src/display/ 显示与交互模块
 ## 1.3 输入 / 输出
 
 - **输入**：
-  - 帧数据：`setFrameShared(FrameSlot*)` 从帧池拉取共享槽（RGB24，零拷贝）；旧路径 `setFrame(data, len, w, h, fmt)` 兜底（RGB24 / RGB565 / YUYV / MJPEG）
+  - 帧数据：`setFrameShared(FrameSlot*)` 从帧池拉取共享槽（RGB24，零拷贝）；兜底路径 `frameToQImage` 处理多格式（RGB24/RGB565/YUYV/MJPEG，Mock/无槽时用）。`setFrame(data, len, w, h, fmt)` 已废弃（无调用点，死代码）
   - 状态更新：`setFPS` / `setDisplayFPS` / `setClientCount` / `setRecordingStatus` / `setStreamingStatus`
   - 相机控制范围：`setBrightnessRange` / `setContrastRange` / `setWhiteBalanceRange` / `setExposureRange` / `setFramerateRange`
   - 存储绑定：`setGalleryStorage(StorageManager*)`
@@ -219,17 +220,17 @@ if (m_heldSlot) {
 if (!img.isNull()) m_videoDisplay->setPixmap(QPixmap::fromImage(img));
 ```
 
-**旧路径兜底**——`setFrame`（`gui.cpp:473`）仍保留（供 Mock/回退），深拷贝到 `m_frameBuffer`：
+**兜底路径说明**——真正的兜底是 `frameToQImage`（`gui.cpp:1121`），按格式分派，仅当**无 `m_heldSlot`** 时被 `refreshFrame` 调用（如 Mock 模式没有帧池槽）。
 
-```cpp
-void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
-    m_frameBuffer.assign(data, data + len);   // 深拷贝，避免悬垂
-    m_currentFrame.data = m_frameBuffer.data();
-    ...
-}
-```
-
-`frameToQImage`（`gui.cpp:1121`）按格式分派，仅当**无 `m_heldSlot`** 时调用：
+> ⚠️ **注意（代码现状）**：`setFrame`（`gui.cpp:473`）虽然定义仍在、深拷贝到 `m_frameBuffer`，但**全代码库已无任何调用点，是死代码**——真实相机走 `setFrameShared`，Mock 模式走 `refreshFrame` 的 else 分支调 `frameToQImage`，都不经 `setFrame`。其 `m_frameBuffer` 成员也仅被它使用（遗留）。
+>
+> ```cpp
+> void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
+>     m_frameBuffer.assign(data, data + len);   // 深拷贝，避免悬垂（死代码，无人调用）
+>     m_currentFrame.data = m_frameBuffer.data();
+>     ...
+> }
+> ```
 
 ```cpp
 case PixelFormat::FMT_YUYV: {
@@ -250,7 +251,7 @@ case PixelFormat::FMT_MJPEG: {
 
 ### 潜在坑点
 
-- **双悬垂风险（旧路径）**：旧 `setFrame` 必须深拷贝（`g_state.frameData` 会被采集线程 realloc）；旧 `QImage` 构造后必须 `.copy()`。**帧池路径消除了这两处**——数据生命周期由 `m_heldSlot` 引用计数保证。
+- **双悬垂风险（遗留 setFrame 路径，死代码）**：遗留 `setFrame` 必须深拷贝（`g_state.frameData` 会被采集线程 realloc）；旧 `QImage` 构造后必须 `.copy()`。**帧池路径消除了这两处**——数据生命周期由 `m_heldSlot` 引用计数保证。
 - **`m_heldSlot` 泄漏风险**：若 `setFrameShared` 换帧时忘了 release 旧槽、或析构时没释放 `m_heldSlot`，槽永不归还 → 池满持续丢帧。`CameraGUI::~CameraGUI` 里判空释放 `m_heldSlot` 正是防泄漏（`gui.cpp:113`）。
 - **`setScaledContents(true)` 的性能**：QLabel 每帧绘制时都对 pixmap 做一次缩放插值，640x480 可接受，但升 720p 后 CPU 开销翻倍——应缓存缩放结果。**实测它在 linuxfb 上会额外触发 `QColorProfile::fromSRgb`（Qt 颜色管理）成为 CPU 热点**，关闭后该热点从 48% 降到 27%（见 §2.2 坑点）。
 - **坏帧静默跳过 vs 画面停顿**：解码失败 `release(slot)` 丢帧，`refreshFrame` 里 `if (!img.isNull())` 跳过 setPixmap，画面保持上一帧。好处是不花屏，坏处是坏帧过多时画面"冻住"却无提示——需要一个坏帧计数器报警。
@@ -258,7 +259,7 @@ case PixelFormat::FMT_MJPEG: {
 ### 面试追问与应答
 
 **Q1：帧池路径和旧 setFrame 深拷贝路径的本质区别？为什么能零拷贝？**
-**A**：旧路径：`setFrame` 把帧深拷贝进 `m_frameBuffer`（assign），`frameToQImage` 解码后再 `.copy()` 一次，RGB24 每帧拷 2 遍。帧池路径：`displayTimer` 解码结果**直接写入池槽**（`slot->data`），`setFrameShared` 让 `m_currentFrame` 零拷贝指向共享内存，`refreshFrame` 用 QImage 浅引用上屏——RGB24 全程 0 次深拷贝。安全靠 `m_heldSlot` 引用计数保证槽生命周期，实测显示链路拷贝从 10.0 → 0.5 MB/s（-95%）。
+**A**：旧路径（`setFrame` 现已无调用点，为死代码，仅作历史对比）：`setFrame` 把帧深拷贝进 `m_frameBuffer`（assign），`frameToQImage` 解码后再 `.copy()` 一次，RGB24 每帧拷 2 遍。帧池路径：`displayTimer` 解码结果**直接写入池槽**（`slot->data`），`setFrameShared` 让 `m_currentFrame` 零拷贝指向共享内存，`refreshFrame` 用 QImage 浅引用上屏——RGB24 全程 0 次深拷贝。安全靠 `m_heldSlot` 引用计数保证槽生命周期，实测显示链路拷贝从 10.0 → 0.5 MB/s（-95%）。
 
 **Q2：MJPEG 每帧解码耗时约 25ms，decode 在哪个线程？会不会卡 UI？**
 **A**：解码发生在 Qt 主线程的 `displayTimer` 的 timeout 槽（帧池路径下不再是 `frameToQImage`）。一次解码 25ms 会阻塞事件循环。**单核 i.MX6ULL 上把解码移出 GUI 线程反而更卡**（线程无法并行，多引入拷贝+切换开销，已回退），所以解码留在 GUI 主线程是当前妥协。**重要修正（实测）**：帧率卡 10fps 的根因**不是解码，而是摄像头硬件实际输出 10fps**——`v4l2-ctl` 直测确认（尽管能力列表声称 30fps）。低分辨率显示解码能省 CPU，但**无法突破硬件帧率上限**（详见 §2.2 坑点"判定帧率瓶颈的方法论"）。
