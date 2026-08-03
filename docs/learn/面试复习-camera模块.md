@@ -29,7 +29,8 @@
    - 2.7 块七：NEON SIMD 加速
    - 2.8 块八：MJPEG 帧边界解析
    - 2.9 块九：JPEG 编码（libjpeg-turbo）
-   - 2.10 块十：V4L2 相机控制（亮度/对比度/曝光/白平衡）
+   - 2.10 块十：JPEG 解码（decodeJPEGtoRGB，显示帧池路径）
+   - 2.11 块十一：V4L2 相机控制（亮度/对比度/曝光/白平衡）
 3. [第三部分 综合思考](#第三部分-综合思考)
    - 3.1 与推理引擎 / 网络传输 / 显示渲染的数据流耦合
    - 3.2 需求变更下的重构推演（USB→CSI、720p→4K、30→60fps）
@@ -60,10 +61,12 @@ src/camera/ 视频采集与图像处理模块
 ├── VideoProcessor（图像处理工具，纯静态类）   processor.h / processor.cpp
 │   ├── MJPEG 解析：isJPEGStart() / findJPEGFrame()
 │   ├── 颜色转换：yuyvToRgb24() / yuyvToRgb565() / yuyvMacroPixelToRgb24()
-│   └── JPEG 编码：encodeRGBtoJPEG() / encodeYUYVtoJPEG()
+│   ├── JPEG 编码：encodeRGBtoJPEG() / encodeYUYVtoJPEG()
+│   └── JPEG 解码：decodeJPEGtoRGB() —— 显示链路 JPEG→RGB24（帧池路径，静默坏帧）
 │
 └── processor_neon.cpp（NEON SIMD 实现，非类成员）
     └── yuyv_to_rgb24_neon() —— YUYV→RGB24 向量化，16 像素/轮
+        （文件内用 #ifdef __ARM_NEON 保护，x86 提供空实现，见 §7.5）
 ```
 
 **V4L2 完整采集流程（代码注释中明示的状态机）：**
@@ -81,7 +84,7 @@ open → querycap → s_fmt → reqbufs → querybuf → mmap → qbuf → strea
 | 申请/映射/轮转 mmap 帧缓冲池 | 持久化存储（拍照/录像在 `src/storage/`） |
 | 阻塞取帧并归还缓冲（getFrame/putFrame） | GUI 渲染（Qt 在 `src/display/`） |
 | YUYV→RGB24/RGB565 颜色转换（含 NEON） | 线程编排与全局状态（`src/main.cpp` 的 `g_state`） |
-| MJPEG 帧边界解析、JPEG 编码 | 业务逻辑（帧率节流、曝光联动等，均在 main.cpp 层） |
+| MJPEG 帧边界解析、JPEG 编码、JPEG→RGB 解码 | 业务逻辑（帧率节流、曝光联动等，均在 main.cpp 层） |
 | V4L2 相机参数读写（亮度/曝光等） | 硬件 DMA 本身（内核 UVC/V4L2 驱动） |
 
 **一句话**：camera 模块是"生产帧 + 加工帧"的供给侧，只暴露 `FrameBuffer` 给上层消费，不关心谁消费、怎么消费。这种"生产与消费解耦"是后面所有多线程设计的前提。
@@ -213,8 +216,12 @@ main.cpp（真实相机模式）
   │    YUYV 模式 → VideoProcessor::encodeYUYVtoJPEG()
   │    → mjpegServer->updateFrame() / rtspServer->feedFrame() / storage->writeRecordFrame()
   │
-  └─ Qt 主线程（QTimer 33ms）
-       gui.setFrame(data, len, w, h, format)  ← 内部再做 YUYV→RGB24 供 QImage
+  └─ Qt 主线程（displayTimer 33ms）— 帧池零拷贝显示路径
+       g_rgbPool->acquire()               ← 借 RGB 写槽（无空闲丢帧）
+       raw = g_state.frameData            ← 短锁拷贝原始帧
+       VideoProcessor::decodeJPEGtoRGB()  ← 解码/转换直接写入池槽（零二次拷贝）
+       g_rgbPool->publish(slot)           ← 原子发布
+       gui.setFrameShared(share())        ← GUI 持有引用，QImage 浅引用上屏
 ```
 
 **关键设计信号**（背诵版）：
@@ -222,6 +229,7 @@ main.cpp（真实相机模式）
 2. V4L2 mmap 内存**不可长期持有**，必须尽快深拷贝后归还（4 缓冲池容易耗尽）。
 3. 一次采集，四路消费（GUI/HTTP/RTSP/存储），编码结果共享，避免重复计算。
 4. 归还缓冲用 `FrameBuffer.pool_index` 直接定位槽位，**O(1) 且自带双防御校验**，取帧路径上无 O(n) 操作。
+5. **显示链路走帧池零拷贝**：`decodeJPEGtoRGB` 解码结果直接写入 `FramePool` 槽，GUI 用 QImage 浅引用上屏，消除 setFrame assign + QImage.copy() 两次深拷贝（见 §2.11）。
 
 ---
 
@@ -834,7 +842,7 @@ Step6: vst3_u8   → 交织写入 RGB24（R,G,B 三平面交错）
 
 ### 潜在坑点
 
-- **`__ARM_NEON` 宏由 `-mfpu=neon` 触发**：CMake 只在 ARM 交叉编译时加 `-march=armv7-a -mfpu=neon -mfloat-abi=hard`，且**仅在 ARM 交叉编译时把 `processor_neon.cpp` 加入源列表**（`list(APPEND ...)`），x86 构建完全跳过该文件。x86 下 `__ARM_NEON` 未定义，`processor.cpp` 里被 `#ifdef __ARM_NEON` 包裹的 extern 声明 + 调用分支不生效，走标量路径。**这一点很重要**：`processor_neon.cpp` 第 19 行无条件 `#include <arm_neon.h>`，x86 没有该头文件，若源列表无条件包含会导致 PC 构建直接编译失败（实测修复过此问题）。"调用方 `#ifdef` 包裹 + CMake 按平台裁剪源文件"是双重保险。
+- **`__ARM_NEON` 宏由 `-mfpu=neon` 触发**：CMake 只在 ARM 交叉编译时加 `-march=armv7-a -mfpu=neon -mfloat-abi=hard`。**当前 `processor_neon.cpp` 无条件加入源列表**（`CMakeLists.txt` 的 `CAMERA_SOURCES`），靠**文件内部 `#ifdef __ARM_NEON` 双重保护**实现跨平台：ARM 编译时 `__ARM_NEON` 定义、走 NEON 实现；x86 编译时未定义、走 `#else` 分支的**空实现**（`yuyv_to_rgb24_neon` 空函数占位）。x86 下 `processor.cpp` 里被 `#ifdef __ARM_NEON` 包裹的 extern 声明 + 调用分支不生效，走标量路径。**这一点很重要**：`processor_neon.cpp` 的 `#include <arm_neon.h>` 也被 `#ifdef __ARM_NEON` 保护，x86 没有该头文件不会引入编译错误——这是修复过的一个预存问题（旧版无条件 include 导致 PC 构建失败）。"调用方 `#ifdef` 包裹 + 源文件内 `#ifdef` 保护"是双重保险。
 - **尾部长度的算术 bug 风险**：`i + 15 < totalPixels` 保证向量路径一次 16 像素不越界；尾部循环 `i + 1 < totalPixels` 按宏像素（2 像素）步进。若宽度为奇数，最后一个像素的 U/V 会读取到下一行数据——YUYV 本身要求偶数宽，此边界由上游保证，但代码里未显式断言。
 - **`vuzp_u8(uv_lo, uv_lo)` 的用法**：同一寄存器与自己 unzip，得到偶奇分离，再跨高低 64bit 合并出 8 个 U 与 8 个 V。这个"自 unzip"技巧是写出来易读、写错难调的典型，值得面试时展开。
 - **NEON 结果与标量一致性**：两者系数、舍入方式（`+128>>8` vs 标量 `>>8`）必须一致，否则切换平台画面亮度/偏色有细微差异。`vHalf=128` 对应四舍五入，标量版无 `+128`，这里有**轻微不一致**（可讨论的精确实现差异）。
@@ -939,7 +947,84 @@ jpeg_finish_compress(&cinfo); jpeg_destroy_compress(&cinfo);
 
 ---
 
-## 2.10 块十：V4L2 相机控制（亮度/对比度/曝光/白平衡）
+## 2.10 块十：JPEG 解码（decodeJPEGtoRGB，显示帧池路径）
+
+### 代码讲解
+
+`decodeJPEGtoRGB()` 是本模块**新增的解码能力**，专用于帧池零拷贝显示链路：把 MJPEG 单帧解压成 RGB24，结果**直接写入帧池槽**（`FrameSlot::data`），消除上屏前二次拷贝。核心是自定义**静默错误处理器**，坏帧不崩溃：
+
+```cpp
+// libjpeg 自定义错误管理器：坏帧时 longjmp 回 setjmp 点，避免默认 exit()
+struct JpegErrorMgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+void jpegSilentErrorExit(j_common_ptr cinfo) {
+    JpegErrorMgr* myerr = reinterpret_cast<JpegErrorMgr*>(cinfo->err);
+    longjmp(myerr->setjmp_buffer, 1);   // 跳回 setjmp 点，不走默认 exit()
+}
+void jpegSilentOutputMessage(j_common_ptr /*cinfo*/) {
+    /* 完全静默 —— 坏帧在实时流中是常态，不刷屏 */
+}
+
+bool VideoProcessor::decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
+                                     std::vector<uint8_t>& rgb, int& out_w, int& out_h) {
+    ...
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit     = jpegSilentErrorExit;      // 替换默认 exit()
+    jerr.pub.output_message = jpegSilentOutputMessage;  // 静默 stderr 警告
+
+    if (setjmp(jerr.setjmp_buffer)) {   // 解码错误 longjmp 回这里
+        jpeg_destroy_decompress(&cinfo);
+        return false;                    // 坏帧返回失败，调用方丢帧
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+    out_w = cinfo.output_width; out_h = cinfo.output_height;
+    rgb.resize(out_w * out_h * 3);
+    while (cinfo.output_scanline < out_h) {        // 逐行解码到 RGB24
+        JSAMPROW row = rgb.data() + cinfo.output_scanline * out_w * 3;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+```
+
+### 关键设计：为什么用 setjmp/longjmp 而不是抛异常
+
+libjpeg 默认的错误处理器会直接调用 `exit()`——摄像头偶发坏帧（USB 传输错误、缓冲超长）会**直接终止整个进程**。这是嵌入式实时流里绝对不能接受的。解决方案：
+
+1. **`error_exit` 替换**：把默认 handler 换成 `jpegSilentErrorExit`，它不 exit，而是 `longjmp` 跳回调用处的 `setjmp` 点；
+2. **`setjmp` 双返回值**：第一次返回 0（正常流程），`longjmp` 跳回时返回非 0（错误分支）→ 先 `jpeg_destroy_decompress` 释放资源再 `return false`，保证**失败路径不泄漏**；
+3. **静默 output_message**：坏帧在实时流中很常见，禁止 libjpeg 往 stderr 刷警告，避免日志爆炸。
+
+### 潜在坑点
+
+- **setjmp/longjmp 与 C++ 对象**：`longjmp` 跳转不会调用局部对象的析构函数，所以错误分支要**手动 `jpeg_destroy_decompress`** 清理，否则泄漏。这是本实现必须手动清理的原因。
+- **`decodeJPEGtoRGB` 的调用点**：在 GUI 主线程的 `displayTimer` 内（单核上解码移出 GUI 线程反而更卡，见 §3.2 场景 D）。约 25ms/帧的解码开销——**这是当前系统真正的性能瓶颈**（帧池把拷贝降到 0.5MB/s 后帧率仍卡 10fps，实测瓶颈在解码而非拷贝）。
+- **`HAS_LIBJPEG` 守卫**：非编译 libjpeg 时返回 false，调用方走丢帧/回退逻辑。
+
+### 面试追问与应答
+
+**Q1：libjpeg 默认解码失败会怎样？为什么必须自定义错误处理器？**
+**A**：默认 `error_exit` 会调用 `exit()` 直接终止进程。USB 摄像头在实时流中偶发坏帧是常态（传输错误、缓冲越界），一次坏帧就让整个相机崩溃不可接受。所以替换 `error_exit` 为 `longjmp` 跳回，坏帧仅返回失败、由调用方丢帧，进程稳定运行。这是"第三方库错误处理 + 嵌入式健壮性"的典型考点。
+
+**Q2：为什么解码结果直接写入帧池槽（`slot->data`）而不是分配临时缓冲再拷贝？**
+**A**：写入池槽后，`publish` + `setFrameShared` 让 GUI 通过 QImage 浅引用直接读同一块内存，**省掉 setFrame 的 assign 和 QImage.copy() 两次深拷贝**（RGB24 0.92MB/帧）。这是帧池零拷贝优化的核心——解码输出端直接就是显示端要读的缓冲。
+
+**Q3：setjmp/longjmp 有什么风险？**
+**A**：`longjmp` 非局部跳转不执行 C++ 析构，跳过的局部对象会泄漏；且跨函数跳转破坏栈展开语义。本项目在错误分支手动 `jpeg_destroy_decompress` 保证 libjpeg 资源释放，且错误分支不依赖其他 C++ RAII 对象，风险可控。更优雅的替代是 libjpeg 2.x 的新 API，但兼容旧板系统选择 setjmp 方案。
+
+**Q4：解码在 GUI 主线程，会不会卡界面？**
+**A**：单核 i.MX6ULL 上，解码移出 GUI 线程（独立线程）实测更卡——线程无法并行反而增加拷贝和切换开销（曾实现后回退）。所以解码留在 GUI 主线程，代价是 displayTimer 内 ~25ms 阻塞；这是当前帧率卡 10fps 的根因，后续主线是**低分辨率显示解码**（解码到 320x240 约 8ms）而非多线程。
+
+---
+
+## 2.11 块十一：V4L2 相机控制（亮度/对比度/曝光/白平衡）
 
 ### 代码讲解
 
@@ -998,7 +1083,7 @@ CameraCapture（mmap 帧）                    ← 生产
     │  getFrame → 深拷贝 → putFrame
     ▼
 g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
-    ├─ Qt 主线程  → gui.setFrame() → QImage → QLabel      （显示渲染）
+    ├─ Qt 主线程  → decodeJPEGtoRGB → 写入 rgb池槽 → publish → setFrameShared → QImage浅引用 → QLabel（显示渲染，帧池零拷贝）
     ├─ 处理线程   → encodeYUYVtoJPEG → mjpegServer / rtspServer（网络传输）
     └─ 处理线程   → storage->writeRecordFrame              （存储）
 ```
@@ -1051,6 +1136,19 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 4. **网络**：60fps 的 MJPEG 码率近似翻倍，局域网内确认带宽余量；RTSP 时间戳/帧率参数同步更新（main.cpp 已有 `setStreamInfo` 联动）。
 5. **软件节流**：`1000/60 ≈ 16ms` 间隔，节流判断改为更高精度时间戳（当前用毫秒，60fps 下 16ms 粒度勉强够，可用微秒级 `steady_clock`）。
 
+### 场景 D：单核上的"解码瓶颈"（已实测，最重要的性能教训）
+
+**背景**：实测 CPU 99% 打满、帧率仅 10fps（目标 30fps）。用 `[PERF]` 插桩量化，做了帧池零拷贝把显示链路拷贝从 10.0 → 0.5 MB/s（-95%），但**帧率纹丝不动、CPU 仍 99%**。
+
+**结论**：**瓶颈是 JPEG 解码（~25ms/帧），不是拷贝**。
+- MJPEG 显示链路必须把 JPEG 解成 RGB24，libjpeg 的霍夫曼解码 + 反量化 + IDCT 在 A7 单核上很重（25ms/帧 × 10fps = 250ms/s CPU）；
+- 帧池消除了"搬运"但没消除"解码计算"本身；
+- 独立解码线程在单核上**更卡**（曾实现后回退）：线程无法并行，反而多引入 0.92MB RGB 深拷贝 + 线程切换开销。
+
+**下一步主线**：**低分辨率显示解码**——显示解码到 320x240（`scale_denom=2`）再放大显示，解码 25ms→~8ms；推流/录像仍用原始 MJPEG 零编码，两边都收益。这是比"多线程"和"PXP 硬件加速"（无 VPU，解不了 JPEG）都适配单核的方案。
+
+**面试价值**：这是"**数据驱动定位瓶颈**"的完整案例——不靠直觉猜拷贝，而是先插桩量化，确认瓶颈后再对症下药。多线程不是万能的，单核上"少计算 + 少拷贝"才是正道。
+
 **核心洞察**：**帧率/分辨率/格式三个维度不是独立参数，而是 CPU/内存/带宽/曝光时间的联合约束**。重构的本质是"先看资源预算，再定技术路径"，这是嵌入式面试官最想听到的思维方式。
 
 ## 3.3 设计模式评估与改进建议
@@ -1088,7 +1186,9 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 
 ## 3.4 面试「一句话总结」
 
-> "camera 模块是整个系统的数据源头，我围绕三个原则设计它：**零拷贝**（V4L2 mmap 让 DMA 帧直达用户态）、**快进快出**（采集线程只做取帧-拷贝-归还三个 O(1) 操作，所有 CPU 重活在处理线程）、**生产消费解耦**（深拷贝 + 条件变量分发，一帧多路消费）。在这个基础上，用定点运算和 NEON 把颜色转换压到 ~5ms/帧，用 MJPEG 硬件直出实现推流零编码路径，最终让 792MHz 单核稳定跑 30fps、内存仅 8MB。如果需求变化，我会先做资源预算分析（CPU/内存/带宽/曝光时间），再决定是调参、换算法还是换硬件——因为分辨率、帧率、格式从来不是独立的参数。"
+> "camera 模块是整个系统的数据源头，我围绕三个原则设计它：**零拷贝**（V4L2 mmap 让 DMA 帧直达用户态）、**快进快出**（采集线程只做取帧-拷贝-归还三个 O(1) 操作，所有 CPU 重活在处理线程）、**生产消费解耦**（深拷贝 + 条件变量分发，一帧多路消费）。在这个基础上，用定点运算和 NEON 把颜色转换压到 ~5ms/帧，用 MJPEG 硬件直出实现推流零编码路径，最终让 792MHz 单核稳定跑 30fps、内存仅 8MB。
+>
+> 后来我用 `[PERF]` 插桩做了量化分析，做了帧池零拷贝把显示链路拷贝降了 95%，但帧率没变——**实测确认瓶颈是 JPEG 解码（~25ms/帧）而非拷贝**。这段经历让我明白：单核嵌入式优化不能靠直觉猜，必须先插桩定位真正的瓶颈；多线程在单核上不是银弹（独立解码线程反而更卡，已回退），'少计算 + 少拷贝'才是正道。下一步主线是低分辨率显示解码。如果需求变化，我会先做资源预算分析（CPU/内存/带宽/曝光时间），再决定是调参、换算法还是换硬件——因为分辨率、帧率、格式从来不是独立的参数。"
 
 ---
 
@@ -1108,6 +1208,10 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 | 为什么强制手动曝光 | 自动曝光在暗光下拉长曝光 → 帧率暴跌 |
 | 为什么软件节流兜底 | 很多 UVC 的 S_PARM 不生效，软件隔帧采样最可靠 |
 | MJPEG vs YUYV | MJPEG 零编码但画质固定；YUYV 可软件处理但吃 CPU |
+| 显示解码要解码吗 | 本地显示必须 JPEG→RGB（libjpeg ~25ms）；推流/录像 MJPEG 直通零解码 |
+| 帧池零拷贝是啥 | 显示链路解码直写池槽 + QImage 浅引用，拷贝 10→0.5MB/s（-95%） |
+| 为什么独立解码线程更卡 | 单核无法并行，多引入拷贝+切换开销 → 少计算而非多线程 |
+| 真正的瓶颈是啥 | JPEG 解码（~25ms/帧），非拷贝；下一步低分辨率显示解码（320x240） |
 | 换 CSI 怎么改 | 抽象 ICameraSource 工厂 + demosaic 管线 |
 | 升 4K 怎么改 | 内存/带宽/编码全爆表 → 预算分析反推硬件选型 |
 | 30→60fps 改什么 | 曝光上限减半、缓冲池扩容、强制 MJPEG、节流精度提高 |
@@ -1584,12 +1688,14 @@ NEON 版: 一条指令并行 8~16 个数据，且无分支（vqmovun 内置饱�
        → 实测约 5ms/帧（README 性能表），CPU 占用大幅下降
 ```
 
-**数据出处**（README 性能表）：
+**数据出处**（README 性能表 + 帧池实施指南）：
 
 | 操作 | 耗时 |
 |------|------|
 | YUYV 转 RGB24 | ~5ms（NEON 定点，文档注释"实测 ~8×"加速） |
 | libjpeg-turbo 编码 | ~25ms（NEON 加速） |
+| **libjpeg-turbo 解码（JPEG→RGB）** | **~25ms**（**当前性能瓶颈**，见 §3.2 场景 D） |
+| 显示链路拷贝 | 0.5 MB/s（帧池零拷贝后，原 10.0 MB/s，-95%） |
 
 ## 7.4 为什么"刚好够"—— NEON + 零拷贝 + MJPEG 直出的整体设计
 
@@ -1604,12 +1710,30 @@ NEON 不是孤立优化，它和系统的其他零拷贝策略配合，才让 79
 NEON 代码通过宏**条件编译**隔离平台：
 
 ```cmake
-if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    list(APPEND CAMERA_SOURCES src/camera/processor_neon.cpp)
-    ...
-else()
-    message(STATUS "✓ x86 模式：跳过 NEON 源，使用标量实现")
-endif()
+# 当前实现：processor_neon.cpp 无条件进源列表
+set(CAMERA_SOURCES
+    src/camera/capture.cpp
+    src/camera/processor.cpp
+    src/camera/processor_neon.cpp
+    include/camera/capture.h
+    include/camera/processor.h
+)
+```
+
+跨平台兼容靠**源文件内 `#ifdef __ARM_NEON` 双重保护**（而非 CMake 裁剪源文件）：
+
+```cpp
+// processor_neon.cpp
+#ifdef __ARM_NEON
+#include <arm_neon.h>          // ARM 编译时才有该头文件
+// ... NEON 实现 ...
+#else  // !__ARM_NEON（x86 PC 调试模式）
+#include <cstdint>
+void yuyv_to_rgb24_neon(const uint8_t* /*yuyv*/, uint8_t* /*rgb*/,
+                         int /*width*/, int /*height*/) {
+    // 非 ARM 平台空实现，仅为满足符号存在性
+}
+#endif // __ARM_NEON
 ```
 
 ```cpp
@@ -1999,6 +2123,16 @@ int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
 | MJPEG 硬件直出 | 只有 JPEG 一份 | ~100KB | <1ms |
 | YUYV 软编码 | YUYV + RGB + JPEG 三份 | ~1.6MB | ~30ms |
 
+### 10.1.1 当前状态：显示路径已用帧池消除 RGB 深拷贝（重要更新）
+
+> 上述 RGB 中间态是指**推流/编码路径**（`encodeYUYVtoJPEG` 内的临时 `rgb` 缓冲）。而**本地显示路径**已经过帧池零拷贝改造，不再有"显示专用的 RGB 深拷贝"。
+
+- 改造前显示链路：`setFrame` 内部 `m_frameBuffer.assign()` + `frameToQImage` 内 `QImage.copy()`，每帧 RGB24 深拷贝 2 次（0.92MB × 2）；
+- 改造后显示链路：`decodeJPEGtoRGB`/`yuyvToRgb24` 解码结果**直接写入帧池槽**（`slot->data`），GUI 通过 QImage 浅引用上屏，**0 次 RGB 深拷贝**；
+- 实测：显示链路拷贝从 10.0 → 0.5 MB/s（-95%），池预分配 2 槽仅 +0.3MB 常驻内存。
+
+**辨析**：帧池省的是"显示路径的 RGB 搬运"，不改变"推流路径 YUYV→RGB→JPEG"的软编码中间态——后者仍是 encodeYUYVtoJPEG 内的 RGB 临时缓冲。两条路径内存优化是独立的。
+
 ## 10.2 mmap 零拷贝 vs "main.cpp 拷贝"：矛盾吗？
 
 **不矛盾——mmap 省的是"从内核 DMA 缓冲到用户态"的搬运，而 `g_state.frameData.assign()` 是一次额外的、应用主动做的深拷贝。** 看 `main.cpp:782-793` 采集线程：
@@ -2077,21 +2211,23 @@ g_state.frameData（应用堆内存，614KB）  ← 10.1 算的"YUYV 输入"就�
 
 ### 如果真的想省，有两条可行路径
 
-**路径 A：转换结果直写应用 RGB，省 YUYV 拷贝（推荐方向）**
+**路径 A：转换结果直写应用 RGB，省 YUYV 拷贝（已部分落地——帧池）**
+
+本项目实际的落地方式是**帧池零拷贝**（`include/common/frame_pool.h`）：解码/转换结果直接写入预分配的池槽（`FrameSlot::data`），GUI 通过共享引用（`setFrameShared` + QImage 浅引用）直接读，省掉显示路径的 RGB 深拷贝。核心 API：
 
 ```cpp
-// 采集线程：不拷 YUYV，直接在 mmap 上转成 RGB 存到 g_state
-std::vector<uint8_t> rgb(w*h*3);                        // 输出端内存还是要的
-VideoProcessor::yuyvToRgb24(fb.data, rgb.data(), w, h); // 从 mmap 直接读
-g_state.frameData = std::move(rgb);                     // 只存 RGB，不再存 YUYV
-putFrame(&fb);                                          // 归还
+// displayTimer（GUI 主线程）
+FrameSlot* slot = g_rgbPool->acquire();        // 借 RGB 写槽（无空闲丢帧，不阻塞）
+decodeJPEGtoRGB(raw, ..., slot->data);         // 解码/转换直接写入池槽
+g_rgbPool->publish(slot);                      // 原子发布为"当前"
+gui.setFrameShared(g_rgbPool->share());        // GUI 持有引用，浅引用上屏
 ```
 
-省掉的是 614KB YUYV 拷贝；代价是采集线程要扛 ~5ms 转换，且 RGB 只够显示用（推流/录像还得另编码 JPEG，即"显示 vs 推流"分流时转两遍）。
+`FramePool` 用引用计数（refs）+ 原子 `m_current` 指针实现无锁双缓冲：生产者写 `refs==1` 的槽、消费者读已发布槽，`SlotGuard`（RAII）保证引用安全归还。这是"数据共享，而非数据搬移"的落地——省的是**显示路径 RGB 搬运**，推流软编码路径的 RGB 中间态依然存在（见 §10.1）。
 
-**路径 B：真正的硬件零拷贝——PXP 直出**
+**路径 B：真正的硬件零拷贝——PXP 直出（预案，未实施）**
 
-i.MX6ULL 的 PXP 能在摄像头缓冲和 LCD 之间做 YUV→RGB + 缩放 + 合成，**完全绕过 CPU 和用户态拷贝**。这才是"不拷贝、直接转"的终极形态——代价是要配 `imx_pxp` 驱动、DMA 同步，且 PXP 结果只服务显示，推流路径依然独立。
+i.MX6ULL 的 PXP 能在摄像头缓冲和 LCD 之间做 YUV→RGB + 缩放 + 合成，**完全绕过 CPU 和用户态拷贝**。这才是"不拷贝、直接转"的终极形态——代价是要配 `imx_pxp` 驱动、DMA 同步，且 PXP 结果只服务显示，推流路径依然独立。**但 PXP 无 VPU、解不了 JPEG**，且已实测瓶颈是解码而非转换，故当前优先级不高（详见 `docs/plan-pxp-acceleration.md`）。
 
 ### 核心权衡
 

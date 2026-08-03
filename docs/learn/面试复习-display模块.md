@@ -17,7 +17,7 @@
    - 1.5 核心类 / 函数列表与调用关系
    - 1.6 Qt 线程模型与两个定时器的关系
 2. [第二部分 分块代码详解（含面试追问）](#第二部分-分块代码详解含面试追问)
-   - 2.1 块一：帧渲染管线（setFrame → frameToQImage → QLabel）
+   - 2.1 块一：帧渲染管线（帧池零拷贝路径 + 旧路径兜底）
    - 2.2 块二：帧率控制（displayTimer / m_refreshTimer 双定时器与双 FPS）
    - 2.3 块三：回调注入（松耦合的关键）
    - 2.4 块四：页面导航（QStackedWidget 三层嵌套）
@@ -44,7 +44,9 @@
 src/display/ 显示与交互模块
 │
 ├── CameraGUI（主界面）                  gui.h / gui.cpp (~1140 行)
-│   ├── 帧渲染：setFrame() / frameToQImage() / refreshFrame()
+│   ├── 帧渲染：setFrameShared() 零拷贝路径（m_heldSlot + QImage 浅引用）
+│   │            + setFrame() 旧深拷贝路径 + frameToQImage() / refreshFrame()
+│   ├── 帧池交互：extern FramePool* g_rgbPool；setFrameShared 持有槽引用，refreshFrame 浅引用上屏
 │   ├── 帧率控制：m_refreshTimer (GUI 内) + displayTimer (main 注入) / 双 FPS
 │   ├── 回调注入：onCaptureRequest / onRecordToggle / onResolutionChanged
 │   │            onFormatChanged / onStoragePathChanged / onCameraControlChanged
@@ -85,7 +87,7 @@ src/display/ 显示与交互模块
 ## 1.3 输入 / 输出
 
 - **输入**：
-  - 帧数据 `(data, len, w, h, fmt)`：`setFrame()` 从 `g_state` 拉取（RGB24 / RGB565 / YUYV / MJPEG 四种格式）
+  - 帧数据：`setFrameShared(FrameSlot*)` 从帧池拉取共享槽（RGB24，零拷贝）；旧路径 `setFrame(data, len, w, h, fmt)` 兜底（RGB24 / RGB565 / YUYV / MJPEG）
   - 状态更新：`setFPS` / `setDisplayFPS` / `setClientCount` / `setRecordingStatus` / `setStreamingStatus`
   - 相机控制范围：`setBrightnessRange` / `setContrastRange` / `setWhiteBalanceRange` / `setExposureRange` / `setFramerateRange`
   - 存储绑定：`setGalleryStorage(StorageManager*)`
@@ -102,7 +104,8 @@ src/display/ 显示与交互模块
 | `linuxfb` 平台插件（`QT_QPA_PLATFORM`） | 帧缓冲渲染 | 内部 mmap `/dev/fb0`，内置 evdev 触摸 |
 | `libjpeg-turbo`（`jpeglib.h`） | MJPEG 解码 / 缩略图 | `HAS_LIBJPEG` 条件编译；自定义错误处理器防坏帧崩溃 |
 | `arm_neon.h`（`__ARM_NEON`） | YUYV→RGB 加速 | 仅 ARM 交叉编译启用，x86 退化标量 |
-| `VideoProcessor`（`src/camera/processor.h`） | YUYV→RGB24 颜色转换 | `gui.cpp` include 复用，避免维护第二份转换代码；含 NEON 加速 |
+| `VideoProcessor`（`src/camera/processor.h`） | YUYV→RGB24 颜色转换 / JPEG→RGB 解码 | `gui.cpp` include 复用，避免维护第二份转换代码；含 NEON 加速与 `decodeJPEGtoRGB` |
+| `FramePool` / `FrameSlot`（`include/common/frame_pool.h`） | 帧池零拷贝显示链路 | `extern FramePool* g_rgbPool`；`setFrameShared` 持有槽引用，`refreshFrame` QImage 浅引用 |
 | StorageManager（`src/storage/`） | 相册数据源 | `listPhotos` / `listVideos` / `deletePhoto` / `extractAviThumbnail` |
 | 标准 C++17 | 容器/函数 | `std::function` 回调、`std::vector` |
 
@@ -123,19 +126,21 @@ main.cpp（Qt 主线程）
   │    gui.onCaptureRequest(...)           ← 存 JPEG（MJPEG 直存 / YUYV 先编码）
   │    gui.onRecordToggle(...)             ← 校验 MJPEG 才允许录像
   │
-  ├─ displayTimer (QTimer 33ms)            ← main 侧：锁内 setFrame(拷贝) + FPS 更新
+  ├─ displayTimer (QTimer 33ms)            ← main 侧：借槽→解码入槽→publish→share→setFrameShared + FPS 更新
   │
   └─ gui.show() → app.exec()               ← 进入 Qt 事件循环
         │
-        └─ CameraGUI::m_refreshTimer (QTimer 33ms)   ← GUI 侧：refreshFrame → 解码 → setPixmap
+        └─ CameraGUI::m_refreshTimer (QTimer 33ms)   ← GUI 侧：refreshFrame → QImage 浅引用 → setPixmap
 ```
 
 **两个定时器串联的完整链路**（这是理解显示线程模型的关键，见 1.6）：
 
 ```
 displayTimer.timeout (main, 锁内)         m_refreshTimer.timeout (GUI 线程)
-  g_state → setFrame (深拷贝)      ───►    refreshFrame → frameToQImage (解码)
-                                          → setPixmap → paintEvent → fb0
+  g_state → 借rgb池槽 → 解码/转换入槽   ───►   refreshFrame
+  → publish → share → setFrameShared           → m_heldSlot 存在: QImage 浅引用（零拷贝）
+  （解码在 displayTimer 内，GUI 主线程）        → 否则: frameToQImage（旧路径兜底）
+                                                → setPixmap → paintEvent → fb0
 ```
 
 ## 1.6 Qt 线程模型与两个定时器的关系
@@ -146,13 +151,16 @@ displayTimer.timeout (main, 锁内)         m_refreshTimer.timeout (GUI 线程)
 
 | 定时器 | 所在 | 回调 | 干的事 |
 |--------|------|------|--------|
-| `displayTimer` | `main.cpp:891` | lambda | 锁内从 `g_state` 拷贝到 GUI 内部 + 更新 FPS/客户端数 |
-| `m_refreshTimer` | `gui.cpp:93` | `refreshFrame` | 把 GUI 内部帧解码成 QImage → `setPixmap` |
+| `displayTimer` | `main.cpp` | lambda | 借 rgb 池槽 → 短锁拷贝 raw → **解码/转换入槽**（`decodeJPEGtoRGB`/`yuyvToRgb24`）→ `publish` → `share` → `setFrameShared` + 更新 FPS/客户端数 |
+| `m_refreshTimer` | `gui.cpp` | `refreshFrame` | 若持有 `m_heldSlot` 用 QImage 浅引用（零拷贝），否则回退 `frameToQImage` → `setPixmap` |
+
+> **注意**：帧池改造后，**解码（JPEG→RGB）发生在 `displayTimer` 的 timeout 内**（即 GUI 主线程，`main.cpp` 的 displayTimer 回调中），不再在 `m_refreshTimer` 的 `frameToQImage` 里。两个定时器仍在 GUI 主线程顺序执行，但 `m_refreshTimer` 变成了纯"浅引用上屏"，几乎不耗时。
 
 **为什么拆成两个而不是一个？**
-1. `displayTimer` 要访问 `g_state`（main.cpp 的全局），属于"模块边界的数据搬运"；`m_refreshTimer` 只碰 GUI 内部状态，属于"渲染"。
+1. `displayTimer` 要访问 `g_state`（main.cpp 的全局）和 `g_rgbPool`（帧池），属于"模块边界的数据搬运 + 解码"；`m_refreshTimer` 只碰 GUI 内部状态，属于"渲染"。
 2. 分离让 `CameraGUI` 类可以**独立测试**（PC Mock 模式只有 `m_refreshTimer` 在跑，不依赖 `g_state`）。
-3. 代价是两个定时器**相位不同步**，帧会多约 0~33ms 的随机延迟——这是"解耦 vs 延迟"的权衡，面试能主动指出说明理解深。
+3. 帧池改造后，解码集中在 `displayTimer`，`m_refreshTimer` 退化为主持"浅引用上屏"；两者仍在 GUI 主线程顺序执行。
+4. 代价是两个定时器**相位不同步**，帧会多约 0~33ms 的随机延迟——这是"解耦 vs 延迟"的权衡，面试能主动指出说明理解深。
 
 【面试官追问】"这两个定时器都在 GUI 线程，会不会互相抢时间导致帧率减半？"
 
@@ -166,97 +174,151 @@ displayTimer.timeout (main, 锁内)         m_refreshTimer.timeout (GUI 线程)
 
 # 第二部分 分块代码详解（含面试追问）
 
-## 2.1 块一：帧渲染管线（setFrame → frameToQImage → QLabel）
+## 2.1 块一：帧渲染管线（帧池零拷贝路径 + 旧路径兜底）
 
 ### 代码讲解
 
-**代码意图**：把共享状态里的一帧安全地变成屏幕上的像素。
+**代码意图**：把共享状态里的一帧安全地变成屏幕上的像素，核心是**帧池零拷贝**。
 
-`setFrame`（`gui.cpp:465`）——只做拷贝，不做解码：
+**帧池路径（当前真实相机模式主路径）**——`setFrameShared`（`gui.cpp:489`），零拷贝持有共享槽：
 
 ```cpp
-void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
-    if (!data || len <= 0) return;
-    // 深拷贝帧数据到内部缓冲区，避免指针悬垂
-    m_frameBuffer.assign(data, data + len);
-    m_currentFrame.data   = m_frameBuffer.data();
-    m_currentFrame.length = len;
-    m_currentFrame.width  = w;
-    m_currentFrame.height = h;
-    m_currentFrame.format = fmt;
+void CameraGUI::setFrameShared(FrameSlot* slot) {
+    if (!slot) return;
+    // 1. 释放上一帧持有的槽引用（若有）
+    if (m_heldSlot) {
+        if (g_rgbPool) g_rgbPool->release(m_heldSlot);
+        m_heldSlot = nullptr;
+    }
+    // 2. 持有新帧槽引用（slot 的 refs 已由 share() +1，GUI 接管）
+    m_heldSlot = slot;
+    // 3. m_currentFrame 直接指向共享数据（零拷贝）
+    m_currentFrame.data   = slot->data.data();
+    m_currentFrame.length = (int)slot->data.size();
+    m_currentFrame.width  = slot->width;
+    m_currentFrame.height = slot->height;
+    m_currentFrame.format = PixelFormat::FMT_RGB24;   // 显示槽固定 RGB24
     m_currentFrame.index++;
     m_mockMode = false;
 }
 ```
 
-`frameToQImage`（`gui.cpp:1099`）按格式分派：
+`refreshFrame`（`gui.cpp:276`）中，持有槽时用 **QImage 浅引用（不 `.copy()`）**：
 
 ```cpp
-case PixelFormat::FMT_RGB24:
-    return QImage(data, w, h, w * 3, QImage::Format_RGB888).copy();
+QImage img;
+if (m_heldSlot) {
+    // ---- 零拷贝路径：QImage 浅引用共享槽（不 .copy()）----
+    // m_heldSlot 保证数据生命周期有效；QImage 是临时对象，作用域结束即毁
+    const int w = m_currentFrame.width;
+    const int h = m_currentFrame.height;
+    img = QImage(m_currentFrame.data, w, h, w * 3, QImage::Format_RGB888);
+} else {
+    img = frameToQImage(m_currentFrame.data, ...);   // 旧路径兜底（Mock/无槽）
+}
+if (!img.isNull()) m_videoDisplay->setPixmap(QPixmap::fromImage(img));
+```
+
+**旧路径兜底**——`setFrame`（`gui.cpp:473`）仍保留（供 Mock/回退），深拷贝到 `m_frameBuffer`：
+
+```cpp
+void CameraGUI::setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt) {
+    m_frameBuffer.assign(data, data + len);   // 深拷贝，避免悬垂
+    m_currentFrame.data = m_frameBuffer.data();
+    ...
+}
+```
+
+`frameToQImage`（`gui.cpp:1121`）按格式分派，仅当**无 `m_heldSlot`** 时调用：
+
+```cpp
 case PixelFormat::FMT_YUYV: {
     std::vector<uint8_t> rgb(w * h * 3);
     VideoProcessor::yuyvToRgb24(data, rgb.data(), w, h);   // 复用 camera 模块，含 NEON 加速
     return QImage(rgb.data(), w, h, w * 3, QImage::Format_RGB888).copy();
 }
 case PixelFormat::FMT_MJPEG: {
-    std::vector<uint8_t> rgb;
-    if (decodeMjpegToRgb(data, len, rgb, dw, dh))   // libjpeg-turbo 解码
-        return QImage(rgb.data(), dw, dh, dw * 3, QImage::Format_RGB888).copy();
+    // libjpeg 解码（旧路径）；帧池路径已在 displayTimer 用 VideoProcessor::decodeJPEGtoRGB 入槽
     ...
 }
 ```
 
-**三个关键设计**：
-1. **`.copy()` 是显式深拷贝**——`QImage(data,...)` 构造只是浅引用 `rgb.data()`（局部 vector），不 copy 就是悬垂。
-2. **libjpeg 自定义错误处理器**（`jpegSilentErrorExit` + `longjmp`）：MJPEG 流里偶发坏帧时，默认的 `exit()` 错误处理会**杀掉整个进程**，改成长跳转返回 false 跳过坏帧，这是嵌入式流式解码必须的处理。
-3. **MJPEG 用 libjpeg 优先，Qt 内置解码兜底**：`#ifdef HAS_LIBJPEG` 保证 PC 无 libjpeg 时也能跑。
+**三个关键设计（帧池路径）**：
+1. **解码发生在 displayTimer，而非 refreshFrame**：`displayTimer` 里 `decodeJPEGtoRGB`/`yuyvToRgb24` 直接把结果写入池槽，`m_refreshTimer` 的 `refreshFrame` 只做浅引用上屏——解码结果与显示端共享同一块池内存，**省掉 setFrame 的 assign 和 QImage.copy() 两次 RGB 深拷贝**。
+2. **QImage 浅引用（不 `.copy()`）是安全的**：因为 `m_heldSlot` 持有池槽引用（refs≥1），保证 `slot->data` 生命周期有效；QImage 是临时对象，作用域结束即毁，不跨帧持有 → 无悬垂。
+3. **生命周期不变量**：GUI 始终持有且仅持有一份 `m_heldSlot`；`setFrameShared` 在换帧时才 release 旧槽（归零后复用），解码方不会回收正在显示的槽。
 
 ### 潜在坑点
 
-- **双悬垂风险**：`setFrame` 必须深拷贝（`g_state.frameData` 会被采集线程 realloc）；`QImage` 构造后必须 `.copy()`（局部 vector 出作用域就释放）。漏掉任一层都会随机崩溃。
+- **双悬垂风险（旧路径）**：旧 `setFrame` 必须深拷贝（`g_state.frameData` 会被采集线程 realloc）；旧 `QImage` 构造后必须 `.copy()`。**帧池路径消除了这两处**——数据生命周期由 `m_heldSlot` 引用计数保证。
+- **`m_heldSlot` 泄漏风险**：若 `setFrameShared` 换帧时忘了 release 旧槽、或析构时没释放 `m_heldSlot`，槽永不归还 → 池满持续丢帧。`CameraGUI::~CameraGUI` 里判空释放 `m_heldSlot` 正是防泄漏（`gui.cpp:113`）。
 - **`setScaledContents(true)` 的性能**：QLabel 每帧绘制时都对 pixmap 做一次缩放插值，640x480 可接受，但升 720p 后 CPU 开销翻倍——应缓存缩放结果。
-- **坏帧静默跳过 vs 画面停顿**：解码失败返回空 QImage，`refreshFrame` 里 `if (!img.isNull())` 会跳过 setPixmap，画面保持上一帧。好处是不花屏，坏处是坏帧过多时画面"冻住"却无提示——需要一个坏帧计数器报警。
+- **坏帧静默跳过 vs 画面停顿**：解码失败 `release(slot)` 丢帧，`refreshFrame` 里 `if (!img.isNull())` 跳过 setPixmap，画面保持上一帧。好处是不花屏，坏处是坏帧过多时画面"冻住"却无提示——需要一个坏帧计数器报警。
 
 ### 面试追问与应答
 
-**Q1：MJPEG 每帧解码耗时约 25ms，decode 在哪个线程？会不会卡 UI？**
-**A**：解码发生在 Qt 主线程的 `frameToQImage`（`m_refreshTimer` 的 timeout 槽）。一次解码 25ms 会阻塞事件循环，解码超时则界面掉帧、按钮无响应。这是当前实现的短板：解码应在处理线程完成、把 RGB 投递给 GUI。实测能跑 30fps 是因为 MJPEG 帧小于 100KB 时解码常低于 25ms，且 33ms 定时器有富余。主动指出这个可优化点，比等面试官挖更加分。
+**Q1：帧池路径和旧 setFrame 深拷贝路径的本质区别？为什么能零拷贝？**
+**A**：旧路径：`setFrame` 把帧深拷贝进 `m_frameBuffer`（assign），`frameToQImage` 解码后再 `.copy()` 一次，RGB24 每帧拷 2 遍。帧池路径：`displayTimer` 解码结果**直接写入池槽**（`slot->data`），`setFrameShared` 让 `m_currentFrame` 零拷贝指向共享内存，`refreshFrame` 用 QImage 浅引用上屏——RGB24 全程 0 次深拷贝。安全靠 `m_heldSlot` 引用计数保证槽生命周期，实测显示链路拷贝从 10.0 → 0.5 MB/s（-95%）。
 
-**Q2：为什么 `setScaledContents(true)` + `setPixmap`，而不是先 `img.scaled(w,h)` 再设置？**
+**Q2：MJPEG 每帧解码耗时约 25ms，decode 在哪个线程？会不会卡 UI？**
+**A**：解码发生在 Qt 主线程的 `displayTimer` 的 timeout 槽（帧池路径下不再是 `frameToQImage`）。一次解码 25ms 会阻塞事件循环。**但实测证明：单核 i.MX6ULL 上把解码移出 GUI 线程反而更卡**（线程无法并行，多引入拷贝+切换开销，已回退），所以解码留在 GUI 主线程是当前妥协，也是帧率卡 10fps 的根因。下一步主线是**低分辨率显示解码**（320x240 ~8ms）而非多线程。
+
+**Q3：为什么 `setScaledContents(true)` + `setPixmap`，而不是先 `img.scaled(w,h)` 再设置？**
 **A**：`setScaledContents(true)` 让 QLabel 在绘制时拉伸 pixmap，等价于先缩放但**延迟到 paintEvent**、避免多一次中间缓冲；缺点是每次绘制都重缩放。对轻微缩放可接受，升 720p 后应缓存缩放结果。
 
-**Q3：`frameToQImage` 为什么是 `switch` 而不是多态？加一种新格式要改哪？**
-**A**：当前 4 种格式（RGB24/RGB565/YUYV/MJPEG）分支清晰、无抽象成本。但加新格式（如 NV12、H.264 解码帧）要改 switch + 头文件枚举。可演化为"`FormatConverter` 策略表"——`std::unordered_map<PixelFormat, std::function<QImage(...)>>`，新增格式注册即可，符合开闭原则（见 3.3）。
+**Q4：`frameToQImage` 为什么是 `switch` 而不是多态？加一种新格式要改哪？**
+**A**：当前 4 种格式（RGB24/RGB565/YUYV/MJPEG）分支清晰、无抽象成本，且帧池路径下 `frameToQImage` 只是无槽时的兜底。但加新格式（如 NV12、H.264 解码帧）要改 switch + 头文件枚举。可演化为"`FormatConverter` 策略表"——`std::unordered_map<PixelFormat, std::function<QImage(...)>>`，新增格式注册即可，符合开闭原则（见 3.3）。
 
 ## 2.2 块二：帧率控制（displayTimer / m_refreshTimer 双定时器与双 FPS）
 
 ### 代码讲解
 
-`main.cpp:891`（显示定时器，拉模式）：
+`main.cpp`（显示定时器，拉模式 + 帧池路径）：
 
 ```cpp
 displayTimer = new QTimer(&gui);
 displayTimer->setInterval(33);                    // 33ms ≈ 30fps
-QObject::connect(displayTimer, &QTimer::timeout, [&gui, ...]() {
-    std::lock_guard<std::mutex> lock(g_state.mtx);
-    if (g_state.frameData.empty()) return;
-    gui.setFrame(g_state.frameData.data(), ...);   // 取"最新"一帧
-    gui.setFPS(g_state.fps);                       // 硬件 FPS
-    ...
+QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
+    // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
+    FrameSlot* slot = g_rgbPool->acquire();
+    if (!slot) return;
+    // 2. 短锁拷贝出原始帧
+    std::vector<uint8_t> raw;  int srcW, srcH;  PixelFormat srcFmt;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mtx);
+        if (g_state.frameData.empty()) { g_rgbPool->release(slot); return; }
+        raw = g_state.frameData;                    // 原始帧拷贝（JPEG ~0.1MB，唯一）
+        srcW = g_state.width; srcH = g_state.height; srcFmt = g_state.format;
+    }
+    // 3. 解码/转换直接写入池槽（消除二次拷贝）
+    slot->width = srcW; slot->height = srcH; slot->format = FMT_RGB24;
+    if (srcFmt == FMT_MJPEG) {
+        if (!VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(), slot->data, dw, dh))
+            { g_rgbPool->release(slot); return; }   // 坏帧丢帧
+    } else if (srcFmt == FMT_YUYV) {
+        slot->data.resize(srcW * srcH * 3);
+        VideoProcessor::yuyvToRgb24(raw.data(), slot->data.data(), srcW, srcH);
+    }
+    // 4. 发布并交 GUI 共享（setFrameShared 持有引用，零拷贝上屏）
+    slot->seq++;
+    g_rgbPool->publish(slot);
+    if (FrameSlot* ds = g_rgbPool->share())
+        gui.setFrameShared(ds);                     // GUI 接管引用
+    gui.setFPS(g_state.fps); gui.setClientCount(mjpegServer->clientCount());
 });
 displayTimer->start();
 ```
 
-**核心设计：拉模式 + 覆盖旧帧，天然防堆积。** 采集线程每帧都写 `g_state`，但 GUI 每 33ms 只取一次——两帧之间的中间帧被"覆盖丢弃"。比"采集线程每帧直接推送刷新（emit 信号）"好在：
+**核心设计：拉模式 + 覆盖旧帧 + 帧池双缓冲，天然防堆积。** 采集线程每帧都写 `g_state`，但 GUI 每 33ms 只取一次——两帧之间的中间帧被"覆盖丢弃"。比"采集线程每帧直接推送刷新（emit 信号）"好在：
 
 - **不存在队列，就没有"堆积"这一说**：`g_state` 是"最新一帧"共享状态而非事件队列，无论采集多快（λ 多大）、显示多慢（μ 多小），都没有东西排队等待，天然规避了 λ > μ 时事件队列无限堆积的问题；
+- **帧池无锁双缓冲**：生产者（displayTimer 写槽）与消费者（refreshFrame 读 `m_current` 槽）通过引用计数分离，`acquire` 只借空闲槽（refs==0），写槽时不会有消费者读它——**读写分离不靠锁**；
 - 显示帧率稳定在定时器周期，不受采集波动影响（推模式下显示节拍跟随采集、有抖动）；
 - 没有跨线程事件投递，无元对象序列化与事件循环调度开销、无事件队列延迟漂移。
 
 **双 FPS 设计**：`setFPS` 显示采集侧（硬件/采集线程算的）FPS，`setDisplayFPS` 显示显示侧（GUI 每 30 次刷新自己统计的）FPS。两个数对比能直接暴露"采集 30、显示 15"的瓶颈——这是排查显示性能的关键仪表。
 
-**帧率联动**（`main.cpp:520`）：用户拖帧率滑块，回调里 `displayTimer->setInterval(1000/fps)` 同步更新显示节奏，让 UI 跟随配置。
+**帧率联动**：用户拖帧率滑块，回调里 `displayTimer->setInterval(1000/fps)` 同步更新显示节奏，让 UI 跟随配置。
 
 ### 潜在坑点
 
@@ -269,8 +331,8 @@ displayTimer->start();
 **Q1：为什么用 QTimer 33ms 而不是在采集线程里直接调 setFrame？**
 **A**：① **线程安全**：Qt 控件只能在 GUI 线程操作，跨线程改 QLabel 必须通过 queued connection 或定时器转发；QTimer 天然运行在 GUI 线程。② **节流防堆积**：每帧跨线程投递时，事件队列是否堆积取决于"采集速率 vs GUI 消费速率"——**只有采集快于 GUI 处理能力时**（如 60fps 采集、解码 25ms/帧）队列才会无限堆积、延迟越来越大；慢速采集（λ < μ）下队列稳定、不会堆积，但推模式仍有显示节拍随采集波动、每次投递带元对象序列化开销的缺点。拉模式固定 33ms 取最新帧，无论采集多快都天然丢弃中间帧、延迟有界且节拍稳定。这是生产者-消费者模型里"**推模式保每帧、拉模式保实时性**"的经典取舍。
 
-**Q2：锁 `g_state.mtx` 期间如果 setFrame 内部做解码（25ms），采集线程会卡住吗？**
-**A**：不会卡 25ms。`setFrame` 拿锁后只做**深拷贝**（`assign`），**解码发生在锁外**的 `frameToQImage`（由 GUI 自己的 `m_refreshTimer` 调用）。也就是说**锁内只拷贝、锁外解码**，锁持有时间就是一次 memcpy（~1ms 级），采集线程最多等 1ms。这个"锁内轻活、锁外重活"的划分是本题的得分点。
+**Q2：锁 `g_state.mtx` 期间如果 displayTimer 内部做解码（25ms），采集线程会卡住吗？**
+**A**：不会卡 25ms。帧池路径下，`displayTimer` 拿锁只做**短锁拷贝**——`raw = g_state.frameData`（原始帧，JPEG ~0.1MB），**解码（`decodeJPEGtoRGB`）发生在锁外**，直接写入池槽。也就是说**锁内只拷贝、锁外解码**，锁持有时间就是一次原始帧 memcpy（~1ms 级），采集线程最多等 1ms。这个"锁内轻活、锁外重活"的划分是本题的得分点（和 camera 篇"拷贝 #2 快速释放锁"同一哲学）。
 
 **Q3：SW_FPS 统计是怎么算的？有什么缺点？**
 **A**：`main.cpp:909` 每 30 次 timeout 用 `dispFrameCount / elapsed` 算平均。缺点：① 只统计"定时器触发次数"，不统计"实际绘制完成"——如果解码慢导致某次渲染被跳过，SW_FPS 仍可能偏高；② 30 帧窗口在低帧率下更新慢。更准确的做法是在 `paintEvent` 里统计或记录每帧实际渲染时间。
@@ -638,8 +700,9 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 耦合对象 | 方式 | 耦合度 | 说明 |
 |----------|------|--------|------|
 | camera | `std::function` 回调（控制） | **松** | GUI 不知道 CameraCapture 类的存在 |
-| camera | `setFrame(data,len,w,h,fmt)`（数据） | **中** | main.cpp 在中间做适配，GUI 只认帧契约 |
-| camera | `VideoProcessor::yuyvToRgb24`（编译期） | **中** | `gui.cpp` include `processor.h` 复用颜色转换（纯静态工具类，无 V4L2 依赖） |
+| camera | `setFrameShared(FrameSlot*)` / `setFrame(...)`（数据） | **中** | main.cpp 在中间适配 + 帧池解码；GUI 认"帧槽契约" |
+| camera | `VideoProcessor::yuyvToRgb24` / `decodeJPEGtoRGB`（编译期） | **中** | `gui.cpp` include `processor.h` 复用颜色转换与解码（纯静态工具类，无 V4L2 依赖） |
+| common | `FramePool` / `g_rgbPool`（帧池） | **中** | GUI 通过 `extern FramePool* g_rgbPool` release 槽引用；`setFrameShared` 持有 `m_heldSlot` |
 | network | `setClientCount(int)` 单向状态 | **松** | 只收状态，不发指令 |
 | storage | 直接持有 `StorageManager*` | **紧** | 相册直接调用 `listPhotos`/`deletePhoto` 等 |
 
@@ -647,7 +710,9 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 - camera 控制频率低、语义简单（拍照/切分辨率），用回调最轻；
 - 相册需要**大量双向数据交互**（列目录、删文件、读缩略图、存空间查询），十几个方法如果全走回调会非常啰嗦，直接持有指针更务实。
 
-**编译期依赖说明（重要演进）**：早期版本 `gui.h` 内联了一份 `yuyv_to_rgb24`/`yuyv_to_rgb565`（BT.601 定点），与 `processor.cpp` 完全重复。重构后已删除，`gui.cpp` 统一调用 `VideoProcessor::yuyvToRgb24`（同样含 NEON 分流）。收益：颜色转换只维护一份实现，消除"两处系数不一致"的隐患；代价：display 对 camera 头文件多了一条编译期依赖（`processor.h` 是纯静态工具类，不含 V4L2 结构体，实际耦合很弱）。`gui.cpp` 本就要 include `capture.h` 用 `V4L2_CID_*` 常量，故该依赖并非新增方向。
+**编译期依赖说明（重要演进）**：早期版本 `gui.h` 内联了一份 `yuyv_to_rgb24`/`yuyv_to_rgb565`（BT.601 定点），与 `processor.cpp` 完全重复。重构后已删除，`gui.cpp` 统一调用 `VideoProcessor::yuyvToRgb24`（同样含 NEON 分流）与 `decodeJPEGtoRGB`（帧池显示解码）。收益：颜色转换与解码只维护一份实现，消除"两处系数不一致"的隐患；代价：display 对 camera 头文件多了一条编译期依赖（`processor.h` 是纯静态工具类，不含 V4L2 结构体，实际耦合很弱）。`gui.cpp` 本就要 include `capture.h` 用 `V4L2_CID_*` 常量，故该依赖并非新增方向。
+
+**帧池依赖说明**：帧池改造后，`gui.cpp` 顶部 `extern FramePool* g_rgbPool` 引用 main.cpp 定义的全局帧池，`setFrameShared` 内部持有/释放 `FrameSlot` 引用。GUI 不再深拷贝帧数据，改为"共享引用 + 生命周期由引用计数保证"——这是对 camera 数据耦合方式的一次重要演进（从"拷贝契约"到"共享契约"）。
 
 **改进方向**：相册对 storage 的依赖可以抽象为 `MediaProvider` 接口（`list/delete/extractThumbnail`），便于单元测试注入假存储；camera 侧保持回调即可。颜色转换若想彻底解耦，可将 `VideoProcessor` 从 `camera/` 目录上移到 `common/`（它本质是通用图像工具，不依赖 V4L2）——这是合理的下一步重构。**松紧结合**是合理的——不同接口不同耦合策略。
 
@@ -658,12 +723,12 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 **变化点**：每帧 RGB24 从 0.92MB → 2.76MB（×3），解码/缩放/拷贝全部 ×3。
 
 **重构方案**：
-1. **解码移出 GUI 线程**（第一优先级）：720p MJPEG 单帧解码 ~50-80ms，主线程必卡。改为解码线程 + `QImage` queued 投递或直接消费 RGB。
+1. **低分辨率显示解码（第一优先级，已实测验证方向）**：720p MJPEG 单帧全尺寸解码 ~50-80ms，主线程必卡。**注意：不能靠"解码移出 GUI 线程"**——实测单核 i.MX6ULL 上独立解码线程反而更卡（线程无法并行，多引入拷贝+切换开销，已回退）。正确方向是**用 `scale_denom` 只解码显示所需尺寸**（如 800x480），解码 25ms→~8ms，推流仍用原始 720p MJPEG 零编码。帧池已为 720p RGB 的零拷贝搬运铺好路。
 2. **缓存缩放结果**：`setScaledContents` 每帧重缩放 720p→800x480 太贵，先 `img.scaled` 一次缓存，只在分辨率变化时重算。
-3. **拷贝裁剪**：显示只需 800x480，采集是 1280x720——可在解码时用 scale_denom 直接缩到显示尺寸，省掉一次全尺寸 RGB 拷贝。
-4. **内存**：`m_frameBuffer` + `g_state.frameData` + QImage 三份 720p RGB ≈ 8MB+，需评估或合并拷贝点。
+3. **拷贝裁剪**：显示只需 800x480，采集是 1280x720——可在解码时用 scale_denom 直接缩到显示尺寸，省掉一次全尺寸 RGB 拷贝（帧池槽可直接装缩小后的 RGB）。
+4. **内存**：帧池已消除显示链路的 RGB 深拷贝（`setFrameShared` + 浅引用）；`g_state.frameData`（JPEG）+ 帧池 RGB 槽（2 槽 × 2.76MB）≈ 6MB，需评估是否缩 RGB 槽尺寸。
 
-**核心洞察**：升分辨率不是"参数改大"，而是每帧预算 ×3 的连锁反应——先动"最贵的路径"（解码/缩放），再谈显示。
+**核心洞察**：升分辨率不是"参数改大"，而是每帧预算 ×3 的连锁反应——先动"最贵的路径"（解码/缩放），再谈显示。**帧池零拷贝已经消除了"搬运"这个维度，剩下要攻的是"解码计算"这个维度**。
 
 ### 场景 B：显示从 Qt 换成 SDL / 裸 framebuffer
 
@@ -680,8 +745,8 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 **变化点**：显示周期 33ms → 16.6ms，每帧显示预算减半。
 
 **重构方案**：
-1. 定时器间隔改 16ms，但 **解码/拷贝必须跟上**——720p 下 60fps 软解码不可行，需 scale_denom 或 PXP；
-2. 双定时器相位不同步在 16ms 周期下更明显，建议合并为单定时器（采集→渲染一个循环）；
+1. 定时器间隔改 16ms，但 **解码/拷贝必须跟上**——720p 下 60fps 软解码不可行，需 scale_denom 低分辨率解码或 PXP；
+2. 双定时器相位不同步在 16ms 周期下更明显，建议合并为单定时器（采集→渲染一个循环）；帧池 `acquire` 池满丢帧提供了天然反压，即使解码跟不上也不阻塞采集；
 3. 节流：`displayTimer->setInterval(std::max(10, 1000/fps))` 已有 10ms 保底，60fps=16ms 可行；
 4. 注意 LCD 面板本身是否支持 60fps 刷新（linuxfb 下 `FBIO_WAITFORVSYNC`）。
 
@@ -692,7 +757,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 观察者 | Qt 信号槽（`clicked`→slot） | 标准观察者，Qt 原生实现 |
 | 依赖倒置 | `std::function` 回调注入 | 优质实践：display 依赖抽象不依赖实现 |
 | 适配器/策略 | 无 `IDisplaySink` 抽象 | 换渲染后端需全重写，建议引入 |
-| 生产者-消费者 | 采集线程 → g_state → displayTimer | 显式实现：共享状态 + 锁 + 拉模式 |
+| 生产者-消费者 | 采集线程 → g_state → displayTimer → 帧池槽 | 显式实现：共享状态 + 锁 + 拉模式 + 帧池引用计数双缓冲 |
 | 状态 | 录像按钮 toggle（`m_isRecording`） | 隐式状态，靠标志位 |
 | 策略 | `frameToQImage` 按格式 switch | 隐式策略，新格式要改 switch |
 | 模板方法 | `refreshFrame` 固定流程 | 隐式模板方法 |
@@ -700,17 +765,19 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 **改进建议（面试给出"批判 + 方案"）**：
 
 1. **引入 `IDisplaySink`**：`virtual void present(const FrameBuffer&) = 0;`。Qt/SDL/裸 FB 各一个实现类，"显示后端"变成可插拔策略。
-2. **解码移出 GUI 线程**：最值得做的性能重构——解码线程 + `QImage` 通过 `Qt::QueuedConnection` 投递，GUI 线程只做轻量绘制。
+2. **低分辨率显示解码（实测验证方向，替代"解码移出 GUI 线程"）**：早期以为"解码移出 GUI 线程"能提速，实测单核 i.MX6ULL 上独立解码线程**反而更卡**（线程无法并行 + 多引入拷贝/切换开销，已回退）。正确方向是**用 `scale_denom` 只解码显示所需尺寸**（显示解码 25ms→~8ms），推流仍用原始 MJPEG 零编码。**单核上"少计算 + 少拷贝"比"多线程"更有效**。
 3. **`FormatConverter` 策略表**：`std::unordered_map<PixelFormat, Converter>` 注册新格式，消除 switch 分支。
 4. **`GestureRecognizer` 抽象**：滑动手势识别从 gallery 内抽离，便于扩展双击/长按。
 5. **状态机替代标志位**：`m_isRecording`/`m_selectMode` 等 bool 可演化为枚举状态机，防非法状态组合。
 6. **缩略图控件复用池**：用 `QListView` delegate 或控件池替代"每图 3 控件"，降内存。
 
-**权衡**：当前代码"功能完备、耦合最小化"；但抽象不足导致换后端成本高、解码阻塞 UI。实习面试能说出"回调边界已解耦，但渲染后端缺适配器抽象、解码应在独立线程"就是很好的系统观。
+**权衡**：当前代码"功能完备、耦合最小化"，且已用帧池消除显示链路深拷贝、验证了瓶颈；但抽象不足导致换后端成本高、解码仍占用 GUI 主线程。面试能说出"回调边界已解耦、渲染后端缺适配器抽象、单核上瓶颈在解码、方向是低分辨率解码而非多线程"就是很好的系统观。
 
 ## 3.4 面试「一句话总结」
 
-> "display 模块是系统的'人机界面'，我围绕三个原则设计：**解耦**（业务通过 `std::function` 回调注入，display 不知道 camera/network 的实现，帧数据走 `setFrame(data,len,w,h,fmt)` 契约，换渲染后端只需换适配层）、**节流防堆积**（采集线程随意推、GUI 用 33ms QTimer 拉最新帧，锁内只深拷贝、解码在锁外，天然丢弃中间帧、延迟稳定）、**低配适配**（MJPEG 用 libjpeg 缩放解码 `scale_denom` 与自定义错误处理器，YUYV 用 NEON 转换，相册缩略图只解码可见尺寸，OSD 用独立控件避免与高频视频帧耦合，AVI 播放手写解析器免 ffmpeg）。触摸走 linuxfb+evdev，Qt 内部 mmap `/dev/fb0` 但应用代码不碰它。如果让我重构，我会把解码移出 GUI 线程、抽象 `IDisplaySink` 渲染后端接口、把相机参数变更收敛成独立的 CameraController，让显示面更纯粹。"
+> "display 模块是系统的'人机界面'，我围绕三个原则设计：**解耦**（业务通过 `std::function` 回调注入，display 不知道 camera/network 的实现，帧数据走 `setFrameShared(FrameSlot*)` 共享契约，换渲染后端只需换适配层）、**节流防堆积 + 帧池零拷贝**（采集线程随意推、GUI 用 33ms QTimer 拉最新帧，锁内只拷贝、解码在锁外；解码结果写入帧池槽、GUI 用 QImage 浅引用上屏，消除显示链路 RGB 深拷贝，实测拷贝 10→0.5 MB/s）、**低配适配**（MJPEG 用 libjpeg 缩放解码 `scale_denom` 与自定义错误处理器，YUYV 用 NEON 转换，相册缩略图只解码可见尺寸，OSD 用独立控件避免与高频视频帧耦合，AVI 播放手写解析器免 ffmpeg）。触摸走 linuxfb+evdev，Qt 内部 mmap `/dev/fb0` 但应用代码不碰它。
+>
+> 我做了一个很有价值的量化分析：帧池把拷贝降了 95%，但帧率没变——**实测瓶颈是 JPEG 解码（~25ms/帧）而非拷贝**，而且单核上独立解码线程反而更卡（已回退）。所以正确的优化方向是'少计算 + 少拷贝'，下一步主线是低分辨率显示解码。如果让我重构，我会用低分辨率显示解码、抽象 `IDisplaySink` 渲染后端接口、把相机参数变更收敛成独立的 CameraController，让显示面更纯粹。"
 
 ---
 
@@ -723,10 +790,13 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 触摸怎么来 | gt9147 → evdev → linuxfb 插件 → QMouseEvent，应用不直接读 /dev/input |
 | 为什么不直接用信号连接 | 回调更轻量、可捕获局部变量、业务解耦；信号用于外部监听 |
 | 怎么防 UI 堆积 | QTimer 拉模式，33ms 取最新帧，锁内只拷贝、锁外解码 |
-| 两个定时器是什么 | displayTimer（main 拉帧拷贝）+ m_refreshTimer（GUI 解码渲染） |
-| 为什么 setFrame 要深拷贝 | g_state.frameData 在采集线程可能 realloc，浅存会悬垂 |
-| 为什么 QImage 要 .copy() | QImage 浅引用外部缓冲，setPixmap 生命周期更长 |
+| 两个定时器是什么 | displayTimer（main 借槽+解码入槽+publish+setFrameShared）+ m_refreshTimer（GUI 浅引用上屏） |
+| 为什么 setFrame 要深拷贝 | g_state.frameData 在采集线程可能 realloc，浅存会悬垂（旧路径） |
+| 帧池路径为什么不拷 | setFrameShared 持有槽引用 + QImage 浅引用，RGB24 零深拷贝（拷贝 10→0.5MB/s） |
+| 为什么 QImage 要 .copy() | QImage 浅引用外部缓冲，setPixmap 生命周期更长（仅旧 frameToQImage 路径） |
 | 怎么防 MJPEG 坏帧崩程序 | libjpeg 自定义 error_exit + longjmp，坏帧跳过不退出 |
+| 显示解码在哪个线程 | 单核上解码留在 GUI 主线程（displayTimer）；独立解码线程实测更卡已回退 |
+| 真正瓶颈是啥 | JPEG 解码（~25ms/帧）非拷贝；下一步低分辨率显示解码（320x240） |
 | 怎么加速缩略图 | libjpeg scale_denom=2/4/8，逆 DCT 直接跳高频，省内存省 CPU |
 | 滑块拖动为什么防抖 | 帧率变更要停流重启（几十 ms），不防抖会反复打断采集 |
 | OSD 用什么画 | 独立 QLabel/控件最省（脏矩形局部重绘），别每帧合成进视频 |
@@ -738,7 +808,8 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | AVI 播放为什么不用 ffmpeg | 自产格式简单 + 免体积负担；idx1 索引让 seek O(1) |
 | 开机自启 | systemd service：ConditionPathExists=/dev/video0 + Restart=on-failure |
 | 换 SDL/裸 FB 要改多少 | 业务侧几乎不动（回调是纯 C++），display 内部全重写 |
-| 最大性能短板 | MJPEG 解码在 GUI 线程（25ms 阻塞事件循环），应移出 |
+| 最大性能短板 | MJPEG 解码在 GUI 线程（25ms/帧，CPU 99% 卡 10fps）；单核上不能靠多线程，应走低分辨率显示解码 |
+| 帧池零拷贝是啥 | displayTimer 解码直写池槽 + setFrameShared 浅引用，显示链路拷贝 -95% |
 | 未用 PXP | 诚实点：NEON 已达标；PXP 适合 YUV→RGB/叠加/缩放，不加速 JPEG |
 
 ---
@@ -788,12 +859,13 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 项 | 大小 | 说明 |
 |----|------|------|
 | linuxfb backing store | 800x480x2 ≈ 0.8MB | RGB565 离屏缓冲 |
-| 视频帧 RGB24 缓冲 | 640x480x3 ≈ 0.92MB | `m_frameBuffer` + `g_state.frameData` + QImage 各有拷贝 |
+| 视频帧 RGB24 缓冲 | 640x480x3 ≈ 0.92MB | **帧池改造后**：2 个 RGB 池槽 ≈ 1.84MB 预分配（固定、无每帧 realloc）；显示链路不再有 `m_frameBuffer` assign + QImage.copy() 的临时拷贝 |
+| 原始帧共享 | g_state.frameData（JPEG ~0.1MB） | displayTimer 短锁拷贝的 raw 临时缓冲 |
 | 缩略图（可见 6 张） | 170x120x4x6 ≈ 0.5MB | ARGB32 |
 | 相册控件对象 | ~1-2MB | 200 张照片×3 控件 |
-| 总 display 占用 | ~5-6MB | 不含 Qt 库本体与系统缓冲 |
+| 总 display 占用 | ~5-6MB | 不含 Qt 库本体与系统缓冲；帧池预分配 +0.3MB |
 
-README 说"运行内存（推流）~8MB"——display 占了其中一半多。面试能背出这些数字，比空谈"内存优化"有说服力得多。
+README 说"运行内存（推流）~8MB"——display 占了其中一半多。帧池把"动态分配的 RGB 拷贝"变成"固定 2 槽的常驻内存"，**消除了每帧 realloc 抖动**，内存曲线更平稳。面试能背出这些数字，比空谈"内存优化"有说服力得多。
 
 ## 补充 4：花屏 / 撕裂排查完整思路（高频实战题）
 
@@ -891,7 +963,7 @@ gui.onFormatChanged([capture, device](PixelFormat fmt) {
 
 ## 1. 一句话回答
 
-**MJPEG 直出模式下，推流（HTTP/RTSP）和录像完全不需要解码（JPEG 字节流原样转发/写盘，零拷贝零处理）；但本地屏幕显示必须解码**——屏幕是像素设备，JPEG 是压缩流，`frameToQImage` 的 `FMT_MJPEG` 分支必然走 `decodeMjpegToRgb`（libjpeg-turbo，~25ms）。
+**MJPEG 直出模式下，推流（HTTP/RTSP）和录像完全不需要解码（JPEG 字节流原样转发/写盘，零拷贝零处理）；但本地屏幕显示必须解码**——屏幕是像素设备，JPEG 是压缩流，`displayTimer` 内 `VideoProcessor::decodeJPEGtoRGB` 必然做 JPEG→RGB（libjpeg-turbo，~25ms），结果直写帧池槽（旧路径 `frameToQImage` 的 `FMT_MJPEG` 分支仍有 `decodeMjpegToRgb`，仅作无 `m_heldSlot` 时兜底）。
 
 ## 2. 两条链路的代码证据
 
@@ -924,16 +996,19 @@ if (g_recording && localFmt == PixelFormat::FMT_MJPEG && g_storage) {
 
 **链路 B：采集 → GUI 显示（必须解码）**
 
-`gui.cpp` `frameToQImage` 的 `FMT_MJPEG` 分支：
+`main.cpp` `displayTimer` 内用 `VideoProcessor::decodeJPEGtoRGB`（帧池路径，解码结果直写池槽）：
 
 ```cpp
-case PixelFormat::FMT_MJPEG: {
-    std::vector<uint8_t> rgb;
-    if (decodeMjpegToRgb(data, len, rgb, dw, dh))   // libjpeg-turbo 解码 JPEG→RGB
-        return QImage(rgb.data(), dw, dh, dw * 3, QImage::Format_RGB888).copy();
-    ...
+// displayTimer timeout 内
+if (srcFmt == PixelFormat::FMT_MJPEG) {
+    if (!VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(), slot->data, dw, dh))
+        { g_rgbPool->release(slot); return; }   // 坏帧丢帧
+    slot->width = dw; slot->height = dh;
 }
+g_rgbPool->publish(slot);                       // 发布 → GUI setFrameShared 浅引用上屏
 ```
+
+（旧路径 `frameToQImage` 的 `FMT_MJPEG` 分支仍有 `decodeMjpegToRgb`，仅作为无 `m_heldSlot` 时的兜底。）
 
 ## 3. 两种模式的真实开销对比
 
@@ -954,7 +1029,7 @@ case PixelFormat::FMT_MJPEG: {
 **A**：AVI 容器里存的是 MJPEG 帧（`00dc` 压缩 chunk）。YUYV 是未压缩原始格式，要录像就得先编码成 JPEG，而 YUYV 模式下的 JPEG 编码结果只用于推流，录像代码干脆只在 `FMT_MJPEG` 时写盘（`main.cpp:876`）——既避免重复编码，也保证 AVI 格式统一。
 
 **Q3：既然显示解码 25ms 在 GUI 线程，MJPEG 模式为什么还能跑 30fps？**
-**A**：与 YUYV 模式相同的原因——640x480 的 MJPEG 帧通常小于 100KB，解码耗时往往低于 25ms 的理论值，33ms 定时器有富余；且坏帧被静默跳过。如果升 720p，解码会超过 33ms，必须先"解码移出 GUI 线程"（见 3.2 场景 A）。
+**A**：640x480 的 MJPEG 帧通常小于 100KB，解码耗时往往低于 25ms 的理论值，33ms 定时器有富余；且坏帧被静默跳过。**但实测在真实光照/复杂画面下 CPU 已 99% 打满、帧率卡 10fps**——说明解码确实是瓶颈。升 720p 解码会超 33ms，必须走"低分辨率显示解码"（scale_denom 只解显示尺寸），而非"解码移出 GUI 线程"（见 3.2 场景 A）。
 
 **Q4：如果让处理线程解码成 RGB 再推给 GUI，能省掉显示解码吗？**
-**A**：能省掉 GUI 线程的解码，但**总量不省**——解码还是要做一次，只是从 GUI 线程挪到处理线程（还多一次 RGB 数据的跨线程拷贝）。真正的收益是"GUI 线程不再被 25ms 阻塞"（事件循环不再卡顿、按钮响应恢复），这正是 3.2 里"解码移出 GUI 线程"重构的核心动机。注意推流路径要的是 JPEG，处理线程解码成 RGB 反而要再编码回去，所以正确做法是：**推流保持 JPEG 直通，另起一个解码线程只服务显示**。
+**A**：能省掉 GUI 线程的解码，但**总量不省**——解码还是要做一次，只是从 GUI 线程挪到处理线程（还多一次 RGB 数据的跨线程拷贝）。**且实测单核 i.MX6ULL 上独立解码线程反而更卡**（线程无法并行，多引入拷贝+切换开销，曾实现后回退）。真正的瓶颈是"解码计算"本身，不是"在哪个线程"。注意推流路径要的是 JPEG，处理线程解码成 RGB 反而要再编码回去。**正确方向是**：推流保持 JPEG 直通，显示路径用 `scale_denom` 低分辨率解码（25ms→~8ms），既降计算又不引入线程切换开销。
