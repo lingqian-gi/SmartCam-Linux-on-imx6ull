@@ -1699,3 +1699,247 @@ git pull origin main
   ```
 - **git / curl / apt 等**：保持 `LD_LIBRARY_PATH` 为空。
 
+---
+
+## 27. Cap FPS 恒为 ~10fps 且任何应用层优化无效 — 根因是摄像头硬件实际输出 10fps ✅ 已确认（非代码 bug）
+
+> 本文档为**完整的性能排查过程记录**，含全部命令、代码、现象与结论，便于复盘与知识沉淀。
+
+| 属性 | 值 |
+|------|-----|
+| **模块** | 显示链路（解码/渲染）+ V4L2 采集 + 摄像头硬件 |
+| **现象** | 状态栏 `Cap FPS` 恒为 ~10fps（目标 30fps），CPU 99~100% 打满，`raw interval` 稳定 100ms/帧 |
+| **严重程度** | ⚠️ 性能问题（功能正常，帧率达不到设计目标） |
+| **最终结论** | **摄像头/驱动实际以 10fps 输出**（`v4l2-ctl` 直测铁证），应用层优化无法突破硬件上限 |
+
+### 一、问题描述
+
+启动命令 `./smartcam --device /dev/video0 --fmt mjpeg` 后：
+- 状态栏 `Cap FPS`（采集帧率）恒为 **10fps**（远低于设计目标 30fps）；
+- `[PERF]` 日志 `cpu=99%` 打满单核；
+- 改变分辨率（720p→640x480→320x240）画面"更新速度"有变化，但 **Cap FPS 始终是 10**；
+- `Disp FPS`（显示帧率）在 320x240 时一度显示 14.8，反而**高于 Cap FPS**（统计口径 bug，见下）。
+
+排查触发原因：用户怀疑"改分辨率后画面变快但 FPS 不变"异常，进而质疑能否通过改代码提高 Cap FPS。
+
+### 二、排查环境
+
+| 项 | 值 |
+|----|-----|
+| 开发板 | 野火 i.MX6ULL Pro（Cortex-A7 单核 @792MHz，512MB DDR3） |
+| 屏幕 | 7 寸 800x480 电容触摸屏，linuxfb，`/dev/fb0`（**RGB565/16bit**）|
+| 摄像头 | USB UVC，支持 MJPEG/YUYV |
+| 系统 | Debian Buster，内核 `4.19.35-imx6` |
+| Qt | 板厂手动 Qt 套 5.11.3（linuxfb） |
+| 工具 | `v4l2-ctl`、`top -H`、`perf`、`gdb`、`strace` |
+| 代码基线 | 帧池零拷贝已实现（RGB 显示池），处理线程含"无人观看跳过推流"优化 |
+
+### 三、排查手段与过程（按时间线）
+
+#### 第 1 步：确认基本事实 — 摄像头能力
+
+用 `v4l2-ctl --list-formats-ext` 查摄像头**声称**支持的格式/帧率：
+
+```bash
+v4l2-ctl -d /dev/video0 --list-formats-ext
+```
+
+**结果**：
+```
+[0]: 'MJPG' (Motion-JPEG, compressed)
+     Size: Discrete 640x480
+         Interval: Discrete 0.033s (30.000 fps)   ← 声称支持 30fps
+     Size: Discrete 640x360
+         Interval: Discrete 0.033s (30.000 fps)
+[1]: 'YUYV' (YUYV 4:2:2)
+     Size: Discrete 640x480
+         Interval: Discrete 0.033s (30.000 fps)
+```
+**现象**：摄像头能力列表声称 MJPEG 640x480 支持 30fps。
+**判断**：初步排除"硬件能力不支持 30fps"（但注意：**能力列表 ≠ 实际输出**，这是后面踩坑的关键）。
+
+#### 第 2 步：插桩量化各应用层任务耗时
+
+怀疑"解码/渲染/推流"某处是 CPU 热点，加诊断插桩：
+- `[DECODE]`：测 displayTimer 内解码耗时
+- `[RENDER]`：测 refreshFrame/setPixmap 耗时
+- `[PERF]`：测 copy/pix/cpu/frames（已有）
+
+**结果**：
+```
+[DECODE] dec:avg=15.6ms max=19.4ms | cb:avg=15.8ms max=19.8ms (res=640x480)
+[RENDER] rf:avg= 9.0ms max=9.8 | setPix:avg= 8.9ms max=9.7
+[FPS Diag] avg=10.0 fps (100.3 ms/frame), raw interval: min=99.9 ms, max=104.0 ms, throttle=0 fps
+[PERF] cpu=99%
+```
+**现象**：
+- 解码仅 15.6ms、渲染仅 9ms、回调 15.8ms —— **所有应用层任务都很小**；
+- 但 CPU 99% 打满、`raw interval` 稳定 100ms（波动仅 ±2ms）；
+- `throttle=0` → 不是软件节流导致。
+**判断**：应用层"测得到"的任务加起来 ~25ms/帧（应能到 40fps），但 CPU 99% + 采集被饿死。**存在测不到的隐藏热点**。
+
+#### 第 3 步：`top -H` 看线程级 CPU — 定位主线程
+
+```bash
+top -H -b -d 1 -n 3 -p <PID>
+```
+**结果**：
+```
+PID 884  smartcam   R  94~99%   ← 主线程（Qt 主线程）烧 ~97%
+PID 885  QEvdevTou+ S  0.0%     ← 触摸线程 0
+PID 886~890  smartcam（各工作线程）S  0.0%  ← 采集/处理/RTSP/控制线程都是 0%
+```
+**现象**：**主线程（PID 884）烧 97%**，其它线程全 0%。采集线程 0% 却被饿死（raw interval 100ms）。
+**判断**：热点在 **Qt 主线程**（GUI 渲染），不是采集/处理/网络线程。
+
+#### 第 4 步：`gdb` 抓主线程 — 定位到 Qt GUI 层
+
+```bash
+sudo gdb -p <PID> -batch -ex "bt"
+```
+**结果**：
+```
+#0  0x7699097c in ?? () from /usr/lib/arm-linux-gnueabihf/libQt5Gui.so.5
+#1  0x6fa34418 in ?? ()
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+```
+**现象**：主线程卡在 `libQt5Gui.so`，栈显示"previous frame identical"（疑似死循环/自递归）。
+**判断**：主线程在 Qt GUI 渲染层有高 CPU 活动，但无符号名，需用 `perf` 定位具体函数。
+
+#### 第 5 步：`perf` 采样 — 找到 `QColorProfile::fromSRgb` 热点
+
+```bash
+sudo perf record -g -p <PID> -o /tmp/perf.data -- sleep 5
+sudo perf report -i /tmp/perf.data --stdio | head -60
+```
+**结果**：
+```
+56.71%  48.25%  smartcam  libQt5Gui.so.5.11.3  [.] QColorProfile::fromSRgb
+12.23%  11.51%  smartcam  smartcam             [.] ycc_rgb565D_convert   ← 后引入
+```
+**现象**：**`QColorProfile::fromSRgb` 占 48% CPU**（Qt 的颜色空间转换函数），且伴随大量 `__dabt_usr`/`do_page_fault`（页错误）。
+**判断**：Qt 在大量做像素颜色转换。**初步误判**：以为 framebuffer 是 RGB565、QImage 是 RGB888 导致每像素转换 → 方向定为"让 QImage 与 framebuffer 格式匹配"。
+
+#### 第 6 步（误判）：改 RGB565 全链路
+
+按误判方向，把显示链路改成 RGB565：
+- 新增 `decodeJPEGtoRGB565`（libjpeg `JCS_RGB565`）
+- displayTimer 解码输出 RGB565 到帧池槽
+- gui.cpp QImage 用 `Format_RGB16`
+
+**结果**：
+```
+[DECODE] dec:avg=25.6ms max=28.5ms   ← 解码变慢了（ycc_rgb565D_convert 慢）
+[RENDER] rf:avg=16.0ms | setPix:avg=15.7ms
+[PERF] cpu=100%  frames=10fps
+```
+**现象**：CPU 仍 100%、Cap FPS 仍 10；且解码从 15.6ms 涨到 25.6ms（`JCS_RGB565` 是负优化）。
+**判断**：RGB565 方向**错误**（解码变慢 + 帧率不变）。
+
+#### 第 7 步：确认 fb0 是 RGB565（为第 6 步的误判找依据，但无用）
+
+```bash
+sudo fbset | head -5
+```
+**结果**：`geometry 800 480 800 480 16` → 确认 **RGB565/16bit**。
+**判断**：framebuffer 确实是 RGB565，但改为 RGB565 无效 → 说明 `QColorProfile::fromSRgb` 不是"格式不匹配"触发。
+
+#### 第 8 步：关闭 `setScaledContents` 验证
+
+把 `m_videoDisplay->setScaledContents(true)` 改为 `false`，再跑 perf。
+**结果**：`QColorProfile::fromSRgb` 从 48% 降到 27%，但 CPU 仍 99-100%、Cap FPS 仍 10。
+**判断**：`setScaledContents` 是部分来源，但不是主因（帧率仍 10）。
+
+#### 第 9 步：完全去掉 `setPixmap`（渲染实验）
+
+注释掉 `m_videoDisplay->setPixmap(...)`，测纯"解码+采集"的 CPU。
+**结果**：
+```
+[RENDER] rf:avg= 0.03ms | setPix:avg=0.0016ms   ← 渲染几乎为 0
+[PERF] cpu=89%  frames=10fps                    ← CPU 只降到 89%，帧率仍 10
+```
+**现象**：完全不做渲染，CPU 还有 89%（因当时是 JCS_RGB565 解码慢到 28ms），但 **Cap FPS 还是 10**。
+**判断**：**帧率被"非 CPU"因素锁死**——即使 CPU 有富余，采集还是 10fps。
+
+#### 第 10 步：回退 RGB888 + 去掉渲染（分离解码与采集）
+
+解码回退 `decodeJPEGtoRGB`（RGB888，15.6ms），保留去掉 setPixmap。
+**结果**：
+```
+[DECODE] dec:avg=21.2ms
+[PERF] cpu=67%  frames=10fps
+```
+**现象**：**CPU 降到 67%**（渲染确实占 ~33%），但 **Cap FPS 还是 10**。
+**判断**：**铁证 —— CPU 只用了 67%（有 33% 空闲），但采集线程仍 10fps。瓶颈不是 CPU！** `getFrame` 每 100ms 才返回一帧，是**驱动/硬件供给**就是 10fps。
+
+#### 第 11 步（决定性）：`v4l2-ctl` 直测摄像头实际帧率
+
+完全绕过 SmartCam，直接用 `v4l2-ctl` 采集 30 帧：
+
+```bash
+time v4l2-ctl -d /dev/video0 \
+    --set-fmt-video=width=640,height=480,pixelformat=MJPG \
+    --stream-mmap --stream-count=30 --stream-to=/dev/null --stream-skip=5
+```
+**结果**：
+```
+<<<<<<<<<<< 10.00 fps
+<<<<<<<<<< 9.98 fps
+<<<<<<<<<< 9.99 fps
+（30 帧耗时约 4.5 秒）
+```
+**最终根因确认**：**摄像头硬件/驱动实际以 10fps 输出**，即使不经过 SmartCam 也如此。`--list-formats-ext` 声称支持 30fps 只是能力列表，实际运行就是 10fps。
+
+### 四、最终结论
+
+| 结论 | 说明 |
+|------|------|
+| **根因** | 摄像头硬件实际输出 **10fps**（v4l2-ctl 直测铁证）|
+| **Cap FPS 上限** | 物理上限 = 摄像头输出 10fps，**应用层无法突破** |
+| **CPU 99% 的原因** | 渲染（`QColorProfile::fromSRgb`）+ 解码在单核上占满，但**这只是占用，不是帧率瓶颈** |
+| **改代码能提升帧率吗** | **不能**（要 30fps 需换支持 30fps 输出的摄像头）|
+
+### 五、关键命令汇总
+
+```bash
+# 1. 查摄像头声称支持的能力（注意：能力列表 ≠ 实际输出）
+v4l2-ctl -d /dev/video0 --list-formats-ext
+
+# 2. 线程级 CPU（定位哪个线程烧 CPU）
+top -H -b -d 1 -n 3 -p <PID>
+
+# 3. 抓主线程调用栈（定位在哪个库/函数）
+sudo gdb -p <PID> -batch -ex "bt"
+
+# 4. perf 采样（精确定位 CPU 热点函数）
+sudo perf record -g -p <PID> -o /tmp/perf.data -- sleep 5
+sudo perf report -i /tmp/perf.data --stdio | head -60
+
+# 5. 查 framebuffer 格式
+sudo fbset | head -5
+
+# 6. 【决定性】v4l2-ctl 直测摄像头实际帧率（绕过应用，最终判定）
+time v4l2-ctl -d /dev/video0 \
+    --set-fmt-video=width=640,height=480,pixelformat=MJPG \
+    --stream-mmap --stream-count=30 --stream-to=/dev/null --stream-skip=5
+```
+
+### 六、经验教训（重要）
+
+| 教训 | 说明 |
+|------|------|
+| **能力列表 ≠ 实际输出** | `--list-formats-ext` 声称 30fps，但实际运行是 10fps。**判定硬件帧率必须用 `v4l2-ctl` 实际采集测试**，不能只看能力表 |
+| **CPU 99% 不代表帧率瓶颈** | 本次 CPU 降到 67% 帧率仍 10，证明**有 CPU 空闲仍提不上帧率 → 瓶颈在供给端（硬件）**。判断瓶颈要先问"CPU 有空闲时帧率提不上去吗" |
+| **先测硬件，再优化代码** | 应该在最早阶段就用 `v4l2-ctl` 直测帧率，能省掉大量后续的代码优化尝试 |
+| **`QColorProfile::fromSRgb` 是 linuxfb 固有热点** | Qt linuxfb 平台绘制 pixmap 时做颜色管理，占 ~48% CPU。可通过关闭 `setScaledContents` 部分缓解，但无法完全消除（与格式无关）|
+| **`JCS_RGB565` 解码更慢** | libjpeg 的 RGB565 输出路径 `ycc_rgb565D_convert` 比 RGB888 慢，**不是优化方向** |
+| **两个 FPS 统计口径不同** | `Cap FPS` 统计采集帧、`Disp FPS` 统计渲染动作次数（未做新帧去重），Disp 可能虚高于 Cap，不代表显示快于采集 |
+
+### 七、代码状态（最终）
+
+本次排查**恢复为干净版本**（commit `3d8e200`）：
+- 回退 RGB565 解码（保留 `decodeJPEGtoRGB` RGB888）；
+- 恢复 `setPixmap` 与 `setScaledContents(true)`；
+- 清理全部诊断插桩（`[DECODE]`/`[RENDER]`）；
+- **保留**"处理线程无人观看时跳过推流分发与深拷贝"优化（无副作用，减少无谓 CPU）。
+
