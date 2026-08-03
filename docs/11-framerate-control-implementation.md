@@ -554,6 +554,7 @@ gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
 - `CameraCapture::updateFPS()` 仍保留其动态测量机制（每 30 帧计算实际 FPS），用于状态栏 Cap FPS 显示和录像文件的 FPS 字段。
 - `Disp FPS` 在 `main.cpp` 显示定时器回调中独立计算（同样的滑动窗口算法，统计"成功渲染一帧"而非"定时器触发"），反映屏幕实际渲染速度。
 - Cap FPS 与 Disp FPS 的差值可直接判断渲染瓶颈 — 若 Cap 远高于 Disp，说明帧处理或 Qt 渲染跟不上（如分辨率高、解码慢时，Cap 仍高但 Disp 下降）。
+- **⚠️ Disp FPS 可能长期高于 Cap FPS（统计口径差异，需在面试/文档中正确解释）**：两者统计的不是同一个对象。Cap FPS 统计采集到的**不同帧**速率（`getFrame` 取到新帧才计数）；Disp FPS 统计 displayTimer **渲染动作**次数，**未做新帧去重**——只要 `g_state.frameData` 非空就渲染并计数，重复渲染同一帧也计入。当采集仅 ~10fps（受单核 CPU 瓶颈）而 displayTimer 按 33ms 周期触发时，一个采集帧间隔内 displayTimer 重复渲染约 3 次，Disp FPS 被"重复渲染计数"灌水，故长期稳定地高于 Cap FPS（如 640x480 时 Cap≈10.0 而 Disp≈14.8）。这**不代表显示真比采集快**，是统计口径导致。修复方向：采集侧加帧序号 `frameSeq`，displayTimer 仅在帧序号变化时渲染并计数，Disp FPS 便恒 ≤ Cap FPS。
 
 ---
 

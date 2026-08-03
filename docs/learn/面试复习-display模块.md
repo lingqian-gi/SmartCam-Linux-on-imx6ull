@@ -337,6 +337,7 @@ displayTimer->start();
 ### 潜在坑点
 
 - **`g_state.fps` 是采集线程的 FPS，不是显示 FPS**：两个数字不同步是常态，若面试官问"为什么 Disp FPS 比 Cap FPS 低"，要能回答"解码耗时吃掉显示预算"（分辨率高→解码慢→Disp 下降，但 Cap 由采集线程独立测量，仍可能保持较高）。
+- **⚠️ Disp FPS 可能高于 Cap FPS（统计口径差异，非 bug 也非"显示快于采集"）**：这两个 FPS 统计的不是同一个对象。Cap FPS 统计"采集到的**不同帧**的速率"（`getFrame` 取到新帧才计数，真实受 V4L2 输出 + 单核 CPU 限制）；Disp FPS 统计"displayTimer **渲染动作**的次数"，**未做新帧去重**——只要 `g_state.frameData` 非空就渲染并计入，重复渲染同一帧也算。当采集只有 ~10fps（100ms/帧）而 displayTimer 按 33ms 周期触发时，一个采集帧间隔内 displayTimer 会渲染约 3 次（其中 2 次是重复渲染同一帧），Disp FPS 被"重复渲染计数"灌水，长期稳定地虚高于 Cap FPS。**修复方向**：在 `g_state` 加 `frameSeq` 帧序号，displayTimer 只在帧序号变化时渲染并计数，则 Disp FPS 恒 ≤ Cap FPS。
 - **双定时器相位不同步**：`displayTimer` 拷贝的帧与 `m_refreshTimer` 渲染的帧可能相差 0~33ms，画面延迟略大但稳定。若要降低延迟，可合并为单定时器。
 - **帧率滑块范围受限**：`setFramerateRange` 钳制到 1~120fps，且 `displayTimer->setInterval` 用 `std::max(10, 1000/fps)` 保底 10ms——显示定时器最快 100fps，避免 setInterval(0) 导致忙等。
 
