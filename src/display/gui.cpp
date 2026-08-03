@@ -16,7 +16,6 @@ extern FramePool* g_rgbPool;
 #include <cmath>
 #include <cstring>
 #include <algorithm>
-#include <chrono>
 
 // ============================================================
 // libjpeg-turbo 解码（自定义错误处理器，静默坏帧）
@@ -149,9 +148,7 @@ void CameraGUI::buildUI() {
     );
     m_videoDisplay->setText(QStringLiteral("Waiting camera..."));
     m_videoDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    // [验证] setScaledContents(true) 会每帧实时缩放 + 触发 Qt 颜色管理(QColorProfile::fromSRgb)，
-    //       临时改为 false 验证是否是 CPU 热点元凶
-    m_videoDisplay->setScaledContents(false);
+    m_videoDisplay->setScaledContents(true);
     liveLayout->addWidget(m_videoDisplay);
 
     m_mainStack->addWidget(m_liveViewContainer);  // index 0
@@ -280,8 +277,6 @@ void CameraGUI::connectSignals() {
 // ============================================================
 
 void CameraGUI::refreshFrame() {
-    // [插桩] 测量 refreshFrame 总耗时与 setPixmap 上屏耗时（定位渲染瓶颈）
-    auto rfStart = std::chrono::steady_clock::now();
     if (m_mockMode) {
         // ---- 模拟模式：生成移动彩条 ----
         if (m_mockBuffer.empty()) return;
@@ -321,14 +316,8 @@ void CameraGUI::refreshFrame() {
                             m_currentFrame.height,
                             m_currentFrame.format);
     }
-    // [插桩] 上屏耗时：QPixmap::fromImage(拷贝) + setPixmap + paintEvent(linuxfb blit)
-    double setPixMs = 0.0;
     if (!img.isNull()) {
-        // [验证] 临时跳过 setPixmap，测 CPU 是否骤降（定位 QPixmap::fromImage 是否触发颜色管理）
-        auto tSetPixStart = std::chrono::steady_clock::now();
-        // m_videoDisplay->setPixmap(QPixmap::fromImage(img));   // ← 临时注释掉
-        setPixMs = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - tSetPixStart).count();
+        m_videoDisplay->setPixmap(QPixmap::fromImage(img));
     }
 
     // 在模拟模式下，叠加文本信息
@@ -351,27 +340,6 @@ void CameraGUI::refreshFrame() {
             p.end();
             m_videoDisplay->setPixmap(pix);
         }
-    }
-
-    // [插桩] 每 100 帧打印 refreshFrame 总耗时与 setPixmap 上屏耗时
-    // 局部静态变量（GUI 单线程安全），确认渲染是否 CPU 瓶颈
-    static int         rfCount = 0;
-    static double      rfAccum = 0.0, rfMax = 0.0;
-    static double      pxAccum = 0.0, pxMax = 0.0;
-    double rfMs = std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - rfStart).count();
-    rfAccum += rfMs;
-    if (rfMs > rfMax) rfMax = rfMs;
-    pxAccum += setPixMs;
-    if (setPixMs > pxMax) pxMax = setPixMs;
-    rfCount++;
-    if (rfCount >= 100) {
-        qDebug() << "[RENDER] n=" << rfCount
-                 << "rf:avg=" << (rfAccum / rfCount) << "ms max=" << rfMax
-                 << " | setPix:avg=" << (pxAccum / rfCount) << "ms max=" << pxMax;
-        rfAccum = 0.0; rfMax = 0.0;
-        pxAccum = 0.0; pxMax = 0.0;
-        rfCount = 0;
     }
 }
 

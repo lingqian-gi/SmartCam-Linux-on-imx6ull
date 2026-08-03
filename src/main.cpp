@@ -1068,14 +1068,8 @@ int main(int argc, char* argv[]) {
         auto dispFpsLastTime = std::chrono::steady_clock::now();
         int  dispFpsCount    = 0;
         double dispFps       = 0.0;
-        // ---- 临时插桩：显示解码耗时 + 整个回调耗时（定位 CPU 瓶颈）----
-        double decAccum = 0.0, decMax = 0.0, cbAccum = 0.0, cbMax = 0.0;
-        int    decSample = 0;
         QObject::connect(displayTimer, &QTimer::timeout,
-            [&gui, mjpegServer, &dispFpsLastTime, &dispFpsCount, &dispFps,
-             &decAccum, &decMax, &cbAccum, &cbMax, &decSample]() {
-            // [插桩] 整个 displayTimer 回调计时
-            auto tCbStart = std::chrono::steady_clock::now();
+            [&gui, mjpegServer, &dispFpsLastTime, &dispFpsCount, &dispFps]() {
             // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
             FrameSlot* slot = g_rgbPool->acquire();
             if (!slot) return;
@@ -1096,13 +1090,10 @@ int main(int argc, char* argv[]) {
                 srcFmt = g_state.format;
             }
 
-            // 3. 解码/转换为 RGB888，直接写入池槽（消除 setFrame 的二次拷贝）
-            //    [验证] 回退 RGB888 快速解码，分离"解码+采集"与"渲染"的 CPU 占比
+            // 3. 解码/转换为 RGB24，直接写入池槽（消除 setFrame 的二次拷贝）
             slot->width  = srcW;
             slot->height = srcH;
             slot->format = PixelFormat::FMT_RGB24;
-            // [插桩] 测量解码/转换耗时
-            auto tDecStart = std::chrono::steady_clock::now();
             if (srcFmt == PixelFormat::FMT_MJPEG) {
 #ifdef HAS_LIBJPEG
                 int dw = 0, dh = 0;
@@ -1121,11 +1112,6 @@ int main(int argc, char* argv[]) {
             } else {   // FMT_RGB24：直拷
                 slot->data = std::move(raw);
             }
-            double decMs = std::chrono::duration<double, std::milli>(
-                               std::chrono::steady_clock::now() - tDecStart).count();
-            decAccum += decMs;
-            if (decMs > decMax) decMax = decMs;
-            decSample++;
 
             // [PERF] ③④ 已消除：解码直接写池槽（零拷贝），不再有 setFrame assign / QImage.copy()
             // [PERF] 本函数 raw = g_state.frameData 是一次原始帧拷贝（JPEG ~0.1MB），计入
@@ -1155,20 +1141,6 @@ int main(int argc, char* argv[]) {
             gui.setFPS(g_state.fps);             // 采集线程取帧速率
             gui.setDisplayFPS(dispFps);          // 实际显示速率
             gui.setClientCount(mjpegServer->clientCount());
-
-            // [插桩] 每 100 帧打印一次：解码耗时 vs 整个 displayTimer 回调耗时
-            double cbMs = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - tCbStart).count();
-            cbAccum += cbMs;
-            if (cbMs > cbMax) cbMax = cbMs;
-            if (decSample >= 100) {
-                LOG_INF("[DECODE] n=%d dec:avg=%.1fms max=%.1fms | cb:avg=%.1fms max=%.1fms (res=%dx%d)",
-                        decSample, decAccum / decSample, decMax,
-                        cbAccum / decSample, cbMax, srcW, srcH);
-                decAccum = 0.0; decMax = 0.0;
-                cbAccum = 0.0; cbMax = 0.0;
-                decSample = 0;
-            }
         });
         displayTimer->start();
 
