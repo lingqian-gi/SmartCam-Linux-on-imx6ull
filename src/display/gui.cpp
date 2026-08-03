@@ -325,8 +325,9 @@ void CameraGUI::refreshFrame() {
     // [插桩] 上屏耗时：QPixmap::fromImage(拷贝) + setPixmap + paintEvent(linuxfb blit)
     double setPixMs = 0.0;
     if (!img.isNull()) {
+        // [验证] 临时跳过 setPixmap，测 CPU 是否骤降（定位 QPixmap::fromImage 是否触发颜色管理）
         auto tSetPixStart = std::chrono::steady_clock::now();
-        m_videoDisplay->setPixmap(QPixmap::fromImage(img));
+        // m_videoDisplay->setPixmap(QPixmap::fromImage(img));   // ← 临时注释掉
         setPixMs = std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - tSetPixStart).count();
     }
