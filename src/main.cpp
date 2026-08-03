@@ -34,6 +34,10 @@
 #include <vector>
 #include <cstring>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <net/if.h>   // IFF_LOOPBACK
 
 #include "include/display/gui.h"
 #include "include/camera/capture.h"
@@ -161,6 +165,39 @@ static long readSelfRssKB() {
     }
     fclose(fp);
     return rss;
+}
+
+// ============================================================
+// 获取本机 IPv4 地址（用于在启动信息里展示浏览器/VLC 访问地址）
+// ============================================================
+// 遍历所有网卡，返回第一个"非 loopback、非 0.0.0.0"的 IPv4 地址。
+// 若获取失败返回 "127.0.0.1"（此时提示用户自行查看 ip addr 配置）。
+static std::string getLocalIPv4() {
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) < 0) {
+        LOG_WRN("getifaddrs failed: %s", strerror(errno));
+        return "127.0.0.1";
+    }
+
+    std::string result = "127.0.0.1";
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+            continue;                                   // 只看 IPv4
+        if ((ifa->ifa_flags & IFF_LOOPBACK))
+            continue;                                   // 跳过回环
+        const auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        char ip[INET_ADDRSTRLEN] = {0};
+        if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+            continue;
+        // 跳过 0.0.0.0（地址未分配）
+        if (strcmp(ip, "0.0.0.0") == 0)
+            continue;
+        result = ip;
+        break;                                          // 取第一个有效地址
+    }
+
+    freeifaddrs(ifaddr);
+    return result;
 }
 
 
@@ -1261,8 +1298,11 @@ int main(int argc, char* argv[]) {
         qInfo() << "控制端口:" << ctrlPort;
         qInfo() << "存储:" << QString::fromStdString(photoDir) << " / " << QString::fromStdString(videoDir);
         qInfo() << "流媒体:" << (mjpegServerOk ? "✅ 已启动" : "❌ 启动失败");
-        qInfo() << "浏览器打开: http://<dev-ip>:" << httpPort << "/";
-        qInfo() << "VLC 播放:   rtsp://<dev-ip>:" << rtspPort << "/stream";
+
+        // 查询本机 IP 并展示访问地址（浏览器 / VLC）
+        const std::string devIp = getLocalIPv4();
+        qInfo() << "浏览器打开: http://" << QString::fromStdString(devIp) << ":" << httpPort << "/";
+        qInfo() << "VLC 播放:   rtsp://" << QString::fromStdString(devIp) << ":" << rtspPort << "/stream";
         qInfo() << "==============================================";
 
     } else {
