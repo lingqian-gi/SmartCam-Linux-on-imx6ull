@@ -1096,17 +1096,18 @@ int main(int argc, char* argv[]) {
                 srcFmt = g_state.format;
             }
 
-            // 3. 解码/转换为 RGB24，直接写入池槽（消除 setFrame 的二次拷贝）
+            // 3. 解码/转换为 RGB565，直接写入池槽（消除 setFrame 的二次拷贝）
+            //    使用 RGB565 以匹配 16bit linuxfb framebuffer，Qt 绘制零颜色转换
             slot->width  = srcW;
             slot->height = srcH;
-            slot->format = PixelFormat::FMT_RGB24;
+            slot->format = PixelFormat::FMT_RGB565;
             // [插桩] 测量解码/转换耗时
             auto tDecStart = std::chrono::steady_clock::now();
             if (srcFmt == PixelFormat::FMT_MJPEG) {
 #ifdef HAS_LIBJPEG
                 int dw = 0, dh = 0;
-                if (VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(),
-                                                    slot->data, dw, dh)) {
+                if (VideoProcessor::decodeJPEGtoRGB565(raw.data(), raw.size(),
+                                                       slot->data, dw, dh)) {
                     slot->width  = dw;
                     slot->height = dh;
                 } else {
@@ -1115,9 +1116,9 @@ int main(int argc, char* argv[]) {
                 }
 #endif
             } else if (srcFmt == PixelFormat::FMT_YUYV) {
-                slot->data.resize(static_cast<size_t>(srcW) * srcH * 3);
-                VideoProcessor::yuyvToRgb24(raw.data(), slot->data.data(), srcW, srcH);
-            } else {   // FMT_RGB24：直拷
+                slot->data.resize(static_cast<size_t>(srcW) * srcH * 2);
+                VideoProcessor::yuyvToRgb565(raw.data(), slot->data.data(), srcW, srcH);
+            } else {   // FMT_RGB565：直拷
                 slot->data = std::move(raw);
             }
             double decMs = std::chrono::duration<double, std::milli>(
@@ -1130,9 +1131,9 @@ int main(int argc, char* argv[]) {
             // [PERF] 本函数 raw = g_state.frameData 是一次原始帧拷贝（JPEG ~0.1MB），计入
             g_perf.copyBytes += raw.size();
             // [PERF] ⑤ 上屏拷贝：QImage 浅引用构造（不拷贝）→ setPixmap 时 QPixmap::fromImage
-            //          做一次 RGB24 拷贝（上屏必需），计入 pixBytes
+            //          做一次 RGB565 拷贝（上屏必需），计入 pixBytes
             g_perf.pixBytes += static_cast<uint64_t>(slot->width) *
-                               slot->height * 3;
+                               slot->height * 2;
 
             // 4. 发布并交 GUI 共享（setFrameShared 内部持有引用，零拷贝上屏）
             slot->seq++;

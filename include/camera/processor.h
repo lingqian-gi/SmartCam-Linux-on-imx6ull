@@ -148,6 +148,23 @@ public:
     static bool decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
                                 std::vector<uint8_t>& rgb, int& out_w, int& out_h);
 
+    /**
+     * @brief 将 JPEG/MJPEG 单帧解码为 RGB565（16-bit，适配 linuxfb）
+     *
+     * 用于帧池显示路径：直接以 RGB565 输出，与 16bit framebuffer 匹配，
+     * 避免 Qt 绘制时 RGB888→RGB565 的像素级颜色转换（QColorProfile::fromSRgb 热点）。
+     * 坏帧时静默返回 false。
+     *
+     * @param jpeg_data  JPEG 数据
+     * @param jpeg_len   数据长度
+     * @param rgb565     输出：RGB565 像素 (w*h*2 字节，自动分配)
+     * @param out_w      输出：图像宽度
+     * @param out_h      输出：图像高度
+     * @return true 解码成功；false 解码失败（坏帧/未编译 HAS_LIBJPEG）
+     */
+    static bool decodeJPEGtoRGB565(const uint8_t* jpeg_data, size_t jpeg_len,
+                                   std::vector<uint8_t>& rgb565, int& out_w, int& out_h);
+
     // ============================================================
     // 工具方法
     // ============================================================

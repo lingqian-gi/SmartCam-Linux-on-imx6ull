@@ -309,9 +309,10 @@ void CameraGUI::refreshFrame() {
     if (m_heldSlot) {
         // ---- 零拷贝路径：QImage 浅引用共享槽（不 .copy()）----
         // m_heldSlot 保证数据生命周期有效；QImage 是临时对象，作用域结束即毁
+        // 槽内为 RGB565，用 Format_RGB16 与 16bit linuxfb 匹配，Qt 绘制零颜色转换
         const int w = m_currentFrame.width;
         const int h = m_currentFrame.height;
-        img = QImage(m_currentFrame.data, w, h, w * 3, QImage::Format_RGB888);
+        img = QImage(m_currentFrame.data, w, h, w * 2, QImage::Format_RGB16);
     } else {
         img = frameToQImage(m_currentFrame.data,
                             m_currentFrame.length,
@@ -535,7 +536,7 @@ void CameraGUI::setFrameShared(FrameSlot* slot) {
     m_currentFrame.length = static_cast<int>(slot->data.size());
     m_currentFrame.width  = slot->width;
     m_currentFrame.height = slot->height;
-    m_currentFrame.format = PixelFormat::FMT_RGB24;   // 显示槽固定 RGB24
+    m_currentFrame.format = PixelFormat::FMT_RGB565;   // 显示槽固定 RGB565（匹配 16bit linuxfb）
     m_currentFrame.index++;
 
     m_mockMode = false;

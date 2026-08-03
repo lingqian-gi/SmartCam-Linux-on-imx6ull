@@ -294,3 +294,49 @@ bool VideoProcessor::decodeJPEGtoRGB(const uint8_t* jpeg_data, size_t jpeg_len,
     return false;
 #endif
 }
+
+bool VideoProcessor::decodeJPEGtoRGB565(const uint8_t* jpeg_data, size_t jpeg_len,
+                                        std::vector<uint8_t>& rgb565, int& out_w, int& out_h) {
+#ifdef HAS_LIBJPEG
+    struct jpeg_decompress_struct cinfo;
+    JpegErrorMgr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit     = jpegSilentErrorExit;      // 替换默认 exit()
+    jerr.pub.output_message = jpegSilentOutputMessage;  // 静默 stderr 警告
+
+    // 解码错误时 longjmp 回到这里（先 destroy，避免泄漏，再返回失败）
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
+    jpeg_read_header(&cinfo, TRUE);
+    // 关键：以 RGB565 输出（与 16bit linuxfb framebuffer 匹配，Qt 绘制零颜色转换）
+    cinfo.out_color_space = JCS_RGB565;
+    jpeg_start_decompress(&cinfo);
+
+    out_w = static_cast<int>(cinfo.output_width);
+    out_h = static_cast<int>(cinfo.output_height);
+    rgb565.resize(static_cast<size_t>(out_w) * out_h * 2);
+
+    // 逐行解码到 RGB565（每像素 2 字节）
+    while (cinfo.output_scanline < static_cast<JDIMENSION>(out_h)) {
+        JSAMPROW row = rgb565.data() + cinfo.output_scanline * out_w * 2;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+#else
+    (void)jpeg_data;
+    (void)jpeg_len;
+    (void)rgb565;
+    (void)out_w;
+    (void)out_h;
+    return false;
+#endif
+}
