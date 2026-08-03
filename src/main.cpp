@@ -1068,12 +1068,14 @@ int main(int argc, char* argv[]) {
         auto dispFpsLastTime = std::chrono::steady_clock::now();
         int  dispFpsCount    = 0;
         double dispFps       = 0.0;
-        // ---- 临时插桩：显示解码耗时统计（确认解码是否是 CPU 瓶颈）----
+        // ---- 临时插桩：显示解码耗时 + 整个回调耗时（定位 CPU 瓶颈）----
         double decAccum = 0.0, decMax = 0.0, cbAccum = 0.0, cbMax = 0.0;
         int    decSample = 0;
         QObject::connect(displayTimer, &QTimer::timeout,
             [&gui, mjpegServer, &dispFpsLastTime, &dispFpsCount, &dispFps,
              &decAccum, &decMax, &cbAccum, &cbMax, &decSample]() {
+            // [插桩] 整个 displayTimer 回调计时
+            auto tCbStart = std::chrono::steady_clock::now();
             // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
             FrameSlot* slot = g_rgbPool->acquire();
             if (!slot) return;
@@ -1153,11 +1155,18 @@ int main(int argc, char* argv[]) {
             gui.setDisplayFPS(dispFps);          // 实际显示速率
             gui.setClientCount(mjpegServer->clientCount());
 
-            // [插桩] 每 100 帧打印一次显示解码耗时统计（确认解码是否 CPU 瓶颈）
+            // [插桩] 每 100 帧打印一次：解码耗时 vs 整个 displayTimer 回调耗时
+            double cbMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - tCbStart).count();
+            cbAccum += cbMs;
+            if (cbMs > cbMax) cbMax = cbMs;
             if (decSample >= 100) {
-                LOG_INF("[DECODE] n=%d avg=%.1fms max=%.1fms (res=%dx%d)",
-                        decSample, decAccum / decSample, decMax, srcW, srcH);
-                decAccum = 0.0; decMax = 0.0; decSample = 0;
+                LOG_INF("[DECODE] n=%d dec:avg=%.1fms max=%.1fms | cb:avg=%.1fms max=%.1fms (res=%dx%d)",
+                        decSample, decAccum / decSample, decMax,
+                        cbAccum / decSample, cbMax, srcW, srcH);
+                decAccum = 0.0; decMax = 0.0;
+                cbAccum = 0.0; cbMax = 0.0;
+                decSample = 0;
             }
         });
         displayTimer->start();
