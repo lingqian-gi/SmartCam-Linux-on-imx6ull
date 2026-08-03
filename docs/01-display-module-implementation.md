@@ -107,8 +107,9 @@ public:
 
     // ---- 数据输入 ----
     void setFrame(const uint8_t* data, int len, int w, int h, PixelFormat fmt);
-    void setFPS(double fps);              // 硬件帧率 (HW_FPS)
-    void setDisplayFPS(double fps);        // 软件/显示帧率 (SW_FPS)
+    void setFPS(double fps);              // 采集线程取帧速率 (Cap FPS)
+    void setDisplayFPS(double fps);        // 实际显示速率 (Disp FPS)
+    void setCurrentFormat(PixelFormat fmt); // 同步采集格式到 Format 下拉框
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -273,3 +274,4 @@ offscreen 模式 (PC):   ✅ 正常启动, Mock 模式输出正确
 | 2026-05-23 | **MJPEG 解码支持**：`frameToQImage()` 新增 `FMT_MJPEG` 分支，使用 libjpeg-turbo 自定义错误处理器静默坏帧警告。`setFrame()` 改为深拷贝（`m_frameBuffer.assign`），修复采集线程与 GUI 线程间的悬垂指针数据竞争。新增 `onCaptureRequest`/`onRecordToggle` 等回调注入接口。 |
 | 2026-05-24 | **systemd 服务完善**：`smartcam.service` 改为 `Type=simple`，新增 `ConditionPathExists=/dev/video0`、`Environment` 环境变量、`ProtectSystem=full` 加固等。`ExecStop` 不再使用不存在的 `smartcam stop` 子命令。 |
 | 2026-05-31 | **双 FPS 显示**：状态栏新增软件帧率(SW_FPS)标签，与硬件帧率(HW_FPS)并排显示。`HW_FPS` 来自 V4L2 实时测量，`SW_FPS` 来自显示定时器平均刷新率。差异可直观判断渲染瓶颈。 |
+| 2026-08-03 | **双 FPS 更名 + 格式同步**：状态栏 FPS 更名并排显示 `Cap FPS`（采集线程取帧速率，来自 V4L2 实时测量）与 `Disp FPS`（实际显示速率，来自 displayTimer 每 30 次成功渲染平均）。新增 `setCurrentFormat()` 把实际生效的采集格式同步到设置面板 Format 下拉框，修复"命令行 `--fmt mjpeg` 与 GUI 显示 YUYV 不一致"的问题。 |

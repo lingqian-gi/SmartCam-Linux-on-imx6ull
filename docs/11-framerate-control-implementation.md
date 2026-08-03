@@ -545,15 +545,15 @@ gui.onFramerateChanged([capture, rtspServer, &displayTimer](int fps) {
 
 | 层级 | 说明 |
 |------|------|
-| **采集帧率** (V4L2) | 动态测量 `updateFPS()` 每 30 帧计算一次 → 显示为 **HW_FPS** |
-| **显示帧率** (GUI) | 显示定时器实际刷新率，每 30 次刷新计算一次 → 显示为 **SW_FPS** |
+| **采集帧率** (V4L2) | 动态测量 `updateFPS()` 每 30 帧计算一次 → 显示为 **Cap FPS** |
+| **显示帧率** (GUI) | displayTimer 实际成功渲染速率，每 30 次刷新计算一次 → 显示为 **Disp FPS** |
 | **GUI 刷新间隔** (displayTimer) | 帧率变更 → `setInterval(1000/fps)` |
 | **RTSP SDP/RTP** | 初始化读实际帧率 + 帧率变更同步 `setStreamInfo()` |
 
 **注意事项**:
-- `CameraCapture::updateFPS()` 仍保留其动态测量机制（每 30 帧计算实际 FPS），用于状态栏 HW_FPS 显示和录像文件的 FPS 字段。
-- `SW_FPS` 在 `main.cpp` 显示定时器回调中独立计算（同样的滑动窗口算法），反映屏幕实际渲染速度。
-- HW_FPS 与 SW_FPS 的差值可直接判断渲染瓶颈 — 若 HW 远高于 SW，说明帧处理或 Qt 渲染跟不上。
+- `CameraCapture::updateFPS()` 仍保留其动态测量机制（每 30 帧计算实际 FPS），用于状态栏 Cap FPS 显示和录像文件的 FPS 字段。
+- `Disp FPS` 在 `main.cpp` 显示定时器回调中独立计算（同样的滑动窗口算法，统计"成功渲染一帧"而非"定时器触发"），反映屏幕实际渲染速度。
+- Cap FPS 与 Disp FPS 的差值可直接判断渲染瓶颈 — 若 Cap 远高于 Disp，说明帧处理或 Qt 渲染跟不上（如分辨率高、解码慢时，Cap 仍高但 Disp 下降）。
 
 ---
 

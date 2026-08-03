@@ -53,7 +53,7 @@ src/display/ 显示与交互模块
 │   │            onFramerateChanged
 │   ├── 设置弹窗：亮度/对比度/白平衡/曝光/帧率滑块 + Reset Defaults
 │   ├── 页面导航：QStackedWidget [0]实时预览 / [1]相册
-│   ├── 状态栏：HW_FPS / SW_FPS / LIVE|IDLE / Clients / REC
+│   ├── 状态栏：Cap FPS / Disp FPS / LIVE|IDLE / Clients / REC
 │   └── Mock 模式：enterMockMode() 8 色彩条 + 滚动
 │
 ├── PhotoGallery（相册）                 gallery.h / gallery.cpp (~1015 行)
@@ -304,7 +304,18 @@ QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
     g_rgbPool->publish(slot);
     if (FrameSlot* ds = g_rgbPool->share())
         gui.setFrameShared(ds);                     // GUI 接管引用
-    gui.setFPS(g_state.fps); gui.setClientCount(mjpegServer->clientCount());
+
+    // 统计实际显示 FPS（每 30 次成功渲染一帧算平均）
+    dispFpsCount++;
+    if (dispFpsCount % 30 == 0) {
+        auto now = steady_clock::now();
+        double elapsed = duration<double>(now - dispFpsLastTime).count();
+        if (elapsed > 0.0) dispFps = 30.0 / elapsed;
+        dispFpsLastTime = now;
+    }
+    gui.setFPS(g_state.fps);        // Cap FPS（采集线程取帧速率）
+    gui.setDisplayFPS(dispFps);     // Disp FPS（实际显示速率）
+    gui.setClientCount(mjpegServer->clientCount());
 });
 displayTimer->start();
 ```
@@ -316,13 +327,16 @@ displayTimer->start();
 - 显示帧率稳定在定时器周期，不受采集波动影响（推模式下显示节拍跟随采集、有抖动）；
 - 没有跨线程事件投递，无元对象序列化与事件循环调度开销、无事件队列延迟漂移。
 
-**双 FPS 设计**：`setFPS` 显示采集侧（硬件/采集线程算的）FPS，`setDisplayFPS` 显示显示侧（GUI 每 30 次刷新自己统计的）FPS。两个数对比能直接暴露"采集 30、显示 15"的瓶颈——这是排查显示性能的关键仪表。
+**双 FPS 设计（Cap FPS / Disp FPS）**：
+- `setFPS` 显示 **Cap FPS**（采集线程取帧速率，来自 V4L2 `updateFPS()` 每 30 帧测量）；
+- `setDisplayFPS` 显示 **Disp FPS**（实际显示速率，displayTimer 内统计"成功渲染一帧"每 30 次平均）。
+- 两个数对比能直接暴露"采集 30、显示 15"的瓶颈——**Cap FPS 高但 Disp FPS 低，说明解码/渲染跟不上**（如 720p 解码慢）。这是排查显示性能的关键仪表。
 
 **帧率联动**：用户拖帧率滑块，回调里 `displayTimer->setInterval(1000/fps)` 同步更新显示节奏，让 UI 跟随配置。
 
 ### 潜在坑点
 
-- **`g_state.fps` 是采集线程的 FPS，不是显示 FPS**：两个数字不同步是常态，若面试官问"为什么 SW_FPS 比 HW_FPS 低"，要能回答"解码耗时吃掉显示预算"。
+- **`g_state.fps` 是采集线程的 FPS，不是显示 FPS**：两个数字不同步是常态，若面试官问"为什么 Disp FPS 比 Cap FPS 低"，要能回答"解码耗时吃掉显示预算"（分辨率高→解码慢→Disp 下降，但 Cap 由采集线程独立测量，仍可能保持较高）。
 - **双定时器相位不同步**：`displayTimer` 拷贝的帧与 `m_refreshTimer` 渲染的帧可能相差 0~33ms，画面延迟略大但稳定。若要降低延迟，可合并为单定时器。
 - **帧率滑块范围受限**：`setFramerateRange` 钳制到 1~120fps，且 `displayTimer->setInterval` 用 `std::max(10, 1000/fps)` 保底 10ms——显示定时器最快 100fps，避免 setInterval(0) 导致忙等。
 
@@ -334,8 +348,8 @@ displayTimer->start();
 **Q2：锁 `g_state.mtx` 期间如果 displayTimer 内部做解码（25ms），采集线程会卡住吗？**
 **A**：不会卡 25ms。帧池路径下，`displayTimer` 拿锁只做**短锁拷贝**——`raw = g_state.frameData`（原始帧，JPEG ~0.1MB），**解码（`decodeJPEGtoRGB`）发生在锁外**，直接写入池槽。也就是说**锁内只拷贝、锁外解码**，锁持有时间就是一次原始帧 memcpy（~1ms 级），采集线程最多等 1ms。这个"锁内轻活、锁外重活"的划分是本题的得分点（和 camera 篇"拷贝 #2 快速释放锁"同一哲学）。
 
-**Q3：SW_FPS 统计是怎么算的？有什么缺点？**
-**A**：`main.cpp:909` 每 30 次 timeout 用 `dispFrameCount / elapsed` 算平均。缺点：① 只统计"定时器触发次数"，不统计"实际绘制完成"——如果解码慢导致某次渲染被跳过，SW_FPS 仍可能偏高；② 30 帧窗口在低帧率下更新慢。更准确的做法是在 `paintEvent` 里统计或记录每帧实际渲染时间。
+**Q3：Disp FPS 统计是怎么算的？有什么缺点？**
+**A**：`main.cpp` displayTimer 回调内，每 30 次"**成功渲染一帧**"（走到 `setFrameShared` 之后）用 `30 / elapsed` 算平均。优点：统计的是实际渲染的帧，而非定时器触发次数——解码慢导致丢帧时（`acquire` 失败提前 return 的路径不计入），Disp FPS 会如实下降。缺点：30 帧窗口在低帧率下更新慢（10fps 下约 3s 才更新一次）。更细的做法可改用滑动指数平均（EMA），响应更快。
 
 ## 2.3 块三：回调注入（松耦合的关键）
 
