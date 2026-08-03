@@ -252,7 +252,7 @@ case PixelFormat::FMT_MJPEG: {
 
 - **双悬垂风险（旧路径）**：旧 `setFrame` 必须深拷贝（`g_state.frameData` 会被采集线程 realloc）；旧 `QImage` 构造后必须 `.copy()`。**帧池路径消除了这两处**——数据生命周期由 `m_heldSlot` 引用计数保证。
 - **`m_heldSlot` 泄漏风险**：若 `setFrameShared` 换帧时忘了 release 旧槽、或析构时没释放 `m_heldSlot`，槽永不归还 → 池满持续丢帧。`CameraGUI::~CameraGUI` 里判空释放 `m_heldSlot` 正是防泄漏（`gui.cpp:113`）。
-- **`setScaledContents(true)` 的性能**：QLabel 每帧绘制时都对 pixmap 做一次缩放插值，640x480 可接受，但升 720p 后 CPU 开销翻倍——应缓存缩放结果。
+- **`setScaledContents(true)` 的性能**：QLabel 每帧绘制时都对 pixmap 做一次缩放插值，640x480 可接受，但升 720p 后 CPU 开销翻倍——应缓存缩放结果。**实测它在 linuxfb 上会额外触发 `QColorProfile::fromSRgb`（Qt 颜色管理）成为 CPU 热点**，关闭后该热点从 48% 降到 27%（见 §2.2 坑点）。
 - **坏帧静默跳过 vs 画面停顿**：解码失败 `release(slot)` 丢帧，`refreshFrame` 里 `if (!img.isNull())` 跳过 setPixmap，画面保持上一帧。好处是不花屏，坏处是坏帧过多时画面"冻住"却无提示——需要一个坏帧计数器报警。
 
 ### 面试追问与应答
@@ -261,7 +261,7 @@ case PixelFormat::FMT_MJPEG: {
 **A**：旧路径：`setFrame` 把帧深拷贝进 `m_frameBuffer`（assign），`frameToQImage` 解码后再 `.copy()` 一次，RGB24 每帧拷 2 遍。帧池路径：`displayTimer` 解码结果**直接写入池槽**（`slot->data`），`setFrameShared` 让 `m_currentFrame` 零拷贝指向共享内存，`refreshFrame` 用 QImage 浅引用上屏——RGB24 全程 0 次深拷贝。安全靠 `m_heldSlot` 引用计数保证槽生命周期，实测显示链路拷贝从 10.0 → 0.5 MB/s（-95%）。
 
 **Q2：MJPEG 每帧解码耗时约 25ms，decode 在哪个线程？会不会卡 UI？**
-**A**：解码发生在 Qt 主线程的 `displayTimer` 的 timeout 槽（帧池路径下不再是 `frameToQImage`）。一次解码 25ms 会阻塞事件循环。**但实测证明：单核 i.MX6ULL 上把解码移出 GUI 线程反而更卡**（线程无法并行，多引入拷贝+切换开销，已回退），所以解码留在 GUI 主线程是当前妥协，也是帧率卡 10fps 的根因。下一步主线是**低分辨率显示解码**（320x240 ~8ms）而非多线程。
+**A**：解码发生在 Qt 主线程的 `displayTimer` 的 timeout 槽（帧池路径下不再是 `frameToQImage`）。一次解码 25ms 会阻塞事件循环。**单核 i.MX6ULL 上把解码移出 GUI 线程反而更卡**（线程无法并行，多引入拷贝+切换开销，已回退），所以解码留在 GUI 主线程是当前妥协。**重要修正（实测）**：帧率卡 10fps 的根因**不是解码，而是摄像头硬件实际输出 10fps**——`v4l2-ctl` 直测确认（尽管能力列表声称 30fps）。低分辨率显示解码能省 CPU，但**无法突破硬件帧率上限**（详见 §2.2 坑点"判定帧率瓶颈的方法论"）。
 
 **Q3：为什么 `setScaledContents(true)` + `setPixmap`，而不是先 `img.scaled(w,h)` 再设置？**
 **A**：`setScaledContents(true)` 让 QLabel 在绘制时拉伸 pixmap，等价于先缩放但**延迟到 paintEvent**、避免多一次中间缓冲；缺点是每次绘制都重缩放。对轻微缩放可接受，升 720p 后应缓存缩放结果。
@@ -339,6 +339,8 @@ displayTimer->start();
 - **`g_state.fps` 是采集线程的 FPS，不是显示 FPS**：两个数字不同步是常态，若面试官问"为什么 Disp FPS 比 Cap FPS 低"，要能回答"解码耗时吃掉显示预算"（分辨率高→解码慢→Disp 下降，但 Cap 由采集线程独立测量，仍可能保持较高）。
 - **⚠️ Disp FPS 可能高于 Cap FPS（统计口径差异，非 bug 也非"显示快于采集"）**：这两个 FPS 统计的不是同一个对象。Cap FPS 统计"采集到的**不同帧**的速率"（`getFrame` 取到新帧才计数，真实受 V4L2 输出 + 单核 CPU 限制）；Disp FPS 统计"displayTimer **渲染动作**的次数"，**未做新帧去重**——只要 `g_state.frameData` 非空就渲染并计入，重复渲染同一帧也算。当采集只有 ~10fps（100ms/帧）而 displayTimer 按 33ms 周期触发时，一个采集帧间隔内 displayTimer 会渲染约 3 次（其中 2 次是重复渲染同一帧），Disp FPS 被"重复渲染计数"灌水，长期稳定地虚高于 Cap FPS。**修复方向**：在 `g_state` 加 `frameSeq` 帧序号，displayTimer 只在帧序号变化时渲染并计数，则 Disp FPS 恒 ≤ Cap FPS。
 - **双定时器相位不同步**：`displayTimer` 拷贝的帧与 `m_refreshTimer` 渲染的帧可能相差 0~33ms，画面延迟略大但稳定。若要降低延迟，可合并为单定时器。
+- **⚠️ linuxfb 渲染热点 `QColorProfile::fromSRgb`（实测占 ~48% CPU）**：Qt linuxfb 平台在每次 pixmap 绘制/缩放时做颜色空间管理，perf 采样显示该函数是单核 CPU 的最大热点。**关闭 `setScaledContents` 只能部分缓解（48%→27%），无法完全消除**——它与 QImage 格式无关（即使改成 RGB565 也一样，因为根因是 linuxfb 插件的固有绘制管线，而非格式不匹配）。这是嵌入式 linuxfb 渲染的固有代价。
+- **⚠️ 判定帧率瓶颈的方法论（关键经验）**：本次排查 Cap FPS 恒为 10fps，发现"CPU 从 100% 降到 67%（有 33% 空闲）但帧率仍 10"——**这说明瓶颈不在 CPU，而在供给端（摄像头硬件）**。判断瓶颈要先问"CPU 有空闲时帧率提得上去吗"：提不上去 → 瓶颈在硬件/驱动，改应用代码无效。**最终用 `v4l2-ctl` 直测确认摄像头实际输出 10fps**（尽管 `--list-formats-ext` 声称支持 30fps，能力列表 ≠ 实际输出）。
 - **帧率滑块范围受限**：`setFramerateRange` 钳制到 1~120fps，且 `displayTimer->setInterval` 用 `std::max(10, 1000/fps)` 保底 10ms——显示定时器最快 100fps，避免 setInterval(0) 导致忙等。
 
 ### 面试追问与应答
@@ -792,7 +794,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 
 > "display 模块是系统的'人机界面'，我围绕三个原则设计：**解耦**（业务通过 `std::function` 回调注入，display 不知道 camera/network 的实现，帧数据走 `setFrameShared(FrameSlot*)` 共享契约，换渲染后端只需换适配层）、**节流防堆积 + 帧池零拷贝**（采集线程随意推、GUI 用 33ms QTimer 拉最新帧，锁内只拷贝、解码在锁外；解码结果写入帧池槽、GUI 用 QImage 浅引用上屏，消除显示链路 RGB 深拷贝，实测拷贝 10→0.5 MB/s）、**低配适配**（MJPEG 用 libjpeg 缩放解码 `scale_denom` 与自定义错误处理器，YUYV 用 NEON 转换，相册缩略图只解码可见尺寸，OSD 用独立控件避免与高频视频帧耦合，AVI 播放手写解析器免 ffmpeg）。触摸走 linuxfb+evdev，Qt 内部 mmap `/dev/fb0` 但应用代码不碰它。
 >
-> 我做了一个很有价值的量化分析：帧池把拷贝降了 95%，但帧率没变——**实测瓶颈是 JPEG 解码（~25ms/帧）而非拷贝**，而且单核上独立解码线程反而更卡（已回退）。所以正确的优化方向是'少计算 + 少拷贝'，下一步主线是低分辨率显示解码。如果让我重构，我会用低分辨率显示解码、抽象 `IDisplaySink` 渲染后端接口、把相机参数变更收敛成独立的 CameraController，让显示面更纯粹。"
+> 我做了一个很有价值的量化分析：帧池把拷贝降了 95%，但帧率没变；我又排除了解码、渲染，甚至把渲染全去掉、CPU 降到 67% 帧率还是 10fps——**最终用 `v4l2-ctl` 直测确认瓶颈是摄像头硬件实际输出 10fps**（不是拷贝、不是解码），而且单核上独立解码线程反而更卡（已回退）。这段经历让我明白：**单核性能排查要先确认硬件供给能力，再优化应用层**。如果让我重构，我会用低分辨率显示解码（换 30fps 摄像头后 CPU 成为瓶颈时）、抽象 `IDisplaySink` 渲染后端接口、把相机参数变更收敛成独立的 CameraController，让显示面更纯粹。"
 
 ---
 
@@ -811,7 +813,8 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 为什么 QImage 要 .copy() | QImage 浅引用外部缓冲，setPixmap 生命周期更长（仅旧 frameToQImage 路径） |
 | 怎么防 MJPEG 坏帧崩程序 | libjpeg 自定义 error_exit + longjmp，坏帧跳过不退出 |
 | 显示解码在哪个线程 | 单核上解码留在 GUI 主线程（displayTimer）；独立解码线程实测更卡已回退 |
-| 真正瓶颈是啥 | JPEG 解码（~25ms/帧）非拷贝；下一步低分辨率显示解码（320x240） |
+| 真正瓶颈是啥 | 实测为**摄像头硬件实际输出 10fps**（v4l2-ctl 直测）；解码/渲染只是 CPU 占用，不是帧率瓶颈 |
+| 判定瓶颈方法论 | CPU 有空闲但帧率提不上去 → 瓶颈在供给端（硬件）；能力列表 ≠ 实际输出，须 v4l2-ctl 直测 |
 | 怎么加速缩略图 | libjpeg scale_denom=2/4/8，逆 DCT 直接跳高频，省内存省 CPU |
 | 滑块拖动为什么防抖 | 帧率变更要停流重启（几十 ms），不防抖会反复打断采集 |
 | OSD 用什么画 | 独立 QLabel/控件最省（脏矩形局部重绘），别每帧合成进视频 |
@@ -823,7 +826,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | AVI 播放为什么不用 ffmpeg | 自产格式简单 + 免体积负担；idx1 索引让 seek O(1) |
 | 开机自启 | systemd service：ConditionPathExists=/dev/video0 + Restart=on-failure |
 | 换 SDL/裸 FB 要改多少 | 业务侧几乎不动（回调是纯 C++），display 内部全重写 |
-| 最大性能短板 | MJPEG 解码在 GUI 线程（25ms/帧，CPU 99% 卡 10fps）；单核上不能靠多线程，应走低分辨率显示解码 |
+| 最大性能短板 | 摄像头硬件 10fps（改代码无法突破）；linuxfb 渲染热点 QColorProfile::fromSRgb 占 ~48% CPU |
 | 帧池零拷贝是啥 | displayTimer 解码直写池槽 + setFrameShared 浅引用，显示链路拷贝 -95% |
 | 未用 PXP | 诚实点：NEON 已达标；PXP 适合 YUV→RGB/叠加/缩放，不加速 JPEG |
 
@@ -1044,7 +1047,7 @@ g_rgbPool->publish(slot);                       // 发布 → GUI setFrameShared
 **A**：AVI 容器里存的是 MJPEG 帧（`00dc` 压缩 chunk）。YUYV 是未压缩原始格式，要录像就得先编码成 JPEG，而 YUYV 模式下的 JPEG 编码结果只用于推流，录像代码干脆只在 `FMT_MJPEG` 时写盘（`main.cpp:876`）——既避免重复编码，也保证 AVI 格式统一。
 
 **Q3：既然显示解码 25ms 在 GUI 线程，MJPEG 模式为什么还能跑 30fps？**
-**A**：640x480 的 MJPEG 帧通常小于 100KB，解码耗时往往低于 25ms 的理论值，33ms 定时器有富余；且坏帧被静默跳过。**但实测在真实光照/复杂画面下 CPU 已 99% 打满、帧率卡 10fps**——说明解码确实是瓶颈。升 720p 解码会超 33ms，必须走"低分辨率显示解码"（scale_denom 只解显示尺寸），而非"解码移出 GUI 线程"（见 3.2 场景 A）。
+**A**：640x480 的 MJPEG 帧通常小于 100KB，解码耗时往往低于 25ms 的理论值，33ms 定时器有富余；且坏帧被静默跳过。**但实测 CPU 99% 打满、帧率卡 10fps——最终 v4l2-ctl 确认根因是摄像头硬件实际输出 10fps**（解码/渲染只是 CPU 占用，不是帧率上限，见 §3.2 场景 D）。升 720p 解码会超 33ms，应走"低分辨率显示解码"（scale_denom 只解显示尺寸）省 CPU，而非"解码移出 GUI 线程"（见 3.2 场景 A）。
 
 **Q4：如果让处理线程解码成 RGB 再推给 GUI，能省掉显示解码吗？**
 **A**：能省掉 GUI 线程的解码，但**总量不省**——解码还是要做一次，只是从 GUI 线程挪到处理线程（还多一次 RGB 数据的跨线程拷贝）。**且实测单核 i.MX6ULL 上独立解码线程反而更卡**（线程无法并行，多引入拷贝+切换开销，曾实现后回退）。真正的瓶颈是"解码计算"本身，不是"在哪个线程"。注意推流路径要的是 JPEG，处理线程解码成 RGB 反而要再编码回去。**正确方向是**：推流保持 JPEG 直通，显示路径用 `scale_denom` 低分辨率解码（25ms→~8ms），既降计算又不引入线程切换开销。
