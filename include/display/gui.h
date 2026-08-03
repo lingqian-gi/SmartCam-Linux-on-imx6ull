@@ -64,7 +64,8 @@ public:
     /**
      * @brief 更新状态栏信息
      */
-    void setFPS(double fps);
+    void setFPS(double fps);        // 采集线程取帧速率 (Cap FPS)
+    void setDisplayFPS(double fps); // 实际显示速率 (Disp FPS，与设置的 Framerate 一致)
     void setClientCount(int count);
     void setRecordingStatus(bool recording);
     void setStreamingStatus(bool streaming);
@@ -154,9 +155,10 @@ private:
     PhotoGallery*   m_gallery        = nullptr;   // 相册组件
 
     // 状态栏
-    QLabel*      m_labelFPS       = nullptr;
-    QLabel*      m_labelStreaming = nullptr;
-    QLabel*      m_labelClients   = nullptr;
+    QLabel*      m_labelFPS        = nullptr;  // 采集帧率 (Cap FPS)
+    QLabel*      m_labelDisplayFPS = nullptr;  // 显示帧率 (Disp FPS)
+    QLabel*      m_labelStreaming  = nullptr;
+    QLabel*      m_labelClients    = nullptr;
     QLabel*      m_labelRecording = nullptr;
 
     // 定时器

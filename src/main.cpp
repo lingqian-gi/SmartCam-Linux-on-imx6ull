@@ -1053,7 +1053,12 @@ int main(int argc, char* argv[]) {
         // 解码仍在 GUI 线程（单核板上线程无并行收益，见 docs 实施指南 §2.3）。
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
-        QObject::connect(displayTimer, &QTimer::timeout, [&gui, mjpegServer]() {
+        // 显示 FPS 统计：每 30 次实际渲染一帧算一次平均（反映真正显示速率）
+        auto dispFpsLastTime = std::chrono::steady_clock::now();
+        int  dispFpsCount    = 0;
+        double dispFps       = 0.0;
+        QObject::connect(displayTimer, &QTimer::timeout,
+            [&gui, mjpegServer, &dispFpsLastTime, &dispFpsCount, &dispFps]() {
             // 1. 借 RGB 写槽（无空闲则丢帧，不阻塞）
             FrameSlot* slot = g_rgbPool->acquire();
             if (!slot) return;
@@ -1113,7 +1118,17 @@ int main(int argc, char* argv[]) {
                 gui.setFrameShared(displaySlot);   // GUI 接管此引用
             }
 
-            gui.setFPS(g_state.fps);
+            // 统计实际显示 FPS（每 30 次成功渲染一帧算一次平均）
+            dispFpsCount++;
+            if (dispFpsCount % 30 == 0) {
+                auto now = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(now - dispFpsLastTime).count();
+                if (elapsed > 0.0) dispFps = 30.0 / elapsed;
+                dispFpsLastTime = now;
+            }
+
+            gui.setFPS(g_state.fps);             // 采集线程取帧速率
+            gui.setDisplayFPS(dispFps);          // 实际显示速率
             gui.setClientCount(mjpegServer->clientCount());
         });
         displayTimer->start();
