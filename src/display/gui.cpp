@@ -149,7 +149,9 @@ void CameraGUI::buildUI() {
     );
     m_videoDisplay->setText(QStringLiteral("Waiting camera..."));
     m_videoDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_videoDisplay->setScaledContents(true);
+    // [验证] setScaledContents(true) 会每帧实时缩放 + 触发 Qt 颜色管理(QColorProfile::fromSRgb)，
+    //       临时改为 false 验证是否是 CPU 热点元凶
+    m_videoDisplay->setScaledContents(false);
     liveLayout->addWidget(m_videoDisplay);
 
     m_mainStack->addWidget(m_liveViewContainer);  // index 0
