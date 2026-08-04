@@ -18,7 +18,7 @@
    - 1.6 Qt 线程模型与两个定时器的关系
 2. [第二部分 分块代码详解（含面试追问）](#第二部分-分块代码详解含面试追问)
    - 2.1 块一：帧渲染管线（帧池零拷贝路径 + 旧路径兜底）
-   - 2.2 块二：帧率控制（displayTimer / m_refreshTimer 双定时器与双 FPS）
+   - 2.2 块二：帧率控制（displayTimer 单驱动 + 双 FPS）
    - 2.3 块三：回调注入（松耦合的关键）
    - 2.4 块四：页面导航（QStackedWidget 三层嵌套）
    - 2.5 块五：触摸交互（eventFilter / 滑动翻页 / 滑块防抖）
@@ -48,7 +48,7 @@ src/display/ 显示与交互模块
 │   │            + frameToQImage() 兜底路径（Mock/无槽时）+ refreshFrame() 主渲染
 │   │            （setFrame() 已废弃——定义仍在但无任何调用点，为死代码）
 │   ├── 帧池交互：extern FramePool* g_rgbPool；setFrameShared 持有槽引用，refreshFrame 浅引用上屏
-│   ├── 帧率控制：m_refreshTimer (GUI 内) + displayTimer (main 注入) / 双 FPS
+│   ├── 帧率控制：displayTimer (main 注入，完全单驱动) / 双 FPS
 │   ├── 回调注入：onCaptureRequest / onRecordToggle / onResolutionChanged
 │   │            onFormatChanged / onStoragePathChanged / onCameraControlChanged
 │   │            onFramerateChanged
@@ -127,45 +127,45 @@ main.cpp（Qt 主线程）
   │    gui.onCaptureRequest(...)           ← 存 JPEG（MJPEG 直存 / YUYV 先编码）
   │    gui.onRecordToggle(...)             ← 校验 MJPEG 才允许录像
   │
-  ├─ displayTimer (QTimer 33ms)            ← main 侧：借槽→解码入槽→publish→share→setFrameShared + FPS 更新
+  ├─ displayTimer (QTimer 33ms)            ← main 侧：借槽→解码入槽→publish→share→setFrameShared
+  │                                          → requestRefresh（发布后立即上屏）+ FPS 更新
   │
   └─ gui.show() → app.exec()               ← 进入 Qt 事件循环
         │
-        └─ CameraGUI::m_refreshTimer (QTimer 33ms)   ← GUI 侧：refreshFrame → QImage 浅引用 → setPixmap
+        └─ CameraGUI::requestRefresh()     ← 全局唯一上屏入口：真实模式由 displayTimer 驱动，
+                                              Mock 模式由 main.cpp 的 Mock 定时器驱动彩条
 ```
 
-**两个定时器串联的完整链路**（这是理解显示线程模型的关键，见 1.6）：
+**完全单驱动架构**（这是理解显示线程模型的关键，见 1.6）：
 
 ```
-displayTimer.timeout (main, 锁内)         m_refreshTimer.timeout (GUI 线程)
-  g_state → 借rgb池槽 → 解码/转换入槽   ───►   refreshFrame
-  → publish → share → setFrameShared           → m_heldSlot 存在: QImage 浅引用（零拷贝）
-  （解码在 displayTimer 内，GUI 主线程）        → 否则: frameToQImage（旧路径兜底）
-                                                → setPixmap → paintEvent → fb0
+真实模式:                                   Mock 模式:
+displayTimer.timeout (main, GUI 线程)       Mock 定时器 (main, 33ms)
+  g_state → 借rgb池槽 → 解码/转换入槽          └─ requestRefresh()
+  → publish → share → setFrameShared              └─ refreshFrame → m_mockMode 彩条滚动
+  └─ requestRefresh()                              └─ setPixmap → paintEvent → fb0
+      └─ refreshFrame → m_heldSlot 浅引用上屏
+      └─ setPixmap → paintEvent → fb0
 ```
 
-## 1.6 Qt 线程模型与两个定时器的关系
+## 1.6 Qt 线程模型与显示驱动（完全单驱动）
 
 **全局只有 Qt 主线程一个 GUI 线程**（采集线程、处理线程、控制线程、RTSP 线程是 `std::thread`，不碰 Qt 对象）。所有控件操作必须在 GUI 线程，跨线程访问 Qt 对象是未定义行为。
 
-项目里有**两个 33ms 定时器**，职责不同：
+**显示驱动：全局只有一个定时器入口**——`main.cpp` 按模式创建，`CameraGUI` 自身**不持有任何刷新定时器**：
 
-| 定时器 | 所在 | 回调 | 干的事 |
+| 驱动定时器 | 所在 | 何时创建 | 回调干的事 |
 |--------|------|------|--------|
-| `displayTimer` | `main.cpp` | lambda | 借 rgb 池槽 → 短锁拷贝 raw → **解码/转换入槽**（`decodeJPEGtoRGB`/`yuyvToRgb24`）→ `publish` → `share` → `setFrameShared` + 更新 FPS/客户端数 |
-| `m_refreshTimer` | `gui.cpp` | `refreshFrame` | 若持有 `m_heldSlot` 用 QImage 浅引用（零拷贝），否则回退 `frameToQImage` → `setPixmap` |
+| `displayTimer` | `main.cpp` | 真实相机模式 | 借 rgb 池槽 → 短锁拷贝 raw → **解码/转换入槽**（`decodeJPEGtoRGB`/`yuyvToRgb24`）→ `publish` → `share` → `setFrameShared` → `requestRefresh()`（发布即上屏）+ 更新 FPS/客户端数 |
+| Mock 驱动定时器 | `main.cpp` | Mock 模式 | `requestRefresh()` → `refreshFrame` → `m_mockMode` 分支滚动彩条 |
 
-> **注意**：帧池改造后，**解码（JPEG→RGB）发生在 `displayTimer` 的 timeout 内**（即 GUI 主线程，`main.cpp` 的 displayTimer 回调中），不再在 `m_refreshTimer` 的 `frameToQImage` 里。两个定时器仍在 GUI 主线程顺序执行，但 `m_refreshTimer` 变成了纯"浅引用上屏"，几乎不耗时。
+> **注意**：帧池改造后，**解码（JPEG→RGB）发生在 `displayTimer` 的 timeout 内**（即 GUI 主线程，`main.cpp` 的 displayTimer 回调中）。`CameraGUI::refreshFrame` 不承担解码，只做"浅引用上屏"或"Mock 彩条滚动"，几乎不耗时。`requestRefresh()` 是全局唯一上屏入口，真实/Mock 两模式都走它。
+>
+> **演进历史（理解设计）**：早期版本 CameraGUI 内置 `m_refreshTimer`（33ms）自驱动 `refreshFrame`，与 main 侧 `displayTimer` 构成双定时器，代价是两定时器**相位不同步**导致 0~33ms 随机延迟。重构后 CameraGUI 移除内部定时器，由 main.cpp 统一驱动 `requestRefresh()`——**完全单驱动**：真实模式"发布后立即上屏"延迟归零，Mock 模式由同入口驱动彩条，全项目只有一个刷新入口。
 
-**为什么拆成两个而不是一个？**
-1. `displayTimer` 要访问 `g_state`（main.cpp 的全局）和 `g_rgbPool`（帧池），属于"模块边界的数据搬运 + 解码"；`m_refreshTimer` 只碰 GUI 内部状态，属于"渲染"。
-2. 分离让 `CameraGUI` 类可以**独立测试**（PC Mock 模式只有 `m_refreshTimer` 在跑，不依赖 `g_state`）。
-3. 帧池改造后，解码集中在 `displayTimer`，`m_refreshTimer` 退化为主持"浅引用上屏"；两者仍在 GUI 主线程顺序执行。
-4. 代价是两个定时器**相位不同步**，帧会多约 0~33ms 的随机延迟——这是"解耦 vs 延迟"的权衡，面试能主动指出说明理解深。
+【面试官追问】"解码在 GUI 线程会不会导致帧率减半或卡顿？"
 
-【面试官追问】"这两个定时器都在 GUI 线程，会不会互相抢时间导致帧率减半？"
-
-> 【理想应答】不会减半。两者都是 33ms 独立触发，Qt 事件循环按到期先后逐个执行 timeout 槽，每个槽的执行时间远小于 33ms（拷贝 ~1ms、解码 ~10-25ms），所以平均刷新率约 30fps。真正的风险是**解码耗时接近 33ms 时**：如果某帧解码超时，事件循环会积压，后续 timeout 被推迟，表现为"偶发跳帧"。这就是"解码应该移出 GUI 线程"的动机来源。
+> 【理想应答】不会因双驱动减半——全局只有一个定时器驱动，不存在两个定时器抢时间的问题。真正的风险是**解码耗时接近 33ms 时**：如果某帧解码超时，事件循环会积压，后续 timeout 被推迟，表现为"偶发跳帧"。这就是"解码应该移出 GUI 线程"的动机来源（实测单核上移出反而更卡，已回退，正确方向是 scale_denom 低分辨率显示解码）。
 
 【面试官追问】"为什么跨线程不能用信号直接驱动 QLabel？"
 
@@ -270,7 +270,7 @@ case PixelFormat::FMT_MJPEG: {
 **Q4：`frameToQImage` 为什么是 `switch` 而不是多态？加一种新格式要改哪？**
 **A**：当前 4 种格式（RGB24/RGB565/YUYV/MJPEG）分支清晰、无抽象成本，且帧池路径下 `frameToQImage` 只是无槽时的兜底。但加新格式（如 NV12、H.264 解码帧）要改 switch + 头文件枚举。可演化为"`FormatConverter` 策略表"——`std::unordered_map<PixelFormat, std::function<QImage(...)>>`，新增格式注册即可，符合开闭原则（见 3.3）。
 
-## 2.2 块二：帧率控制（displayTimer / m_refreshTimer 双定时器与双 FPS）
+## 2.2 块二：帧率控制（displayTimer 单驱动 + 双 FPS）
 
 ### 代码讲解
 
@@ -339,7 +339,7 @@ displayTimer->start();
 
 - **`g_state.fps` 是采集线程的 FPS，不是显示 FPS**：两个数字不同步是常态，若面试官问"为什么 Disp FPS 比 Cap FPS 低"，要能回答"解码耗时吃掉显示预算"（分辨率高→解码慢→Disp 下降，但 Cap 由采集线程独立测量，仍可能保持较高）。
 - **⚠️ Disp FPS 可能高于 Cap FPS（统计口径差异，非 bug 也非"显示快于采集"）**：这两个 FPS 统计的不是同一个对象。Cap FPS 统计"采集到的**不同帧**的速率"（`getFrame` 取到新帧才计数，真实受 V4L2 输出 + 单核 CPU 限制）；Disp FPS 统计"displayTimer **渲染动作**的次数"，**未做新帧去重**——只要 `g_state.frameData` 非空就渲染并计入，重复渲染同一帧也算。当采集只有 ~10fps（100ms/帧）而 displayTimer 按 33ms 周期触发时，一个采集帧间隔内 displayTimer 会渲染约 3 次（其中 2 次是重复渲染同一帧），Disp FPS 被"重复渲染计数"灌水，长期稳定地虚高于 Cap FPS。**修复方向**：在 `g_state` 加 `frameSeq` 帧序号，displayTimer 只在帧序号变化时渲染并计数，则 Disp FPS 恒 ≤ Cap FPS。
-- **双定时器相位不同步**：`displayTimer` 拷贝的帧与 `m_refreshTimer` 渲染的帧可能相差 0~33ms，画面延迟略大但稳定。若要降低延迟，可合并为单定时器。
+- **双定时器相位不同步（已彻底消除）**：早期版本 CameraGUI 内置 `m_refreshTimer` 自驱动 + main 侧 `displayTimer` 双定时器，帧可能相差 0~33ms。已重构为**完全单驱动**：CameraGUI 移除内部定时器，`requestRefresh()` 成为全局唯一上屏入口——真实模式 `displayTimer` 发布后立即调用（延迟归零），Mock 模式由 main.cpp 的 Mock 定时器调用驱动彩条。面试答法：指出"解耦 vs 延迟"的权衡后，说明"把刷新入口收敛到 `requestRefresh()` 单一驱动"是比"保留双定时器再停用"更干净的解法。
 - **⚠️ linuxfb 渲染热点 `QColorProfile::fromSRgb`（实测占 ~48% CPU）**：Qt linuxfb 平台在每次 pixmap 绘制/缩放时做颜色空间管理，perf 采样显示该函数是单核 CPU 的最大热点。**关闭 `setScaledContents` 只能部分缓解（48%→27%），无法完全消除**——它与 QImage 格式无关（即使改成 RGB565 也一样，因为根因是 linuxfb 插件的固有绘制管线，而非格式不匹配）。这是嵌入式 linuxfb 渲染的固有代价。
 - **⚠️ 判定帧率瓶颈的方法论（关键经验）**：本次排查 Cap FPS 恒为 10fps，发现"CPU 从 100% 降到 67%（有 33% 空闲）但帧率仍 10"——**这说明瓶颈不在 CPU，而在供给端（摄像头硬件）**。判断瓶颈要先问"CPU 有空闲时帧率提得上去吗"：提不上去 → 瓶颈在硬件/驱动，改应用代码无效。**最终用 `v4l2-ctl` 直测确认摄像头实际输出 10fps**（尽管 `--list-formats-ext` 声称支持 30fps，能力列表 ≠ 实际输出）。
 - **帧率滑块范围受限**：`setFramerateRange` 钳制到 1~120fps，且 `displayTimer->setInterval` 用 `std::max(10, 1000/fps)` 保底 10ms——显示定时器最快 100fps，避免 setInterval(0) 导致忙等。
@@ -808,7 +808,7 @@ int offset = (m_mockFrameIndex * 2) % w;      // 每帧移动 2 像素
 | 触摸怎么来 | gt9147 → evdev → linuxfb 插件 → QMouseEvent，应用不直接读 /dev/input |
 | 为什么不直接用信号连接 | 回调更轻量、可捕获局部变量、业务解耦；信号用于外部监听 |
 | 怎么防 UI 堆积 | QTimer 拉模式，33ms 取最新帧，锁内只拷贝、锁外解码 |
-| 两个定时器是什么 | displayTimer（main 借槽+解码入槽+publish+setFrameShared）+ m_refreshTimer（GUI 浅引用上屏） |
+| 显示驱动是什么 | 完全单驱动：CameraGUI 无内部定时器，requestRefresh() 是唯一上屏入口；真实模式由 displayTimer 发布即上屏，Mock 模式由 main 的 Mock 定时器驱动彩条 |
 | 为什么 setFrame 要深拷贝 | g_state.frameData 在采集线程可能 realloc，浅存会悬垂（旧路径） |
 | 帧池路径为什么不拷 | setFrameShared 持有槽引用 + QImage 浅引用，RGB24 零深拷贝（拷贝 10→0.5MB/s） |
 | 为什么 QImage 要 .copy() | QImage 浅引用外部缓冲，setPixmap 生命周期更长（仅旧 frameToQImage 路径） |

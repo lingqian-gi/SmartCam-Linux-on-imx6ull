@@ -93,12 +93,9 @@ CameraGUI::CameraGUI(QWidget* parent)
     buildUI();
     connectSignals();
 
-    // 启动刷新定时器 33ms ≈ 30fps
-    m_refreshTimer = new QTimer(this);
-    m_refreshTimer->setInterval(33);
-    connect(m_refreshTimer, &QTimer::timeout, this, &CameraGUI::refreshFrame);
-    m_refreshTimer->start();
-
+    // 完全单驱动：CameraGUI 不再持有内部刷新定时器，上屏统一由外部驱动
+    // （真实模式=main.cpp 的 displayTimer，Mock 模式=main.cpp 的 Mock 定时器）
+    // 均通过公开入口 requestRefresh() 触发 refreshFrame()。
     // 默认进入模拟模式
     enterMockMode();
 
@@ -341,6 +338,12 @@ void CameraGUI::refreshFrame() {
             m_videoDisplay->setPixmap(pix);
         }
     }
+}
+
+void CameraGUI::requestRefresh() {
+    // 显示刷新唯一驱动入口：真实模式由 displayTimer（发布后立即上屏），
+    // Mock 模式由 main.cpp 的 Mock 定时器（驱动彩条滚动）调用。
+    refreshFrame();
 }
 
 void CameraGUI::onCapture() {

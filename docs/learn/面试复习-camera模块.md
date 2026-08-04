@@ -96,7 +96,7 @@ open → querycap → s_fmt → reqbufs → querybuf → mmap → qbuf → strea
   - 期望格式 `(width, height, pixfmt)`，如 `(640, 480, V4L2_PIX_FMT_MJPEG)`
   - V4L2 控件 ID 与目标值（`setControl(cid, value)`）
 - **输出**：
-  - `FrameBuffer`（`include/common/types.h`）：`data/length/width/height/format/index/pool_index/timestamp`
+  - `FrameBuffer`（`include/common/types.h`）：`data/length/width/height/format/index/timestamp`（注意：**无 `pool_index` 字段**——`putFrame` 通过 `data` 指针遍历反推槽位，见 §2.4）
   - 枚举结果：格式列表、分辨率列表、帧率列表、控件范围
   - 统计信息：`getCurrentFPS()` / `getCurrentResolution()` / `getCurrentFormat()`
 
@@ -199,8 +199,8 @@ main.cpp（真实相机模式）
   │    init("/dev/video0")
   │    enumFormats → 检测 YUYV/MJPEG 支持
   │    setFormat(640,480, pixfmt)          ← 驱动可能调整实际分辨率，须回读
-  │    queryControl/getControl             ← 亮度/对比度/白平衡/曝光
-  │    setControl(V4L2_CID_EXPOSURE_AUTO, 1)  ← 强制手动曝光保帧率
+  │    queryControl/getControl             ← 亮度/对比度/白平衡/曝光（仅查询+更新 GUI）
+  │    曝光: 只查询不写硬件                 ← 保留自动曝光（强制手动会让固件黑帧，见 §2.11）
   │    enumFrameRates/getFramerate         ← 决定 GUI 帧率滑块范围
   │    startCapture()                      ← 内部: reqbufs→querybuf→mmap→qbuf→streamon
   │
@@ -208,7 +208,7 @@ main.cpp（真实相机模式）
   │    getFrame(&fb, 1000)                 ← select 超时 + DQBUF
   │    （软件帧率节流，未到时间直接 putFrame 丢弃）
   │    frameData.assign(fb.data, ...)      ← ★深拷贝，立即归还缓冲
-  │    putFrame(&fb)                       ← pool_index 直接 O(1) QBUF 归还
+  │    putFrame(&fb)                       ← data 指针遍历反推槽位，QBUF 归还（O(n)，n≤4）
   │    通知处理线程（条件变量 procCv）
   │
   ├─ 处理线程（std::thread）
@@ -216,20 +216,21 @@ main.cpp（真实相机模式）
   │    YUYV 模式 → VideoProcessor::encodeYUYVtoJPEG()
   │    → mjpegServer->updateFrame() / rtspServer->feedFrame() / storage->writeRecordFrame()
   │
-  └─ Qt 主线程（displayTimer 33ms）— 帧池零拷贝显示路径
+  └─ Qt 主线程（displayTimer 33ms，完全单驱动）— 帧池零拷贝显示路径
        g_rgbPool->acquire()               ← 借 RGB 写槽（无空闲丢帧）
        raw = g_state.frameData            ← 短锁拷贝原始帧
        VideoProcessor::decodeJPEGtoRGB()  ← 解码/转换直接写入池槽（零二次拷贝）
        g_rgbPool->publish(slot)           ← 原子发布
        gui.setFrameShared(share())        ← GUI 持有引用，QImage 浅引用上屏
+       gui.requestRefresh()               ← 发布后立即上屏（唯一驱动入口，无相位延迟）
 ```
 
 **关键设计信号**（背诵版）：
-1. 采集线程路径上只有 `DQBUF → 拷贝 → QBUF` 三个 O(1) 操作，**CPU 密集/阻塞操作一律不在取帧路径上**。
+1. 采集线程路径上只有 `DQBUF → 拷贝 → QBUF` 三个操作，**CPU 密集/阻塞操作一律不在取帧路径上**（拷贝是 memcpy、QBUF 是 ioctl，都很快）。
 2. V4L2 mmap 内存**不可长期持有**，必须尽快深拷贝后归还（4 缓冲池容易耗尽）。
 3. 一次采集，四路消费（GUI/HTTP/RTSP/存储），编码结果共享，避免重复计算。
-4. 归还缓冲用 `FrameBuffer.pool_index` 直接定位槽位，**O(1) 且自带双防御校验**，取帧路径上无 O(n) 操作。
-5. **显示链路走帧池零拷贝**：`decodeJPEGtoRGB` 解码结果直接写入 `FramePool` 槽，GUI 用 QImage 浅引用上屏，消除 setFrame assign + QImage.copy() 两次深拷贝（见 §2.11）。
+4. 归还缓冲靠 `data` 指针遍历 `m_buffers[]` 反推槽位（O(n)，n≤4 可接受），配指针匹配校验；**无 `pool_index` 字段**（见 §2.4）。
+5. **显示链路走帧池零拷贝**：`decodeJPEGtoRGB` 解码结果直接写入 `FramePool` 槽，GUI 用 QImage 浅引用上屏，消除 setFrame assign + QImage.copy() 两次深拷贝（见 §2.11）；显示采用**完全单驱动**（`requestRefresh` 唯一上屏入口）。
 
 ---
 
@@ -572,7 +573,7 @@ if (m_fd >= 0) {
 **A**：read() 路径是"内核驱动缓冲区 → 用户态临时缓冲 → 用户态拷贝"，至少两次内存拷贝；mmap 将驱动侧的 DMA 缓冲区直接映射进用户态虚拟地址空间，`DQBUF` 拿到的是**同一块物理内存**的指针，省去全部拷贝。对 640x480 的 MJPEG（约 30~100KB/帧）@30fps，每秒能省下大量内存带宽——在单核 792MHz 的 i.MX6ULL 上，这是能否跑满 30fps 的关键。
 
 **Q2：为什么默认缓冲池是 4 个？改成 8 个或 2 个会怎样？**
-**A**：缓冲池是"延迟吸收器"。取帧方处理一帧的时间如果大于摄像头产生一帧的间隔，队列就会向耗尽方向滑动。4 个缓冲允许消费者平均最多滞后 3 帧才开始丢帧；改成 8 个提高容错但多占约 4×帧大小内存（对 MJPEG 640x480 约多 200~400KB，可接受）；改成 2 个是最低要求，一旦某次处理抖动（如系统调度延迟）就立刻无缓冲可取、掉帧。本项目"采集线程只做 O(1) 拷贝、重活交给处理线程"的策略下，4 个绰绰有余。
+**A**：缓冲池是"延迟吸收器"。取帧方处理一帧的时间如果大于摄像头产生一帧的间隔，队列就会向耗尽方向滑动。4 个缓冲允许消费者平均最多滞后 3 帧才开始丢帧；改成 8 个提高容错但多占约 4×帧大小内存（对 MJPEG 640x480 约多 200~400KB，可接受）；改成 2 个是最低要求，一旦某次处理抖动（如系统调度延迟）就立刻无缓冲可取、掉帧。本项目"采集线程只做拷贝/QBUF 等轻量操作、重活交给处理线程"的策略下，4 个绰绰有余。
 
 **Q3：`REQBUFS(0)` 的作用是什么？不调用会怎样？**
 **A**：`REQBUFS(0)` 告诉驱动释放所有已申请的缓冲区资源。如果不释放，驱动侧缓冲区仍被占用，**后续 `VIDIOC_S_FMT` 修改格式会返回 `EBUSY`**。所以 `unmapBuffers` 里必须补这一步，否则"停流 → 改分辨率 → 再启动"的重配置流程会神秘失败。这是 V4L2 编程的经典坑。
@@ -601,32 +602,27 @@ int CameraCapture::getFrame(FrameBuffer* buf, int timeout_ms) {
     buf->length     = vbuf.bytesused;                        // 驱动回填的实际字节数
     buf->width      = m_width; buf->height = m_height;
     buf->format     = (m_pixfmt == V4L2_PIX_FMT_YUYV) ? FMT_YUYV : FMT_MJPEG;
-    buf->index      = m_frameCount++;
-    buf->pool_index = vbuf.index;                            // 记录槽位，putFrame O(1) 归还
+    buf->index      = m_frameCount++;                        // 帧序号（≠槽位号）
     buf->timestamp  = std::chrono::steady_clock::now();
     updateFPS();
     return 0;
 }
 ```
 
-`putFrame()` 直接用 `pool_index` 归还（O(1)），并保留两道防御校验：
+`putFrame()` 用 **`data` 指针遍历反推**槽位（O(n)，n≤4），并保留指针匹配校验：
 
 ```cpp
 int CameraCapture::putFrame(const FrameBuffer* buf) {
     if (!m_streaming || m_fd < 0) return -EIO;
     if (!buf || !buf->data) return -EINVAL;
 
-    const int idx = buf->pool_index;                  // getFrame 已填充
-    if (idx < 0 || idx >= m_nbuffers || !m_buffers) { // 索引合法性校验
-        LOG_ERR_("putFrame: invalid pool_index=%d (nbufs=%d)", idx, m_nbuffers);
-        return -EINVAL;
+    // 从 data 指针反推缓冲区索引（FrameBuffer 无 pool_index 字段）
+    int idx = -1;
+    for (int i = 0; i < m_nbuffers; ++i) {
+        if (m_buffers[i].start == buf->data) { idx = i; break; }
     }
-    if (m_buffers[idx].start != buf->data) {          // 防御：指针必须匹配
-        LOG_ERR_("putFrame: pool_index=%d data pointer mismatch", idx);
-        return -EINVAL;
-    }
-    if (m_buffers[idx].queued) {                      // 防御：防 double put
-        LOG_ERR_("putFrame: buffer %d already queued (double put?)", idx);
+    if (idx < 0) {                                   // 指针未命中 → 拒绝
+        LOG_ERR_("putFrame: buffer pointer not found in pool");
         return -EINVAL;
     }
     // QBUF(idx) 归还；m_buffers[idx].queued = true;
@@ -648,7 +644,7 @@ ioctl(m_fd, VIDIOC_DQBUF, &buf);
 ### 潜在坑点
 
 - **配对契约**：`getFrame` 后**必须** `putFrame`，否则缓冲池 4 个槽位很快耗尽，`DQBUF` 永久阻塞。main.cpp 采集线程把深拷贝放在 getFrame 与 putFrame 之间，就是为满足"尽快归还"。
-- **`putFrame` O(1) 归还**：已改为直接用 `FrameBuffer.pool_index`（getFrame 填充的 V4L2 `vbuf.index`）归还，不再遍历反查。同时保留两道防御：① 校验 `pool_index` 在 `[0, m_nbuffers)` 且 `data` 指针与槽位 `start` 一致（防伪造 FrameBuffer）；② 校验槽位 `queued` 状态，重复归还（double put）直接报错。
+- **`putFrame` 遍历反推（O(n)，n≤4）**：`FrameBuffer` **没有 `pool_index` 字段**——`getFrame` 填的是帧序号 `index`（自增），不含 V4L2 槽位号。归还时靠 `data` 指针与 `m_buffers[i].start` 逐一比对反推，命中后 `QBUF`。缓冲池只有 4 个槽，O(n) 遍历开销可忽略（n≤4），这也是"保持 FrameBuffer 结构轻量"（不带槽位号）的取舍。唯一校验是"指针必须命中池中某个 `start`"（防伪造/错位 FrameBuffer）。
 - **`select` 被信号中断（EINTR）**：当前直接返回 `-errno`，采集线程 `continue` 重试。若要求更稳可改为循环重试 select。这是健壮性可改进点。
 - **`buf->length = vbuf.bytesused`**：使用驱动回填的实际字节数而非缓冲池长度。MJPEG 帧长度每帧不同，用池长度会导致多读垃圾数据；用 bytesused 才是真实有效数据。
 - **外部不能 free `buf->data`**：它指向 mmap 内存，头文件注释明确"不应外部释放"。一旦外部 free 会破坏 V4L2 映射，这是契约问题，靠文档约束 + 上层深拷贝规避。
@@ -658,8 +654,8 @@ ioctl(m_fd, VIDIOC_DQBUF, &buf);
 **Q1：getFrame/putFrame 为什么必须成对调用？如果某一帧被消费者遗忘会发生什么？**
 **A**：缓冲池是固定 4 个槽位的"租借"模型：getFrame 借出一个槽位，putFrame 归还。遗忘归还 = 槽位永久流失，4 帧后所有缓冲都在消费者手里，驱动无处写入，`DQBUF` 永久阻塞，整个采集链冻结。因此设计上要求：**持有 mmap 缓冲的时间越短越好**。main.cpp 的做法是"拷贝完立刻归还"，把帧数据复制到普通堆内存 `g_state.frameData` 后再分发，彻底解除对 mmap 生命周期的手动管理。
 
-**Q2：putFrame 是怎么归还缓冲区的？O(n) 遍历反查的历史与改进？**
-**A**：现在已是 O(1)。`getFrame` 把 V4L2 的 `vbuf.index` 写入 `FrameBuffer.pool_index`，`putFrame` 直接 `QBUF(pool_index)`。历史背景：初版 `FrameBuffer` 没带缓冲池索引，只能拿 `data` 指针与池中 `start` 逐个比对反推，功能正确但有两个隐患——一是 O(n) 开销，二是依赖指针唯一性（若未来某处构造了指向相同 mmap 地址的 FrameBuffer 就会误匹配）。改进要点：① `pool_index` 默认 `-1`，未经验证的 FrameBuffer 归还时会因越界被拒；② `putFrame` 保留两道 O(1) 防御校验（`data` 指针匹配 + 防 double put），把"信任成本"降到最低，同时避免破坏"getFrame/putFrame 必须成对"的契约检查。
+**Q2：putFrame 是怎么归还缓冲区的？是 O(1) 还是 O(n)？**
+**A**：**O(n) 遍历反推（n = 缓冲池大小 ≤ 4）**。`getFrame` 不把 V4L2 槽位号写进 `FrameBuffer`（结构体里只有帧序号 `index`），归还时 `putFrame` 拿 `buf->data` 与 `m_buffers[i].start` 逐个比对，命中后 `QBUF(idx)`。为什么不加 `pool_index` 做 O(1)？两个考量：① 缓冲池最多 4 个槽，O(4) 遍历的开销（几次指针比较）在 30fps 取帧路径上可以忽略，加了反而让 `FrameBuffer` 结构多一个字段、增加"槽位号可能过期/被伪造"的契约负担；② 指针反推自带"校验"语义——`data` 必须真的指向池中某个映射，天然拒绝外部构造的假 FrameBuffer。若未来缓冲数变大（如 8/16）或想省那几次比较，可以在 `FrameBuffer` 加 `pool_index`（getFrame 填 `vbuf.index`，putFrame 直接 `QBUF(pool_index)` 且加防 double put 校验）——这是可选的优化方向，但当前规模下不值得。
 
 **Q3：select 超时 1 秒，超时后返回 -ETIMEDOUT，上层如何处理？**
 **A**：main.cpp 采集线程对 `getFrame < 0` 的处理是 `continue` 重试（除非 `!running` 退出）。超时本身不代表摄像头故障——可能是驱动在重协商、或系统调度导致帧间隔被拉长。但连续长时间超时（比如几十秒）就应视为设备异常，可以升级处理（日志告警、重启采集）。当前代码是"静默重试 + 依赖上层 watchdog"，是一个可讨论的简化。
@@ -1005,7 +1001,7 @@ libjpeg 默认的错误处理器会直接调用 `exit()`——摄像头偶发坏
 ### 潜在坑点
 
 - **setjmp/longjmp 与 C++ 对象**：`longjmp` 跳转不会调用局部对象的析构函数，所以错误分支要**手动 `jpeg_destroy_decompress`** 清理，否则泄漏。这是本实现必须手动清理的原因。
-- **`decodeJPEGtoRGB` 的调用点**：在 GUI 主线程的 `displayTimer` 内（单核上解码移出 GUI 线程反而更卡，见 §3.2 场景 D）。约 15~25ms/帧的解码开销——**早期曾误判为帧率瓶颈，最终 v4l2-ctl 实测确认瓶颈是摄像头硬件实际输出 10fps**（解码只是 CPU 占用，不是帧率上限，详见 §3.2 场景 D）。
+- **`decodeJPEGtoRGB` 的调用点**：在 GUI 主线程的 `displayTimer` 内（单核上解码移出 GUI 线程反而更卡，见 §3.2 场景 D），解码结果直写帧池槽后由 `gui.requestRefresh()` 立即上屏。约 15~25ms/帧的解码开销——**早期曾误判为帧率瓶颈，最终 v4l2-ctl 实测确认瓶颈是摄像头硬件实际输出 10fps**（解码只是 CPU 占用，不是帧率上限，详见 §3.2 场景 D）。
 - **`HAS_LIBJPEG` 守卫**：非编译 libjpeg 时返回 false，调用方走丢帧/回退逻辑。
 
 ### 面试追问与应答
@@ -1036,28 +1032,34 @@ int CameraCapture::getControl(cid, value)                  // G_CTRL 读当前�
 int CameraCapture::setControl(cid, value)                  // S_CTRL 写值
 ```
 
-main.cpp 中的关键工程决策——**强制手动曝光保帧率**：
+main.cpp 中的关键工程决策——**曝光只查询不写入，保留自动曝光**：
 
 ```cpp
-// V4L2_EXPOSURE_MANUAL = 1，强制手动模式以保持帧率
-if (expVal != 1) {
-    capture->setControl(V4L2_CID_EXPOSURE_AUTO, 1);
-    LOG_INF("Auto Exposure disabled to preserve framerate");
-}
-// 曝光绝对值限制：30fps 要求曝光 < 33ms
-if (targetExposure > 300) targetExposure = 300;
+// 自动曝光 → 仅查询并更新 GUI，不写硬件（保留摄像头自动曝光）。
+// ★ 修复：强制手动曝光(Exposure=300)会让该摄像头固件进入异常状态
+//   （输出黑帧且状态残留，退出程序后 v4l2-ctl 抓帧也黑）。
+//   v4l2-ctl 实证：不设曝光 → 正常大帧(~100KB)，设曝光300 → 黑帧(~6.7KB)。
+capture->queryControl(V4L2_CID_EXPOSURE_AUTO, ...);   // 只读范围
+capture->getControl(V4L2_CID_EXPOSURE_AUTO, expVal);  // 只读当前值
+gui.setAutoExposure(expVal != 1);                      // 反映当前状态到 GUI
+// 曝光绝对值同样只查询供滑块显示，不写硬件
+capture->queryControl(V4L2_CID_EXPOSURE_ABSOLUTE, ...);
+gui.setExposureRange(absMin, absMax, absStep, def);
 ```
+
+> **设计演进（重要）**：早期版本曾强制 `EXPOSURE_AUTO=1`（手动）+ 曝光限幅 300 以"保帧率"（自动曝光在暗光下拉长曝光 → 帧率暴跌）。但真机实测发现：**该摄像头固件在强制手动曝光后进入异常状态**（输出黑帧、状态残留，退出程序后 `v4l2-ctl` 抓帧仍黑）。因此改为"**只查询、不写入**"——保留摄像头自动曝光，GUI 滑块仅反映当前值；用户若确实要调，通过滑块回调 `setControl` 手动触发（此时是用户主动行为，风险自担）。这是"**真机反馈修正设计假设**"的典型案例：理论上的"帧率反推曝光上限"在特定固件上失效，必须以实测为准。
 
 ### 潜在坑点
 
-- **自动曝光 vs 帧率的耦合**：暗光下自动曝光会把曝光时间拉长到几十毫秒，导致帧率从 30fps 掉到 10fps 甚至更低——因为"一帧的曝光时间 > 帧间隔"。main.cpp 强制手动曝光并限幅 300（UVC 驱动下 V4L2 曝光绝对值通常以 100µs 为单位，300 ≈ 30ms，小于 30fps 的 33ms 帧间隔，保证曝光完成且有富余）。这是"帧率需求反推曝光上限"的典型工程权衡。
+- **强制改曝光有固件风险**：早期"强制手动曝光保帧率"的方案被真机证伪——该 UVC 固件强制 `Exposure=300` 后输出黑帧且状态残留。**结论：不要想当然地写硬件参数，尤其曝光类控件，先用 `v4l2-ctl` 实测再决定**。当前代码只查询 + 更新 GUI，把"写"的决策权留给用户显式操作。
+- **自动曝光 vs 帧率的耦合（仍存在，只是不主动干预）**：暗光下自动曝光把曝光时间拉长（可能几十 ms），帧率会随之下降。这是硬件行为，应用层**记录并接受**（状态栏如实显示 Cap FPS），不再强行覆盖；若业务上必须保帧率，需换支持固定曝光的固件/摄像头，或在驱动层解决。
 - **控件互锁**：如自动白平衡开启时，手动色温 `WHITE_BALANCE_TEMPERATURE` 可能被驱动忽略。GUI 层需要互锁逻辑（main.cpp 注释提及"互锁逻辑"）。
 - **`setControl` 不校验返回值范围**：只做 ioctl 层面的失败处理；若驱动对超范围值静默钳制，日志里的 name 是"unknown"（QUERYCTRL 失败时）。
 
 ### 面试追问与应答
 
-**Q1：自动曝光为什么会导致帧率下降？你的解决思路是什么？**
-**A**：曝光时间是传感器"开门"时长，直接决定每帧的采集耗时。自动曝光在暗光下会把曝光时间拉到最大（可能 100ms+），于是帧间隔被曝光时间下限锁定，帧率自然掉到 <10fps。解决思路是"应用层对帧率有硬需求时，剥夺自动曝光的调节权"：启动时强制 `EXPOSURE_AUTO=1`（手动），并把绝对曝光值限幅在"目标帧间隔以内"（30fps → 曝光 ≤ 33ms 的量级）。这是"控制环路决策权在应用层"的设计——相机参数服务于业务目标（帧率/画质），而不是相反。
+**Q1：自动曝光为什么会导致帧率下降？你的解决方案是什么？**
+**A**：曝光时间是传感器"开门"时长，直接决定每帧的采集耗时。自动曝光在暗光下会把曝光时间拉到最大（可能 100ms+），帧间隔被曝光时间下限锁定，帧率自然掉到 <10fps。早期方案是"应用层剥夺自动曝光调节权"：强制 `EXPOSURE_AUTO=1`（手动）+ 限幅曝光 ≤ 帧间隔。但真机实测证明这条路在该固件上走不通——强制手动后摄像头输出黑帧且状态残留（`v4l2-ctl` 实证）。**最终方案是"只查询不写入"**：保留自动曝光，GUI 如实反映当前状态，把调节权交还用户显式操作。**核心教训**：理论推导（帧率反推曝光上限）必须经真机验证，硬件行为以实测为准；`v4l2-ctl` 是最重要的验证工具。
 
 **Q2：`queryControl` 返回的范围怎么用？为什么 GUI 要设置滑块范围？**
 **A**：不同摄像头驱动对同一控件（如亮度）的范围/步进/默认值完全不同（有的 0~255，有的 -64~64）。启动时 QUERYCTRL 拿到真实范围传给 GUI 设置滑块，才能保证"滑块的每个位置都是驱动接受的有效值"，避免设置无效值或滑块不可操作。这就是"设备驱动是事实来源，UI 是映射层"的原则。
@@ -1066,7 +1068,7 @@ if (targetExposure > 300) targetExposure = 300;
 **A**：V4L2 驱动的语义是：自动白平衡开启时，驱动根据场景自动调整增益和色温，手动 `WHITE_BALANCE_TEMPERATURE` 的写入会被忽略或被自动值覆盖。若不互锁，用户会看到"滑了没反应"，体验与状态都错乱。互锁方案：开启 AWB 时禁用色温滑块（GUI），关闭 AWB 时才允许手动色温，同时把当前状态回读同步到 UI。**凡是"硬件模式互斥"的控制项，UI 都要有对应的联动**。
 
 **Q4：`setControl` 返回成功是否代表值真的生效了？**
-**A**：不一定。`VIDIOC_S_CTRL` 成功只表示驱动接受了请求，但驱动可能：钳制到范围外相邻值、因当前模式忽略该控件（如自动模式下手动值无效）、延迟生效。严格验证应 `G_CTRL` 回读比对。本项目对曝光控件在初始化时做了"查询范围 → 读当前值 → 限幅 → 设置"的流程，并未严格回读比对；其余控件靠 GUI 滑块范围约束，属于性价比合适的信任边界。
+**A**：不一定。`VIDIOC_S_CTRL` 成功只表示驱动接受了请求，但驱动可能：钳制到范围外相邻值、因当前模式忽略该控件（如自动模式下手动值无效）、延迟生效。严格验证应 `G_CTRL` 回读比对。本项目对曝光控件只查询不写入，其余控件靠 GUI 滑块范围约束 + 回调后打日志，属于"信任驱动 + 日志可查"的边界。
 
 ---
 
@@ -1092,9 +1094,9 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 
 | 接口点 | 设计 | 解耦价值 |
 |--------|------|---------|
-| 模块间传递单元 | 统一的 `FrameBuffer`（`data/length/width/height/format/index/pool_index/timestamp`） | 生产/消费双方只需认识一种结构；`pool_index` 让归还缓冲 O(1) |
+| 模块间传递单元 | 统一的 `FrameBuffer`（`data/length/width/height/format/index/timestamp`） | 生产/消费双方只需认识一种结构；归还缓冲靠 `data` 指针反推 |
 | 生产-消费同步 | 深拷贝 + mutex + 条件变量 | 消费者拿到独立数据，无悬垂指针 |
-| 取帧路径 | 采集线程只做 O(1) 操作 | 慢消费者（网络拥塞、磁盘 IO）不阻塞取帧 |
+| 取帧路径 | 采集线程只做拷贝 + QBUF 等轻量操作 | 慢消费者（网络拥塞、磁盘 IO）不阻塞取帧 |
 | 格式路由 | `PixelFormat` 枚举 + 运行时分支（MJPEG 直通 / YUYV 先编码） | 编码策略可替换，消费方无感知 |
 | 控制反哺 | 回调（`gui.onXxxChanged`）→ capture 重配置 | UI 与采集解耦，通过协议联动 |
 
@@ -1130,7 +1132,7 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 **变化点**：帧间隔 33ms → 16.6ms，所有处理链路的每帧预算减半。
 
 **重构方案**：
-1. **曝光**：强制曝光上限从"≤33ms"改为"≤16ms"（`targetExposure > 150` 钳制），否则自动曝光会再次拉掉帧率。
+1. **曝光**：当前是"只查询不写入"（保留自动曝光），60fps 下若自动曝光拉低帧率，需评估是否强制手动曝光（受固件限制，须先 `v4l2-ctl` 实测验证）或换支持固定曝光的固件/摄像头。
 2. **缓冲池**：60fps 下处理抖动更容易耗尽 4 缓冲 → 缓冲数升到 6~8，或进一步压缩取帧路径延迟。
 3. **编码**：YUYV 模式 60fps 软编码 CPU 预算翻倍（每帧 25ms → 不够）→ 只能强制 MJPEG 模式（硬件直出，<1ms）。
 4. **网络**：60fps 的 MJPEG 码率近似翻倍，局域网内确认带宽余量；RTSP 时间戳/帧率参数同步更新（main.cpp 已有 `setStreamInfo` 联动）。
@@ -1199,7 +1201,7 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 
 ## 3.4 面试「一句话总结」
 
-> "camera 模块是整个系统的数据源头，我围绕三个原则设计它：**零拷贝**（V4L2 mmap 让 DMA 帧直达用户态）、**快进快出**（采集线程只做取帧-拷贝-归还三个 O(1) 操作，所有 CPU 重活在处理线程）、**生产消费解耦**（深拷贝 + 条件变量分发，一帧多路消费）。在这个基础上，用定点运算和 NEON 把颜色转换压到 ~5ms/帧，用 MJPEG 硬件直出实现推流零编码路径，最终让 792MHz 单核稳定跑 30fps、内存仅 8MB。
+> "camera 模块是整个系统的数据源头，我围绕三个原则设计它：**零拷贝**（V4L2 mmap 让 DMA 帧直达用户态）、**快进快出**（采集线程只做取帧-拷贝-归还三个轻量操作，所有 CPU 重活在处理线程）、**生产消费解耦**（深拷贝 + 条件变量分发，一帧多路消费）。在这个基础上，用定点运算和 NEON 把颜色转换压到 ~5ms/帧，用 MJPEG 硬件直出实现推流零编码路径，最终让 792MHz 单核稳定跑 30fps、内存仅 8MB。
 >
 > 后来我用 `[PERF]` 插桩做了量化分析，做了帧池零拷贝把显示链路拷贝降了 95%，但帧率没变——曾误判为解码瓶颈，**最终用 `v4l2-ctl` 直测确认真正瓶颈是摄像头硬件实际输出 10fps**（能力列表声称 30fps 但实际 10fps）。这段经历让我明白：单核嵌入式优化不能靠直觉猜，必须先插桩量化、再排除应用层、**最终用工具直测硬件供给能力**；判断瓶颈先问"CPU 有空闲时帧率提得上去吗"，提不上去就是硬件；多线程在单核上不是银弹（独立解码线程反而更卡，已回退）。如果需求变化，我会先做资源预算分析（CPU/内存/带宽/曝光时间 + 硬件帧率上限），再决定是调参、换算法还是换硬件——因为分辨率、帧率、格式从来不是独立的参数。"
 
@@ -1214,11 +1216,11 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 | 为什么必须回读 S_FMT 结果 | 驱动可能调整分辨率/格式，不回读会越界 |
 | 为什么 REQBUFS(0) | 释放驱动缓冲，否则 S_FMT 返回 EBUSY |
 | 为什么 getFrame/putFrame 成对 | 缓冲池租借模型，漏还 = 缓冲耗尽 = 采集冻结 |
-| 为什么 putFrame 能 O(1) 归还 | FrameBuffer.pool_index 直接记录槽位，免遍历反查 |
+| putFrame 怎么归还 | data 指针遍历反推槽位（O(n)，n≤4），配指针匹配校验；无 pool_index 字段 |
 | 为什么深拷贝再归还 | mmap 内存不能长期持有，深拷贝换确定性 |
 | 为什么定点不浮点 | 无浮点开销，且与 NEON 整数 SIMD 兼容 |
 | 为什么 NEON | 16 像素/轮 + vqmovun 免分支，实测 ~8× |
-| 为什么强制手动曝光 | 自动曝光在暗光下拉长曝光 → 帧率暴跌 |
+| 曝光怎么处理 | 只查询不写入（保留自动曝光）；早期强制手动曝光被真机证伪（固件黑帧），以 v4l2-ctl 实测为准 |
 | 为什么软件节流兜底 | 很多 UVC 的 S_PARM 不生效，软件隔帧采样最可靠 |
 | MJPEG vs YUYV | MJPEG 零编码但画质固定；YUYV 可软件处理但吃 CPU |
 | 显示解码要解码吗 | 本地显示必须 JPEG→RGB（libjpeg ~25ms）；推流/录像 MJPEG 直通零解码 |
@@ -1228,7 +1230,7 @@ g_state.frameData（mutex 保护 + 条件变量）   ← 分发枢纽
 | 判定瓶颈方法论 | CPU 有空闲但帧率提不上去 → 供给端（硬件）；能力列表 ≠ 实际输出，须 v4l2-ctl 直测 |
 | 换 CSI 怎么改 | 抽象 ICameraSource 工厂 + demosaic 管线 |
 | 升 4K 怎么改 | 内存/带宽/编码全爆表 → 预算分析反推硬件选型 |
-| 30→60fps 改什么 | 曝光上限减半、缓冲池扩容、强制 MJPEG、节流精度提高 |
+| 30→60fps 改什么 | 评估曝光策略（受固件限制）、缓冲池扩容、强制 MJPEG、节流精度提高 |
 
 ---
 
@@ -1424,7 +1426,7 @@ startCapture()
 
 **Q6：这套缓冲池是什么"租借模型"？**
 
-> 请求 N 个缓冲后全部入队（qbuf），驱动填一帧应用取一帧（dqbuf），处理完必须归还（qbuf）。漏还 = 队列耗尽 = 采集冻结。`getFrame`/`putFrame` 成对调用 + `pool_index` O(1) 归还，就是这个模型的工程落地。
+> 请求 N 个缓冲后全部入队（qbuf），驱动填一帧应用取一帧（dqbuf），处理完必须归还（qbuf）。漏还 = 队列耗尽 = 采集冻结。`getFrame`/`putFrame` 成对调用 + `data` 指针反推槽位归还，就是这个模型的工程落地。
 
 ### 一句话总结
 
@@ -1593,7 +1595,7 @@ if (ret == -EBUSY) {          // 设备正忙，提示"先停止再改格式"
 |--------|-----------|------|
 | `-ENODEV` | No such device | `m_fd < 0`，设备未打开/不是采集设备 |
 | `-EBUSY` | Device busy | 流未停止就调用 `setFormat` |
-| `-EINVAL` | Invalid argument | `putFrame` 传入非法 `pool_index` 或指针不匹配 |
+| `-EINVAL` | Invalid argument | `putFrame` 传入空指针/`data` 指针未命中缓冲池（指针不匹配） |
 | `-ENOMEM` | Out of memory | `REQBUFS` 分配的缓冲区不足 2 个 |
 | `-ETIMEDOUT` | Timeout | `select` 超时没等到新帧 |
 | `-EIO` | I/O error | 未在流状态下调用 `getFrame/putFrame` |
@@ -2149,7 +2151,7 @@ int VideoProcessor::encodeYUYVtoJPEG(const uint8_t* yuyv, int width, int height,
 
 ## 10.2 mmap 零拷贝 vs "main.cpp 拷贝"：矛盾吗？
 
-**不矛盾——mmap 省的是"从内核 DMA 缓冲到用户态"的搬运，而 `g_state.frameData.assign()` 是一次额外的、应用主动做的深拷贝。** 看 `main.cpp:782-793` 采集线程：
+**不矛盾——mmap 省的是"从内核 DMA 缓冲到用户态"的搬运，而 `g_state.frameData.assign()` 是一次额外的、应用主动做的深拷贝。** 看 `main.cpp:945` 采集线程：
 
 ```cpp
 // 拷贝帧数据到共享缓冲区（V4L2 mmap 内存不能长期持有）
@@ -2245,7 +2247,7 @@ i.MX6ULL 的 PXP 能在摄像头缓冲和 LCD 之间做 YUV→RGB + 缩放 + 合
 
 ### 核心权衡
 
-> 用一次 memcpy（几十微秒）换"缓冲占用极短 + 无锁多路消费 + 生命周期确定"。在 792MHz 单核上，614KB 的 `assign()` 约几十微秒，而 NEON 转 RGB 要 5ms——**把转换放在取帧路径上反而更贵**，所以把"拷贝"和"重活"都挪出采集线程，让采集线程保持 `getFrame → 拷贝 → putFrame` 三个 O(1) 操作。这就是 `main.cpp` 注释"采集线程仅做 getFrame → 拷贝 → putFrame，不阻塞在推流/录像上"的深层原因。
+> 用一次 memcpy（几十微秒）换"缓冲占用极短 + 无锁多路消费 + 生命周期确定"。在 792MHz 单核上，614KB 的 `assign()` 约几十微秒，而 NEON 转 RGB 要 5ms——**把转换放在取帧路径上反而更贵**，所以把"拷贝"和"重活"都挪出采集线程，让采集线程保持 `getFrame → 拷贝 → putFrame` 三个轻量操作（拷贝是 memcpy、putFrame 是 O(4) 反推 + 一次 QBUF ioctl）。这就是 `main.cpp` 注释"采集线程仅做 getFrame → 拷贝 → putFrame，不阻塞在推流/录像上"的深层原因。
 
 ## 10.4 面试一句话总结（本主题三连答）
 
@@ -2259,13 +2261,13 @@ i.MX6ULL 的 PXP 能在摄像头缓冲和 LCD 之间做 YUV→RGB + 缩放 + 合
 
 ## 11.1 两次拷贝在哪
 
-**拷贝 #1**：采集线程，`main.cpp:785`
+**拷贝 #1**：采集线程，`main.cpp:945`
 
 ```cpp
 g_state.frameData.assign(fb.data, fb.data + fb.length);  // mmap → g_state
 ```
 
-**拷贝 #2**：处理线程，`main.cpp:829`
+**拷贝 #2**：处理线程，`main.cpp:1003`
 
 ```cpp
 localFrame = g_state.frameData;   // g_state → 处理线程本地
@@ -2283,7 +2285,7 @@ localFrame = g_state.frameData;   // g_state → 处理线程本地
 
 ## 11.3 拷贝 #2 的原因：避免长时间持锁
 
-处理线程拿到帧后要做什么？看 `main.cpp:807` 起：**YUYV→JPEG 编码（~25ms CPU 重活）+ 推流 + 录像**。如果它直接在 `g_state.mtx` 锁内做这些：
+处理线程拿到帧后要做什么？看 `main.cpp:1019` 起：**YUYV→JPEG 编码（~25ms CPU 重活）+ 推流 + 录像**。如果它直接在 `g_state.mtx` 锁内做这些：
 
 ```cpp
 // 错误写法：锁内做重活

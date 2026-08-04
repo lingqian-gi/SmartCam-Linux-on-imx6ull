@@ -357,9 +357,10 @@ V4L2 dqbuf → mmap 帧                等 procCv 通知                      ep
 解码线程 (decodeThread)              GUI 线程 (Qt 主线程)
 =====================              ====================
   ├─ share() 最新原始帧              ├─ displayTimer(33ms)
-  ├─ MJPEG 解码 / YUYV→RGB24         │    └─ 拉 g_display → setFrame(RGB24)
-  └─ publish → g_display (RGB)       └─ m_refreshTimer(33ms)
+  ├─ MJPEG 解码 / YUYV→RGB24         │    └─ 拉 g_display → 解码/转换入槽 → setFrameShared
+  └─ publish → g_display (RGB)       └─ requestRefresh（发布后立即上屏，全局唯一驱动入口）
                                         └─ QImage 浅引用 → setPixmap → 上屏
+                                        （完全单驱动：真实模式=displayTimer，Mock=main 定时器）
 ```
 
 **线程同步**：
@@ -445,7 +446,7 @@ use_syslog = true
 | 运行内存（推流） | ~8 MB | 帧缓冲 + JPEG 拷贝 |
 | 相册峰值内存 | ~2.5 MB | 6 张可见缩略图 + 1 张全尺寸 |
 
-> **显示帧率上限**：本地预览受 `m_refreshTimer` 固定 33ms 节拍限制，最多 30fps（匹配 MJPEG 解码能力）；**推流/录像帧率不受此限制**，跟随采集目标帧率（最高 60fps）。升 720p 需先"解码移出 GUI 线程"（已完成）并评估 CPU。
+> **显示帧率上限**：本地预览受 `displayTimer` 固定 33ms 节拍限制，最多 30fps（匹配 MJPEG 解码能力）；**推流/录像帧率不受此限制**，跟随采集目标帧率（最高 60fps）。升 720p 需先"解码移出 GUI 线程"（已完成）并评估 CPU。显示采用完全单驱动：`requestRefresh()` 是唯一上屏入口（真实模式发布后立即上屏，Mock 模式由 main 定时器驱动彩条），无双定时器相位延迟。
 
 ---
 

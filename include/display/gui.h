@@ -62,6 +62,16 @@ public:
     void setFrameShared(FrameSlot* slot);
 
     /**
+     * @brief 立即将当前持有的最新帧上屏（显示刷新唯一驱动入口）
+     *
+     * 完全单驱动架构：CameraGUI 不再持有内部刷新定时器。
+     *   - 真实相机模式：main.cpp 的 displayTimer 在 setFrameShared 后调用本方法；
+     *   - Mock 模式：main.cpp 的 Mock 驱动定时器调用本方法（驱动彩条滚动）。
+     * 内部只是 refreshFrame 的公开入口，浅引用上屏开销几乎为零。
+     */
+    void requestRefresh();
+
+    /**
      * @brief 更新状态栏信息
      */
     void setFPS(double fps);        // 采集线程取帧速率 (Cap FPS)
@@ -160,9 +170,6 @@ private:
     QLabel*      m_labelStreaming  = nullptr;
     QLabel*      m_labelClients    = nullptr;
     QLabel*      m_labelRecording = nullptr;
-
-    // 定时器
-    QTimer*      m_refreshTimer   = nullptr;
 
     // ====== 设置对话框 ======
     QDialog*     m_settingsDialog  = nullptr;

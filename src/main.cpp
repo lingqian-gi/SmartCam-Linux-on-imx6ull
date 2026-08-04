@@ -1060,8 +1060,13 @@ int main(int argc, char* argv[]) {
         // 显示定时器（Qt 主线程，33ms ≈ 30fps）— 帧池零拷贝路径
         // ============================================================
         // 流程：借 rgb 槽 → 解码/转换入槽 → publish → share → setFrameShared
+        // → requestRefresh（发布后立即上屏）
         // 消除了旧路径的 2 次 RGB24 深拷贝（setFrame 内 assign + QImage.copy()）。
         // 解码仍在 GUI 线程（单核板上线程无并行收益，见 docs 实施指南 §2.3）。
+        //
+        // 完全单驱动：CameraGUI 无内部刷新定时器，上屏统一走 requestRefresh()。
+        // 本定时器在发布新帧后立即上屏——无任何相位延迟，且全项目只有一个驱动入口
+        // （Mock 模式复用同一入口，由下方 Mock 分支的定时器驱动彩条）。
         displayTimer = new QTimer(&gui);
         displayTimer->setInterval(33);
         // 显示 FPS 统计：每 30 次实际渲染一帧算一次平均（反映真正显示速率）
@@ -1128,6 +1133,9 @@ int main(int argc, char* argv[]) {
             if (displaySlot) {
                 gui.setFrameShared(displaySlot);   // GUI 接管此引用
             }
+            // 5. 发布后立即上屏（浅引用 setPixmap，近乎零开销）
+            //    完全单驱动：requestRefresh 是全局唯一上屏入口，无相位延迟
+            gui.requestRefresh();
 
             // 统计实际显示 FPS（每 30 次成功渲染一帧算一次平均）
             dispFpsCount++;
@@ -1354,6 +1362,16 @@ int main(int argc, char* argv[]) {
         gui.onFormatChanged([](PixelFormat fmt) {
             qDebug() << "[Main] 格式变更:" << static_cast<int>(fmt);
         });
+
+        // ---- Mock 显示驱动（完全单驱动：复用 requestRefresh 入口）----
+        // CameraGUI 已无内部刷新定时器，此处用与真实模式相同的 requestRefresh()
+        // 驱动 Mock 彩条滚动（refreshFrame 内 m_mockMode 分支），全项目单一驱动入口。
+        displayTimer = new QTimer(&gui);
+        displayTimer->setInterval(33);
+        QObject::connect(displayTimer, &QTimer::timeout, [&gui]() {
+            gui.requestRefresh();   // Mock 彩条滚动上屏
+        });
+        displayTimer->start();
 
         // 启动 TCP 控制服务器（Mock 模式：仅心跳 + 状态查询可用）
         controlSrv = new ControlServer();
