@@ -20,6 +20,7 @@
    - 1.7 C++ 内存序（memory_order）详解
 2. [第二部分 线程编排与配置解析](#第二部分-线程编排与配置解析)
    - 2.1 六线程模型
+     - 2.1.1 线程的开启、关闭与管理（含控制线程代码）
    - 2.2 配置三级优先级
    - 2.3 命令行解析详解（QCommandLineParser）
    - 2.4 回调注入（业务编排）
@@ -1112,6 +1113,170 @@ s->refs.fetch_sub(1, std::memory_order_release);     // release() 里
 - **采集线程只做轻活**：取帧/拷贝/归还三个操作，把"编码、推流、写盘"等重活全部下沉到处理线程——避免慢客户端/磁盘 IO 阻塞取帧导致 4 缓冲耗尽（V4L2 缓冲池租借模型）
 - **RTSP/控制各自独立线程**：互不阻塞，都是 `epoll` 单线程事件循环
 - **退出协调**：`g_state.running=false` + `procCv.notify_all()` 唤醒处理线程 → 各线程 join → 资源清理
+
+### 2.1.1 线程的开启、关闭与管理（含控制线程代码）
+
+> 面试高频："线程怎么优雅退出？为什么先 stop 再 join？"这一节讲透线程生命周期管理，重点给控制线程的完整代码。
+
+#### ① 总体框架：三种线程管理模式
+
+| 线程 | 创建方式 | 退出机制 | 管理方式 |
+|------|---------|---------|---------|
+| **采集/处理线程** | `std::thread` + lambda | **标志位**（`g_state.running`）+ 条件变量唤醒 | 主线程 join |
+| **RTSP/控制线程** | `std::thread` + lambda | **对象内部停止**（`stop()` 关闭 fd → 中断事件循环） | 主线程 join |
+| **HTTP 客户端线程** | 服务内部 detach | 连接断开自然退出 | **不 join**（detach） |
+
+**核心思想**：**每个线程都有一个"让它退出"的机制**，主线程通过 `join()` 等待它真正结束，再释放资源。这是"优雅关闭"的关键。
+
+#### ② 控制线程的完整生命周期（重点）
+
+**1. 开启**（`main.cpp:858-865`）：
+
+```cpp
+// 启动控制线程（ControlServer::start 内部是阻塞事件循环）
+controlThread = new std::thread([controlSrv, ctrlPort]() {
+    LOG_INF("Control thread starting on port %d", ctrlPort);
+    controlSrv->start(ctrlPort);     // ← 阻塞直到 stop() 被调用
+    LOG_INF("Control thread exited"); // ← start 返回后打印
+});
+// 给控制线程一点时间启动
+std::this_thread::sleep_for(std::chrono::milliseconds(200));
+```
+
+要点：`new std::thread(lambda)` 创建后立即执行；lambda 捕获 `controlSrv`（堆对象指针）和 `ctrlPort`（值）；**`controlSrv->start()` 是阻塞调用**（内部进入 `eventLoop()` 死循环）；`sleep_for(200ms)` 给线程时间完成 socket 创建和 epoll 注册。
+
+**2. start() 内部**（`control.cpp:186-231`）：
+
+```cpp
+int ControlServer::start(int port) {
+    if (m_running) { ... return 0; }   // 幂等：已运行则返回
+    m_port = port;
+
+    int fd = createSocket(port);       // ① 创建监听 socket
+    if (fd < 0) return -1;
+    m_server_fd = fd;
+
+    m_epoll_fd = epoll_create1(EPOLL_CLOEXEC);   // ② 创建 epoll 实例
+    if (m_epoll_fd < 0) { ::close(m_server_fd); ...; return -1; }
+
+    ev.events  = EPOLLIN | EPOLLET;    // ③ server fd 加入 epoll（边缘触发）
+    ev.data.fd = m_server_fd;
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_server_fd, &ev) < 0) { ...; return -1; }
+
+    m_running = true;
+    LOG_INF("ControlServer started on port %d (epoll ET)", port);
+
+    eventLoop();                       // ④ 进入事件循环（阻塞，直到 stop()）
+    return 0;
+}
+```
+
+要点：`start()` 分两阶段——**准备阶段**（建 socket、建 epoll、注册 fd）和**运行阶段**（`eventLoop()` 死循环 `while(m_running) { epoll_wait(...) }`）。关键：`eventLoop()` 是**在 controlThread 线程内执行**的（因为 `start()` 被该线程调用），所以"控制服务"就是这一个线程在跑整个事件循环。
+
+**3. stop() 内部**（`control.cpp:233-263`）：
+
+```cpp
+void ControlServer::stop() {
+    if (!m_running) return;          // 幂等
+    m_running = false;               // ① 置标志（让 while 条件下次为 false）
+
+    if (m_epoll_fd >= 0) {
+        ::close(m_epoll_fd);         // ② 关键：关闭 epoll fd 中断 epoll_wait()
+        m_epoll_fd = -1;             //    （阻塞中的 epoll_wait 返回 EBADF）
+    }
+    if (m_server_fd >= 0) {          // ③ 关闭 server socket，停止接受新连接
+        ::close(m_server_fd);
+        m_server_fd = -1;
+    }
+    {                                // ④ 关闭所有客户端连接
+        std::lock_guard<std::mutex> lock(m_clientsMtx);
+        for (auto& pair : m_clients)
+            if (pair.second.fd >= 0) ::close(pair.second.fd);
+        m_clients.clear();
+    }
+}
+```
+
+**stop() 做 4 件事，每件都有明确目的**：
+1. `m_running = false`：让 `eventLoop()` 的 while 条件在下次检查时为 false
+2. **`::close(m_epoll_fd)`**：这是"解锁"的关键——如果线程阻塞在 `epoll_wait()`，关闭 fd 让它立即返回 EBADF，从而跳出循环。**不关 fd 线程会一直睡到 epoll_wait 超时（最长 30s 心跳间隔）才醒来，join 会卡住**
+3. `::close(m_server_fd)`：停止接受新连接
+4. 关闭所有客户端连接：断开已连接的客户端
+
+**4. 主线程的关闭序列**（`main.cpp:1451-1460`）：
+
+```cpp
+if (controlSrv) {
+    controlSrv->stop();                        // ① 先 stop（打断阻塞）
+}
+if (controlThread && controlThread->joinable()) {
+    controlThread->join();                     // ② 再 join（等线程真正结束）
+    delete controlThread;                      // ③ 释放线程对象
+}
+if (controlSrv) {
+    delete controlSrv;                         // ④ 释放服务对象
+}
+```
+
+**标准三步关闭**：
+1. **`stop()`**：设置退出条件 + 打断阻塞（关闭 fd）
+2. **`join()`**：主线程**阻塞等待** controlThread 真正结束（`start()` 返回后 lambda 退出）
+3. **`delete`**：释放 `std::thread` 对象和服务对象
+
+**为什么顺序不能乱？**
+- 不先 `stop()` 直接 `join()`：控制线程永远阻塞在 `epoll_wait`，`join()` 永不返回 → **主线程挂死**
+- stop 了不 join 就 delete：`std::thread` 析构时若仍 joinable 会 `std::terminate()` 崩溃
+
+#### ③ 对比：采集/处理线程的关闭方式
+
+采集/处理线程用**标志位 + 条件变量**而非"关 fd"：
+
+```cpp
+// 采集线程（main.cpp:883-890）
+while (g_state.running) {          // ← 标志位控制
+    if (g_state.paused) { ... }
+    if (capture->getFrame(&fb, 1000) < 0) {   // select 有 1s 超时
+        if (!g_state.running) break;          // 超时后检查标志退出
+        continue;
+    }
+    ...
+}
+
+// 主线程关闭（main.cpp:1422-1433）
+g_state.running = false;            // ① 置标志
+g_state.procCv.notify_all();        // ② 唤醒处理线程（可能阻塞在条件变量）
+if (captureThread && captureThread->joinable()) {
+    captureThread->join();          // ③ join
+    delete captureThread;
+}
+```
+
+| | 控制/RTSP 线程 | 采集/处理线程 |
+|---|---|---|
+| 阻塞在哪 | `epoll_wait`（可能很久） | `getFrame`（select 1s 超时）/ `procCv.wait` |
+| 退出触发 | `stop()` 关闭 fd → epoll_wait 返回 | `running=false` → 循环条件 / 条件变量唤醒 |
+| 打断阻塞的方式 | **关闭 fd**（EBADF） | **超时兜底**（1s）/ **notify_all**（唤醒） |
+| 优雅性 | 立即退出 | 最迟 1s 退出（getFrame 超时） |
+
+#### ④ 线程管理的通用原则（面试核心）
+
+```
+创建：  new std::thread(lambda)  → 立即执行
+       （或先构建对象，线程里调用对象的阻塞方法）
+运行：  线程内执行阻塞事件循环 / 工作循环
+停止：  ① 设置退出条件（标志 / 对象 stop）
+        ② 打断阻塞（关 fd / notify / 超时兜底）
+        ③ join() 等待真正结束
+        ④ delete 释放
+```
+
+**三个必须回答的问题**：
+1. **怎么让线程退出？** 标志位（`m_running`）+ 打断阻塞的手段
+2. **为什么先 stop 再 join？** 不 stop 线程退不出（阻塞在 epoll_wait），join 永不返回
+3. **为什么 joinable 才 join？** `joinable()` 检查线程是否还在运行，避免对已结束/未启动的线程 join 抛异常；且 `std::thread` 析构时若仍 joinable 会 `std::terminate`，所以必须 join 或 detach 后才能 delete
+
+**面试一句话**：
+> "线程管理分创建、运行、停止、回收四阶段：用 `new std::thread(lambda)` 创建（lambda 内调用服务的阻塞 `start()`）；停止时**先设退出标志 + 打断阻塞**（控制线程靠 `stop()` 关闭 epoll fd 使 `epoll_wait` 返回 EBADF，采集线程靠 `running=false` + 1s 超时兜底），**再 `join()` 等线程真正结束，最后 `delete`**。控制线程的完整关闭是 `controlSrv->stop()` → `controlThread->join()` → `delete`，顺序不能乱——不 stop 直接 join 会挂死，不 join 就 delete 会 `std::terminate`。核心是'每个阻塞调用都要有对应的打断手段'，这是优雅关闭的本质。"
 
 ## 2.2 配置三级优先级
 
