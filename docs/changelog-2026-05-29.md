@@ -11,7 +11,7 @@
 
 Gallery 模块原先仅支持**逐条删除**照片/视频（在全屏查看模式下点删除按钮）。当相册中媒体文件积累较多时（>50 条），逐条删除效率极低，用户体验差。
 
-> 此需求来自项目待办文档 `docs/09-gallery-module-implementation.md` §十五："多选删除（全选/反选 + 批量删除）"。
+> 此需求来自项目待办文档 `docs/learn/09-gallery-module-implementation.md` §十五："多选删除（全选/反选 + 批量删除）"。
 
 ### 2. 解决方案
 
@@ -305,9 +305,9 @@ SmartCam 运行在嵌入式 linuxfb（Qt for Embedded Linux，无 X11/Wayland）
 | `include/display/gui.h` | +2 行 | 新增 `setDisplayFPS()` / `m_labelDisplayFPS` |
 | `src/display/gui.cpp` | +8 行 | 双 FPS 标签 + `setDisplayFPS()` 实现 |
 | `src/main.cpp` | +20 行 | 显示定时器内计算软件帧率 |
-| `docs/01-display-module-implementation.md` | ~3 处 | 双 FPS 说明 |
+| `docs/learn/01-display-module-implementation.md` | ~3 处 | 双 FPS 说明 |
 | `CODE_WALKTHROUGH.md` | ~3 处 | 双 FPS 说明 |
-| `docs/11-framerate-control-implementation.md` | ~1 处 | 三层帧率更新为四层 |
+| `docs/learn/11-framerate-control-implementation.md` | ~1 处 | 三层帧率更新为四层 |
 
 ---
 

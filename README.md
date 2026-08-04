@@ -413,7 +413,7 @@ use_syslog = true
 
 **支持的命令**：拍照 (0x01)、开始/停止录像 (0x02/0x03)、设置分辨率 (0x10)、设置格式 (0x11)、查询状态 (0x20)、心跳 (0xFF)。
 
-详见：`docs/05-control-module-implementation.md`
+详见：`docs/learn/05-control-module-implementation.md`
 
 ---
 

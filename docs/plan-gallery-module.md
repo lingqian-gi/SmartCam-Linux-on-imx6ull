@@ -325,7 +325,7 @@ QVBoxLayout
 | `src/display/gui.cpp` | 修改 | 集成相册按钮 + QStackedWidget 布局调整 (~80行) |
 | `src/main.cpp` | 修改 | 将 `g_storage` 指针传给 `PhotoGallery` (~5行) |
 | `CMakeLists.txt` | 修改 | 新增 `gallery.cpp` / `gallery.h` 到 DISPLAY_SOURCES |
-| `docs/09-gallery-module-implementation.md` | **新增** | 相册模块实现文档 |
+| `docs/learn/09-gallery-module-implementation.md` | **新增** | 相册模块实现文档 |
 
 **预估总代码增量：~850 行**
 
@@ -389,7 +389,7 @@ QVBoxLayout
 - 真实照片文件测试（拷贝几张大/小 JPEG 到 `/data/photos`）
 - 删除功能验证
 - 空目录、大量文件边界测试
-- 编写 `docs/09-gallery-module-implementation.md`
+- 编写 `docs/learn/09-gallery-module-implementation.md`
 
 ---
 

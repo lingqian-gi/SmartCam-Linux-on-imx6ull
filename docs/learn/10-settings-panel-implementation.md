@@ -673,7 +673,7 @@ cmake ../.. && make -j$(nproc)
 
 ### 8.1 曝光控制实现
 
-> 参见 `docs/11-framerate-control-implementation.md` §9.7 — 曝光控制面板完整实现。
+> 参见 `docs/learn/11-framerate-control-implementation.md` §9.7 — 曝光控制面板完整实现。
 
 在 Camera Controls 分组中新增了曝光控制行（Auto Exposure 复选框 + Exposure 滑块），实现逻辑与白平衡控制对称：
 
@@ -699,7 +699,7 @@ static constexpr uint32_t V4L2_CID_EXPOSURE_ABSOLUTE = 0x009a0902;
 
 ### 8.2 帧率控制引用
 
-> 参见 `docs/11-framerate-control-implementation.md` — 帧率控制完整设计与调试验证。
+> 参见 `docs/learn/11-framerate-control-implementation.md` — 帧率控制完整设计与调试验证。
 
 Settings 弹窗的 Camera Controls 分组末尾新增 Framerate 滑块，运行时动态调整 V4L2 采集帧率。核心交互：
 

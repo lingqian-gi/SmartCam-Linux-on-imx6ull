@@ -2234,4 +2234,4 @@ lastSelfCpu = selfCpu;
 
 ---
 
-*本文档基于 SmartCam-Linux-on-imx6ull 项目源码（commit: main 分支），聚焦 `src/main.cpp` 的全局状态、线程编排、配置解析与三个核心函数（readSelfCpuJiffies / readSelfRssKB / [PERF] 插桩）。配合阅读：`docs/learn/面试复习-camera模块.md`（采集/处理线程下游）、`docs/learn/面试复习-display模块.md`（displayTimer 上游）、`docs/debug-summary.md` #27（瓶颈排查实录）。*
+*本文档基于 SmartCam-Linux-on-imx6ull 项目源码（commit: main 分支），聚焦 `src/main.cpp` 的全局状态、线程编排、配置解析与三个核心函数（readSelfCpuJiffies / readSelfRssKB / [PERF] 插桩）。配合阅读：`docs/interview/面试复习-camera模块.md`（采集/处理线程下游）、`docs/interview/面试复习-display模块.md`（displayTimer 上游）、`docs/debug-summary.md` #27（瓶颈排查实录）。*
