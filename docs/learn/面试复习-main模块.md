@@ -518,6 +518,145 @@ V4L2 缓冲到 `g_state` 的**原始帧拷贝省不掉**（JPEG 小，~0.1MB，�
 **Q4：两者各自解决什么问题？一句话？**
 **A**：V4L2 缓冲解决"**怎么高效地从硬件拿帧**"（mmap 零拷贝 + 租借周转）；FramePool 解决"**怎么高效地把帧分发给显示**"（引用计数共享 + 零拷贝上屏）。`g_state` 是连接两者的"所有权过渡带"。
 
+### 1.5.8 数据旅程：拷贝与引用完整清单
+
+> 面试高频："摄像头数据从硬件到各消费端，到底发生了几次拷贝、几次引用？"这一节给出完整清单，并**特别澄清"显示链路零拷贝"的准确边界**（易错点，见 1.5.8.3）。
+
+#### ① 总体结论
+
+从摄像头到各消费端，数据共发生 **4 次深拷贝（memcpy）+ 多次引用（零拷贝共享）**。核心规律：**拷贝都在"线程边界 + 所有权转移"处，引用都在"同一份数据被多端共享"处**。
+
+#### ② 全景图（一次采集，多路分发）
+
+```
+摄像头 DMA
+   │
+   ▼
+① V4L2 mmap 缓冲区（内核, JPEG/YUYV）          ← 引用#0：DMA 直写，getFrame 拿到指针（零拷贝）
+   │
+   │  拷贝#1（采集线程, 必须）
+   ▼
+② g_state.frameData（用户态, 原始帧）
+   │
+   ├─┬──────────────────────────────────────────────┐
+   │ │                                              │
+   │ 拷贝#2（处理线程）                             │  拷贝#4（displayTimer）
+   ▼                                              │  ▼
+③ localFrame（处理线程本地）                      │  ⑤ raw（GUI 线程临时）
+   │                                              │  │
+   ├─ MJPEG 直通（引用，无拷贝，见下）              │  解码直写（无拷贝）
+   ├─ YUYV 模式：编码为 JPEG（编码自身开销）         │  ▼
+   │                                              │  ⑥ FramePool 槽（RGB24）
+   ▼                                              │  │
+  ④ 各服务器内部                                    │  share（引用#1）
+   │                                              │  ▼
+   ├─ HTTP: m_currentFrame.assign（拷贝#3a）       │  GUI m_heldSlot 持有（引用#2）
+   ├─ RTSP: m_latestJpeg.assign（拷贝#3b）         │  │
+   ├─ 录像: fwrite 直写磁盘（无内存拷贝）           │  QImage 浅引用（引用#3）
+   └─ RTP 分片: sendto 直发（无拷贝）               │  │
+                                                  ▼
+                                               ⑦ QPixmap::fromImage（上屏拷贝#5）
+```
+
+#### ③ 逐个环节明细
+
+**引用环节（零拷贝，不搬数据）**：
+
+| 环节 | 类型 | 代码 | 说明 |
+|------|------|------|------|
+| ① DMA → mmap | **引用#0** | `buf->data = m_buffers[vbuf.index].start`（capture.cpp:470） | DMA 硬件直写，getFrame 直接拿指针，**无拷贝** |
+| ⑥ 池槽 → GUI | **引用#1** | `g_rgbPool->share()` → `setFrameShared` | 引用计数共享，GUI 持 refs |
+| GUI 持有槽 | **引用#2** | `m_heldSlot = slot` | 生命周期由引用计数保证 |
+| 槽 → QImage | **引用#3** | `QImage(m_currentFrame.data, ...)` 不 `.copy()` | 浅引用池槽内存 |
+
+**拷贝环节（4 次深拷贝 + 1 次上屏拷贝）**：
+
+| 环节 | 类型 | 代码 | 为什么必须 |
+|------|------|------|-----------|
+| ② mmap → g_state | **拷贝#1** | `g_state.frameData.assign(fb.data, ...)`（main.cpp:945） | V4L2 缓冲会被硬件覆盖，必须深拷贝后才 `putFrame` 归还 |
+| ③ g_state → localFrame | **拷贝#2** | `localFrame = g_state.frameData`（main.cpp:1003） | 处理线程要锁外做重活，必须拷出后快速释放锁 |
+| ④a → HTTP | **拷贝#3a** | `m_currentFrame.assign(data, data+len)`（mjpeg_server.cpp:255） | 服务器要等所有客户端就绪，需存副本 |
+| ④b → RTSP | **拷贝#3b** | `m_latestJpeg.assign(...)`（rtsp_server.cpp:762） | 同上，供新客户端 join 用 |
+| ⑤ g_state → raw | **拷贝#4** | `raw = g_state.frameData`（main.cpp:1087） | displayTimer 短锁拷贝，避免持锁解码 |
+| ⑦ 上屏 | **拷贝#5** | `QPixmap::fromImage(img)`（gui.cpp） | linuxfb 上屏物理必需 |
+
+**无拷贝环节（直接透传）**：
+
+| 环节 | 代码 | 说明 |
+|------|------|------|
+| HTTP 直发 | `write(client_fd, jpeg, len)` | 从 `m_currentFrame` 直接发给客户端 |
+| RTSP RTP 分片 | `rtpSendFrame(ci, jpeg_data, len, ...)` → `sendto` | 直接从传入指针分片发送 |
+| 录像写盘 | `fwrite(jpeg_data, 1, len, m_recordFile)`（manager.cpp） | 直接从 `localFrame` 写磁盘 |
+
+#### ④ 为什么拷贝都在"线程边界 + 所有权转移"处？
+
+```
+采集线程 → g_state     ：所有权转移（mmap 借来的内存必须归还）
+g_state → 处理线程      ：锁竞争（锁内只拷 1ms，锁外做 25ms 编码）
+g_state → displayTimer ：锁竞争（短锁拷贝，锁外解码）
+服务器内部 assign      ：多客户端等待（存副本供 join）
+```
+
+**每条拷贝都有一个明确的"为什么不能省"的理由**——不是冗余拷贝，而是并发/所有权模型的必要代价。
+
+#### ⑤ ⚠️ 重点澄清："显示链路零拷贝"的准确边界（易错点）
+
+> **误区**："帧池让显示链路零拷贝"——这句话**不严谨**。因为显示链路还有 `g_state → raw` 这次 JPEG 拷贝。
+
+**准确说法**：帧池消除的是 **RGB24 数据的 2 次深拷贝**，而不是"整个显示链路没有任何拷贝"。
+
+关键：**要区分"谁被拷了"**。显示链路里有两种数据：
+
+| 数据 | 旧路径 | 帧池路径 | 帧池是否改变 |
+|------|--------|---------|-------------|
+| **JPEG 原始帧**（g_state → raw） | 拷贝 1 次 | 拷贝 1 次 | **不变**（都是 1 次） |
+| **RGB24**（解码结果） | setFrame.assign + QImage.copy() = **拷 2 次** | 解码直写池槽 + QImage 浅引用 = **拷 0 次** | **省掉 2 次** |
+
+```
+旧路径：g_state → raw（JPEG拷）→ 解码 → RGB24拷1(setFrame.assign) → RGB24拷2(QImage.copy()) → 上屏
+帧池：  g_state → raw（JPEG拷）→ 解码直写池槽 → share引用 → QImage浅引用 → 上屏
+         │                                                               │
+         └─ 这1次拷贝在优化前后都存在                                └─ 省掉的2次
+```
+
+**为什么 raw 的 JPEG 拷贝"消不掉"**：
+1. `g_state.frameData` 是**采集线程随时覆盖**的最新帧（`g_state.mtx` 保护）
+2. 解码要花 25ms，**不可能持锁 25ms**（会把采集线程卡死）
+3. 所以必须短锁拷出 raw，锁外解码
+
+**两个独立维度的优化**：
+- **raw 拷贝** = 线程安全/锁竞争的代价（不可省）
+- **RGB 拷贝** = 数据搬运的冗余（帧池省掉了）
+
+**代码证据**（[PERF] 注释，main.cpp）：
+
+```cpp
+// [PERF] ③④ 已消除：解码直接写池槽（零拷贝），不再有 setFrame assign / QImage.copy()
+// [PERF] 本函数 raw = g_state.frameData 是一次原始帧拷贝（JPEG ~0.1MB），计入
+g_perf.copyBytes += raw.size();   // ← raw 拷贝仍在统计
+```
+
+`copyBytes` 统计里 **raw 那次拷贝一直算着**，只有"③④ RGB 两次拷贝"被标记为"已消除"。
+
+**准确表述（面试直接用）**：
+> "帧池优化 = **显示链路的 RGB24 零拷贝**（解码直写池槽 + QImage 浅引用，RGB24 全程 0 次深拷贝）；但显示链路整体仍有 **1 次 JPEG 原始帧拷贝**（g_state → raw），它是线程安全/锁竞争的必然代价，不属于帧池优化目标，优化前后都存在。"
+
+#### ⑥ 一次采集的总账（面试手算）
+
+**MJPEG 模式，无 HTTP/RTSP 客户端，有显示**：
+
+```
+mmap 指针 → g_state（拷贝#1：JPEG ~0.1MB）
+g_state → localFrame（拷贝#2）
+g_state → raw（拷贝#4，仅显示时）
+= 每帧 3 次深拷贝（JPEG 量级）+ 显示 RGB24 零拷贝（引用）
+```
+
+有网络客户端时再加 HTTP/RTSP 各 1 次 assign（拷贝#3a/3b）。
+
+**一句话总结**：
+> "摄像头数据从硬件到各消费端共发生 **4 次深拷贝 + 多次零拷贝引用**：mmap 拿到 DMA 指针是引用（零拷贝），随后采集线程为归还缓冲深拷贝到 g_state（拷贝#1）、处理线程为快速释放锁拷到 localFrame（拷贝#2）、displayTimer 短锁拷到 raw（拷贝#4）、HTTP/RTSP 服务器为多客户端 join 各存一份副本（拷贝#3a/3b），上屏还有一次物理必需的 QPixmap 拷贝。**引用集中在帧池显示链路**——解码直写池槽、share 引用、QImage 浅引用，RGB24 全程零深拷贝。核心规律：**拷贝发生在'线程边界 + 所有权转移'处，是并发模型的必要代价；引用发生在'同一数据多端共享'处，是零拷贝优化的主战场**。注意'显示链路零拷贝'是**限定 RGB24 数据**的说法，JPEG raw 的 1 次拷贝仍存在（1.5.8 ⑤）。"
+
 ## 1.6 FramePool 四方法详解（acquire / share / release / publish）
 
 > 面试高频：四个方法怎么配合？为什么不用锁？核心一句话——**这是"数据共享"而非"数据搬移"**：不拷贝帧数据，而是通过引用计数让多线程共享同一块内存。四方法是这套共享机制的四把钥匙。
