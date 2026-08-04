@@ -13,6 +13,7 @@
    - 1.1 脑图式结构
    - 1.2 职责边界
    - 1.3 全局状态设计
+     - 1.3.4 unique_lock vs lock_guard（锁管理器对比）
    - 1.4 代码结构与关系全景图
    - 1.5 V4L2 缓冲与 RGB 帧池的关系
    - 1.6 FramePool 四方法详解（acquire / share / release / publish）
@@ -23,6 +24,8 @@
    - 2.3 命令行解析详解（QCommandLineParser）
    - 2.4 回调注入（业务编排）
    - 2.5 三个相机回调的区别（onCameraControlChanged / onResolutionChanged / onFormatChanged）
+   - 2.6 onResolutionChanged 深入：paused vs stopCapture 与双线程握手
+   - 2.7 wait_until 详解：原型、参数与使用
 3. [第三部分 核心函数深度解析](#第三部分-核心函数深度解析)
    - 3.1 readSelfCpuJiffies() —— 进程 CPU 时间读取
    - 3.2 readSelfRssKB() —— 进程内存占用读取
@@ -118,6 +121,83 @@ FramePool* g_rgbPool = nullptr;
 ```
 
 `FramePool` 是 header-only 的帧池（`include/common/frame_pool.h`），用**引用计数 + 原子指针**实现无锁双缓冲。main.cpp 负责创建（`new FramePool(2)`），displayTimer 做生产者（解码入槽 → publish），GUI 做消费者（share → 浅引用上屏）。
+
+### 1.3.4 unique_lock vs lock_guard（锁管理器对比）
+
+> 面试高频：为什么同一个项目里 `g_state.pauseMtx` 用 unique_lock、`g_state.mtx` 用 lock_guard？核心一句话——**lock_guard 是"最小可用"的 RAII（不能中途解锁），unique_lock 是"功能完整"的 RAII（加解锁时机完全可控，且是条件变量 wait 的唯一合法搭配）**。
+
+**两处实际用法**：
+
+```cpp
+// 用法 1：unique_lock（main.cpp:1209，暂停握手）
+{
+    std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+    g_state.pauseCv.wait_until(lk,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+        [] { return g_state.pausedAck.load(); });
+}
+
+// 用法 2：lock_guard（main.cpp:944，帧数据保护）
+{
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    g_state.frameData.assign(fb.data, fb.data + fb.length);
+    ...
+}
+```
+
+**详细对比**：
+
+| 维度 | `lock_guard` | `unique_lock` |
+|------|-------------|---------------|
+| RAII 自动管理 | ✅ 构造加锁、析构解锁 | ✅ 同样自动 |
+| 手动解锁 | ❌ 不能 | ✅ `lk.unlock()` |
+| 重新加锁 | ❌ 不能 | ✅ `lk.lock()` |
+| 延迟加锁 | ❌ 构造即锁 | ✅ `defer_lock` 先构造后加锁 |
+| 尝试加锁 | ❌ 不能 | ✅ `try_lock()` 非阻塞尝试 |
+| 配合条件变量 | ❌ 不行 | ✅ **必须**（`wait` 需要它） |
+| 移动语义 | ❌ 不能移动 | ✅ 可移动（转移锁所有权） |
+| 内部开销 | 轻（无额外状态） | 稍重（维护一个标志位） |
+
+**为什么条件变量 `wait` 必须用 `unique_lock`？**（最关键的考点）
+
+`wait` 内部要做三件事：
+1. 检查条件（`pausedAck` 是否已置位）
+2. **不满足 → 原子地"解锁 + 睡眠"**（两步合并，避免丢失唤醒）
+3. 被唤醒 → **重新加锁**，再检查条件
+
+问题来了：`wait` 需要在睡眠期间**解锁**、醒来后**重新加锁**——这要求锁对象支持"手动解锁 + 重新加锁"。而 **`lock_guard` 没有 `unlock()`/`lock()` 接口**，所以编译器直接拒绝：
+
+```cpp
+std::lock_guard<std::mutex> lk(mtx);
+cv.wait(lk, ...);   // ❌ 编译错误：lock_guard 不能被 wait 使用
+```
+
+- **为什么不能锁着等？** 如果 `wait` 不解锁就睡眠，持有锁的线程一直占着 `g_state.pauseMtx`——主线程 `notify_one()` 时需要拿同一把锁通知，被卡死 → **死锁**。所以 `wait` 必须能在睡眠前释放锁。
+- **为什么"解锁+睡眠"要原子？** 如果先解锁、再睡眠，中间有空隙：主线程可能在这个空隙里 `notify_one()`，而睡眠线程还没开始等——**唤醒信号丢失**，线程永远等不到。`wait` 内部把"解锁+睡眠"做成原子操作，从根上避免这个经典 bug。
+
+**结合项目理解"为什么这么选"**：
+
+- **场景 A：`pauseCv.wait_until`（必须 unique_lock）**——等待期间必须**释放锁**（否则 notify 方卡死）、等待结束必须**重新持锁**（继续访问 g_state）。只有 `unique_lock` 能满足 → **没得选**。
+- **场景 B：`g_state.mtx` 保护帧数据（lock_guard 足够）**——进临界区 → 改数据 → 出临界区，**全程不需要中途解锁**。`lock_guard` 语义正好："进了就别走，走了就别回"，更轻量、意图更明确。
+
+**工程原则**：**能用 `lock_guard` 就不用 `unique_lock`**——`lock_guard` 意图清晰（纯临界区）、开销小；只有真正需要"解锁/重锁/条件等待"时才升级到 `unique_lock`。这是 Google C++ Style 等规范的常见建议。
+
+**补充：unique_lock 的 defer_lock / try_lock 用法**（项目没用，面试常追问）：
+
+```cpp
+std::unique_lock<std::mutex> lk(mtx, std::defer_lock);  // 延迟加锁：先构造空锁
+if (needLock) lk.lock();                                // 条件满足才加锁
+
+std::unique_lock<std::mutex> lk(mtx, std::try_to_lock); // 尝试加锁（非阻塞）
+if (lk.owns_lock()) { /* 拿到锁 */ } else { /* 没拿到，去做别的事 */ }
+
+lk.unlock();     // 手动解锁后做事（不占锁）
+// ... 长时间计算，不阻塞别人 ...
+lk.lock();       // 需要时再锁
+```
+
+**面试一句话**：
+> "lock_guard 和 unique_lock 都是 RAII 锁管理器，区别在**可控性**：lock_guard 构造加锁、析构解锁，**不能中途解锁/重锁**，适合'纯临界区'（如保护 g_state.frameData）；unique_lock 加解锁时机完全可控（可延迟加锁、手动解锁、重新加锁、可移动），**是条件变量 wait 的唯一合法搭配**——因为 wait 需要在睡眠前原子地'解锁+睡眠'、唤醒后'重新加锁'，lock_guard 没有这些接口。工程上能用 lock_guard 就不用 unique_lock（意图清晰、开销小），只有条件等待等场景才升级。项目里 pauseCv.wait_until 用 unique_lock（要等待+重锁），g_state.mtx 保护帧数据用 lock_guard（纯临界区）——正好是两种 RAII 的典型分工。"
 
 ## 1.4 代码结构与关系全景图
 
@@ -1390,6 +1470,285 @@ gui.onFormatChanged([](PixelFormat fmt) { qDebug() << "格式变更"; });
 | 触发控件 | 滑块 | 分辨率下拉框 | 格式下拉框 |
 
 **面试一句话**：三者都是 main.cpp 注入给 GUI 的回调，区别在**改的对象**：`onCameraControlChanged` 调 sensor 图像参数（`VIDIOC_S_CTRL` 写寄存器），**即时生效、无需断流**；`onResolutionChanged` 和 `onFormatChanged` 都改**缓冲池布局**（`VIDIOC_S_FMT`），因为 S_FMT 在 STREAMON 下返回 EBUSY、且帧大小变了缓冲必须重建，所以**都要走"暂停→停流→改→重启→恢复"完整流程**，区别只是前者只改 size、后者只改 pixelformat。
+
+## 2.6 onResolutionChanged 深入：paused vs stopCapture 与双线程握手
+
+> 面试深挖："为什么改个分辨率要这么麻烦？`paused=true` 和 `stopCapture()` 有什么区别？"这一节把 onResolutionChanged 的完整实现思路讲透。
+
+### 2.6.1 paused vs stopCapture：应用层协调 vs 驱动层停流
+
+| | `g_state.paused = true` | `capture->stopCapture()` |
+|---|---|---|
+| **操作对象** | 应用层的**标志位**（`std::atomic<bool>`） | V4L2 **内核驱动**（`VIDIOC_STREAMOFF`） |
+| **本质** | 通知采集线程"你先别拉帧了" | 让驱动**停止 DMA 采集** + 释放 mmap 缓冲 |
+| **谁执行** | 只是写一个变量 | 执行 `ioctl` 系统调用 + `unmapBuffers` |
+| **是否阻塞** | 不阻塞（原子写） | 阻塞（ioctl + munmap） |
+| **影响范围** | 只影响采集线程的**循环逻辑** | 影响**整个硬件采集链路** |
+
+```cpp
+// ① paused：应用层协调标志
+g_state.paused = true;     // 采集线程看到它 → 停止取帧，进入等待
+
+// ② stopCapture：V4L2 驱动级停流
+int CameraCapture::stopCapture() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(m_fd, VIDIOC_STREAMOFF, &type);   // 停 DMA
+    m_streaming = false;
+    unmapBuffers();                          // munmap + REQBUFS(0) 释放缓冲
+    ...
+}
+```
+
+**为什么要两个？** 解决的是**两个不同层面的问题**：
+- `stopCapture()` 停的是硬件流，但**采集线程可能正卡在 `getFrame()`（select 等待 DQBUF）里**，如果直接停流，采集线程还在用 mmap 缓冲 → 竞态/崩溃
+- 所以必须先 `paused=true` **让采集线程主动退出取帧循环**，等它确认（`pausedAck`）后才安全地 `stopCapture()`
+
+**类比**：`paused=true` 是"让工人先放下手里的活"，`stopCapture()` 是"关掉机器"。必须先让工人停手，才能安全关机器。
+
+### 2.6.2 完整代码（`main.cpp:1202-1229`）
+
+```cpp
+gui.onResolutionChanged([capture](int w, int h) {
+    if (!capture->isStreaming()) return;                       // ① 防御
+
+    // 1. 暂停采集线程，防止 stopCapture 时采集线程还在使用 mmap 缓冲区
+    g_state.paused = true;                                     // ② 置暂停标志
+    // 等待采集线程确认暂停（getFrame 有 1s 超时，最多等 1.1s）
+    {
+        std::unique_lock<std::mutex> lk(g_state.pauseMtx);     // ③ 条件变量等待
+        g_state.pauseCv.wait_until(lk,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+            [] { return g_state.pausedAck.load(); });
+    }
+
+    // 2. 安全停止采集、切换格式、重启
+    capture->stopCapture();                                    // ④ 停流
+    int ret = capture->setFormat(w, h, capture->getCurrentFormat());  // ⑤ 改分辨率
+    if (ret < 0) {                                             // ⑥ 失败回退
+        LOG_ERR_("setFormat(%dx%d) failed (ret=%d), reverting to 640x480",
+                  w, h, ret);
+        capture->setFormat(640, 480, capture->getCurrentFormat());
+    }
+    capture->startCapture();                                   // ⑦ 重启
+
+    // 3. 恢复采集线程
+    g_state.paused = false;                                    // ⑧ 解除暂停
+    g_state.pauseCv.notify_one();                              // ⑨ 唤醒采集线程
+    LOG_INF("Resolution changed to %dx%d", w, h);
+});
+```
+
+### 2.6.3 实现思路：为什么是"暂停 → 停流 → 改 → 重启 → 恢复"五步？
+
+**核心矛盾**：V4L2 的 `S_FMT` 有两个硬性限制：
+1. **STREAMON 状态下调用 `S_FMT` 返回 `EBUSY`**——必须先 STREAMOFF
+2. **改分辨率后 mmap 缓冲必须重建**——帧大小变了，旧缓冲装不下
+
+而采集线程一直在跑（拉帧/归还缓冲），**直接停流会和采集线程打架**。所以必须设计一套"双线程协作"的握手协议。
+
+### 2.6.4 逐步拆解（重点）
+
+**① 防御检查**：`if (!capture->isStreaming()) return;` —— 摄像头未启动时 `stopCapture`/`setFormat` 无意义甚至出错，提前返回。
+
+**② 置暂停标志**：`g_state.paused = true` —— 告诉采集线程"下个循环别再拉帧了"。采集线程在循环开头检查：
+
+```cpp
+while (g_state.running) {
+    if (g_state.paused) {                    // ← 看到暂停标志
+        g_state.pausedAck = true;            //   确认：我停了
+        g_state.pauseCv.notify_one();        //   通知主线程
+        std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+        g_state.pauseCv.wait(lk, [] { return !g_state.paused.load(); });  // 挂起等待
+        continue;
+    }
+    g_state.pausedAck = false;
+    ...
+}
+```
+
+注意：`paused` 是 `std::atomic<bool>`——因为它是**跨线程共享**（主线程写、采集线程读），用 atomic 避免数据竞争。
+
+**③ 等待采集线程确认**：`wait_until` —— 为什么必须等？
+- 置 `paused=true` 只是"请求"，采集线程可能**正卡在 `getFrame()` 的 select 等待里**（最长 1s 超时）
+- 不等确认就 `stopCapture()` → 采集线程可能正在 `putFrame()` 使用 mmap 缓冲，此时 `unmapBuffers()` 释放缓冲 → **use-after-free / 崩溃**
+- `wait_until` 语义：条件满足立即返回；不满足则释放 `pauseMtx` 睡眠（最多 1.1s）；超时也返回（**兜底**，不能无限等）
+
+**④ 安全停流**：`capture->stopCapture()` —— 此时采集线程已确认暂停（或超时兜底），**没人再用 mmap 缓冲**，可安全 `STREAMOFF` + `unmapBuffers`。
+
+**⑤ 改分辨率**：`capture->setFormat(w, h, capture->getCurrentFormat())` —— 只改 `width/height`，**保持当前像素格式**。内部 `VIDIOC_S_FMT`（此时已 STREAMOFF 不会 EBUSY）→ **回读驱动实际接受的值**（驱动可能调整分辨率，必须写回 `m_width/m_height`）。
+
+**⑥ 失败回退**：`if (ret < 0) capture->setFormat(640, 480, ...)` —— 请求分辨率驱动不支持时回退到**已知可靠的默认值**，保证系统继续工作而不是崩掉。
+
+**⑦ 重启采集**：`capture->startCapture()` —— 内部重新执行 `REQBUFS → QUERYBUF → mmap → QBUF → STREAMON`，**按新分辨率重建缓冲池**。这就是"改分辨率必须重建缓冲"的落地。
+
+**⑧⑨ 恢复采集线程**：`paused=false`（撤销标志）+ `notify_one()`（唤醒挂起的采集线程继续拉帧）。
+
+### 2.6.5 完整时序图（双线程协作）
+
+```
+主线程 (onResolutionChanged)              采集线程
+──────────────────────                  ─────────────────
+ ① isStreaming() 检查
+ ② paused = true        ──────────►     循环开头看到 paused
+ ③ wait_until(1100ms)                   pausedAck = true
+    等待...                             notify_one()  ← 被唤醒
+                                         wait() 挂起等待恢复
+ ④ stopCapture()                        （挂起中，不碰缓冲）
+ ⑤ setFormat(w,h)                       
+ ⑥ (失败则回退 640x480)
+ ⑦ startCapture()                       
+ ⑧ paused = false                       
+ ⑨ notify_one()       ──────────►      wait 返回，继续拉帧
+```
+
+### 2.6.6 面试要点总结
+
+| 步骤 | 解决什么问题 |
+|------|-------------|
+| ① 防御检查 | 避免无效操作 |
+| ② paused=true | 请求采集线程让路（应用层协调） |
+| ③ wait_until | 等采集线程确认，防 use-after-free |
+| ④ stopCapture | STREAMOFF + 释放缓冲（驱动层） |
+| ⑤ setFormat | S_FMT 改分辨率（必须停流后） |
+| ⑥ 失败回退 | 不支持的格式回退 640x480 |
+| ⑦ startCapture | 按新分辨率重建缓冲池 |
+| ⑧⑨ 恢复 | 撤销暂停 + 唤醒采集线程 |
+
+**面试一句话**：
+> "onResolutionChanged 的核心是**双线程握手协议**：因为 V4L2 的 S_FMT 在 STREAMON 下返回 EBUSY、且改分辨率后 mmap 缓冲必须重建，所以先 `paused=true` 请求采集线程让路，用 `wait_until` 等它确认暂停（防采集线程还在用缓冲时被释放），再安全地 `stopCapture → setFormat → startCapture`，最后 `paused=false + notify_one` 唤醒采集线程继续拉帧。paused 是应用层协调标志（原子变量），stopCapture 是驱动层停流（ioctl），两者解决不同层面的问题，必须配合使用。"
+
+## 2.7 wait_until 详解：原型、参数与使用
+
+> 面试深挖：2.6 里那个"最多等 1.1s"是怎么实现的？这一节把 `std::condition_variable::wait_until` 的原型、参数、两个重载、返回值、易错点讲透。
+
+### 2.7.1 项目里的实际使用
+
+```cpp
+// main.cpp:1210-1212（onResolutionChanged 里）
+std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+g_state.pauseCv.wait_until(lk,
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+    [] { return g_state.pausedAck.load(); });
+```
+
+### 2.7.2 原型（`std::condition_variable::wait_until`）
+
+```cpp
+// 重载 1：无谓词版（不带条件判断）
+template<class Clock, class Duration>
+cv_status wait_until(std::unique_lock<std::mutex>& lock,
+                     const std::chrono::time_point<Clock, Duration>& abs_time);
+
+// 重载 2：带谓词版（推荐，本项目用的这个）
+template<class Clock, class Duration, class Predicate>
+bool wait_until(std::unique_lock<std::mutex>& lock,
+                const std::chrono::time_point<Clock, Duration>& abs_time,
+                Predicate pred);
+```
+
+### 2.7.3 参数逐个说明
+
+| 参数 | 类型 | 作用 |
+|------|------|------|
+| `lock` | `std::unique_lock<std::mutex>&` | **必须持有**的锁（wait 期间会释放它，唤醒后重新持有）。为什么必须 unique_lock？因为 wait 需要"解锁+睡眠+重新加锁"，lock_guard 做不到 |
+| `abs_time` | `time_point<Clock, Duration>` | **绝对时间点**（注意不是相对时长！），到这个时刻为止等待。本项目：`steady_clock::now() + 1100ms` |
+| `pred` | `Predicate`（可调用对象） | 条件谓词，返回 bool。**只要 pred 为 false 就继续等，为 true 立即返回** |
+
+### 2.7.4 两个重载的区别
+
+**重载 1（无谓词）—— 裸等待，需自己循环**：
+
+```cpp
+cv_status st = cv.wait_until(lk, abs_time);
+if (st == std::cv_status::timeout) {
+    // 超时了
+} else {
+    // 被 notify 唤醒（注意：可能是"假唤醒"）
+}
+```
+
+缺点：被唤醒后**不检查条件**，遇到"假唤醒"（spurious wakeup）会继续往下走——所以**必须手动循环检查条件**：
+
+```cpp
+while (!g_state.pausedAck.load()) {
+    if (cv.wait_until(lk, abs_time) == std::cv_status::timeout)
+        break;   // 超时，退出
+}
+```
+
+**重载 2（带谓词）—— 内部自动循环（推荐）**：
+
+```cpp
+bool ok = cv.wait_until(lk, abs_time, [] { return g_state.pausedAck.load(); });
+```
+
+内部等价于：
+
+```cpp
+while (!pred()) {                        // 谓词不满足就一直等
+    if (wait_until(lock, abs_time) == std::cv_status::timeout) {
+        return pred();                   // 超时：再查一次谓词决定返回值
+    }
+}
+return true;                             // 谓词满足
+```
+
+好处：
+1. **自动处理假唤醒**——谓词不满足就继续等，不会误判
+2. **超时返回"谓词最终结果"**——不是盲目的"超时=true"，而是告诉你"等到超时时条件到底满足没"
+3. 语义清晰，一行搞定
+
+### 2.7.5 返回值
+
+| 重载 | 返回值 | 含义 |
+|------|--------|------|
+| 重载 1 | `cv_status::timeout` / `cv_status::no_timeout` | 单纯告诉你"是否超时" |
+| 重载 2 | `bool` | **谓词的最终结果**：true=条件满足返回；false=超时且条件仍未满足 |
+
+### 2.7.6 三个关键概念（面试必问）
+
+**① 绝对时间 vs 相对时长（最易错点）**
+
+`wait_until` 用**绝对时间点**，`wait_for` 用**相对时长**：
+
+```cpp
+// wait_until：绝对时间（本项目用法）
+cv.wait_until(lk, steady_clock::now() + 1100ms, pred);
+
+// wait_for：相对时长（等效写法）
+cv.wait_for(lk, 1100ms, pred);
+```
+
+**为什么推荐 wait_until？** 如果用 `wait_for` 配合循环，每次重算"现在+1100ms"，会导致**总等待时间被拉长**（多次重算累计）。`wait_until` 的绝对时间点在循环里**固定不变**，保证"最多等 1.1s"的承诺严格成立。本项目用 `wait_until` 正是这个原因——它要严格保证"最多等 1.1s"（对应采集线程 getFrame 的 1s 超时兜底）。
+
+**② 假唤醒（spurious wakeup）**
+
+条件变量**可能被莫名唤醒**（无 notify、超时未到）。带谓词版自动规避——谓词不满足就继续等，所以**永远用带谓词版本**。
+
+**③ 为什么等待时必须持锁？**
+
+谓词 `pausedAck.load()` 访问的是共享状态，必须有锁保护（与其他写 `pausedAck` 的线程互斥）。wait 在检查谓词前**假设你已经持锁**，检查时持锁、睡眠时释放、唤醒后重新持锁再检查——这就是 unique_lock 的用武之地。
+
+### 2.7.7 完整正确用法模板
+
+```cpp
+// ① 持锁
+std::unique_lock<std::mutex> lk(mtx);
+// ② 带谓词等待（绝对时间，自动处理假唤醒）
+bool done = cv.wait_until(lk,
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(1100),
+    [] { return g_state.pausedAck.load(); });
+// ③ 判断结果
+if (done) {
+    // 条件满足（采集线程已确认暂停）
+} else {
+    // 超时兜底（即使没确认，也不能无限等）
+}
+```
+
+### 2.7.8 面试一句话总结
+
+> "`wait_until` 是条件变量的带超时等待函数，原型接收三个参数：已持有的 `unique_lock`（wait 期间释放、唤醒后重新持有）、**绝对时间点**（不是相对时长，保证循环里总等待时间固定）、条件谓词（返回 bool）。带谓词版本内部自动循环处理假唤醒，超时返回谓词的最终结果。项目里用它实现'最多等 1.1s 采集线程确认暂停'——绝对时间确保严格超时，谓词确保只被'真的暂停了'唤醒，unique_lock 确保睡眠期间不占锁（否则 notify 方会死锁）。"
 
 ---
 
