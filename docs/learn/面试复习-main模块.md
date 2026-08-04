@@ -1,0 +1,1088 @@
+# src/main.cpp 模块面试复习指南（程序入口与线程编排）
+
+> 定位：以「技术面试官 + 应聘者」双视角，系统拆解 `src/main.cpp` 的代码实现。
+> 阅读本文档前建议先自行通读 `src/main.cpp`（约 1450 行），并对照 `include/common/`、`include/display/gui.h`、`include/common/frame_pool.h`。
+>
+> 组织方式：**模块概览（脑图）→ 全局状态与线程编排 → 三个核心函数深度解析（readSelfCpuJiffies / readSelfRssKB / [PERF] 插桩）→ 面试速查**。
+
+---
+
+## 目录
+
+1. [第一部分 模块整体概览](#第一部分-模块整体概览)
+   - 1.1 脑图式结构
+   - 1.2 职责边界
+   - 1.3 全局状态设计
+   - 1.4 代码结构与关系全景图
+   - 1.5 V4L2 缓冲与 RGB 帧池的关系
+2. [第二部分 线程编排与配置解析](#第二部分-线程编排与配置解析)
+   - 2.1 六线程模型
+   - 2.2 配置三级优先级
+   - 2.3 命令行解析详解（QCommandLineParser）
+   - 2.4 回调注入（业务编排）
+3. [第三部分 核心函数深度解析](#第三部分-核心函数深度解析)
+   - 3.1 readSelfCpuJiffies() —— 进程 CPU 时间读取
+   - 3.2 readSelfRssKB() —— 进程内存占用读取
+   - 3.3 [PERF] 性能插桩机制
+4. [第四部分 面试速查表](#第四部分-面试速查表)
+
+---
+
+# 第一部分 模块整体概览
+
+## 1.1 脑图式结构
+
+```
+src/main.cpp  程序入口：全局状态 + 线程编排 + 回调注入 + 性能插桩
+│
+├── 全局共享状态
+│   ├── CaptureState g_state        ← 采集→GUI/处理 的中转站（mutex + 条件变量）
+│   ├── std::atomic<bool> g_recording  ← 录像标志（main 写，采集/处理读）
+│   ├── StorageManager* g_storage  ← 存储管理器单例指针
+│   ├── PerfStats g_perf            ← 性能插桩计数器（atomic）
+│   └── FramePool* g_rgbPool       ← RGB 显示帧池（帧池零拷贝，容量 2）
+│
+├── 工具函数
+│   ├── readSelfCpuJiffies()        ← 读 /proc/self/stat，全进程 CPU 时间
+│   ├── readSelfRssKB()             ← 读 /proc/self/status，进程 RSS 内存
+│   └── getLocalIPv4()              ← 遍历网卡拿本机 IP（启动信息展示）
+│
+├── main()
+│   ├── 命令行解析（QCommandLineParser）
+│   ├── 配置加载（ConfigManager，三级优先级）
+│   ├── GUI 创建 + 存储绑定 + 回调注入
+│   ├── 真实相机模式（--device 非空）
+│   │   ├── V4L2 摄像头初始化 + 控制参数查询
+│   │   ├── MJPEG HTTP / RTSP / TCP 控制 三服务启动
+│   │   ├── 采集线程 + 处理线程 + displayTimer + perfTimer
+│   │   └── 显示帧池零拷贝路径
+│   ├── Mock 模式（无 --device）→ 彩条 + 控制服务
+│   └── Qt 事件循环 + 资源清理
+└── 线程模型：Qt 主线程 + 采集 + 处理 + RTSP + 控制（+ HTTP 客户端动态线程）
+```
+
+## 1.2 职责边界
+
+| 本模块负责 | 本模块不负责 |
+|-----------|-------------|
+| 线程编排：创建/join 采集、处理、RTSP、控制线程 | V4L2 ioctl 细节（`src/camera/`） |
+| 全局共享状态定义（`g_state` / `g_recording` / `g_rgbPool`） | 网络协议实现（`src/network/`） |
+| 配置三级优先级合并（命令行 > 配置文件 > 默认值） | GUI 控件逻辑（`src/display/`） |
+| 回调注入（GUI 事件 → 业务动作的 lambda 桥接） | 文件持久化（`src/storage/`） |
+| 性能插桩（`[PERF]` / `[FPS Diag]`） | 协议编解码（各服务内部） |
+| 进程资源读取（CPU jiffies / RSS） | 硬件 DMA（内核驱动） |
+
+**一句话**：main.cpp 是"**胶水层**"——它不实现具体功能，而是把 camera/display/network/storage 四个模块编排成一个可运行的系统，并承担"线程怎么分、状态怎么传、事件怎么接"的全局决策。
+
+## 1.3 全局状态设计
+
+### 1.3.1 CaptureState（`main.cpp:56-75`）——帧数据中转站
+
+```cpp
+struct CaptureState {
+    std::mutex              mtx;            // 帧数据锁
+    std::vector<uint8_t>    frameData;      // 拷贝后的最新帧
+    int                     width = 0, height = 0;
+    PixelFormat             format = FMT_RGB24;
+    double                  fps = 0.0;
+    std::atomic<bool>       running{false};  // 线程退出标志
+    std::atomic<bool>       paused{false};   // 暂停采集（切分辨率/格式）
+    std::mutex              pauseMtx;        // 暂停同步锁
+    std::condition_variable pauseCv;         // 暂停同步条件变量
+    std::atomic<bool>       pausedAck{false};// 采集线程已确认暂停
+    std::atomic<int>        targetFps{0};    // 用户目标帧率（0=不限制）
+    std::mutex              procMtx;         // 处理线程专用锁
+    std::condition_variable procCv;          // 新帧通知
+    std::atomic<bool>       frameReady{false}; // 有新帧待处理
+};
+static CaptureState g_state;
+```
+
+**设计要点**：
+- **`frameData` 是"最新一帧"而非队列**：采集线程每帧覆盖写，消费方（GUI/处理线程）主动取最新——天然防堆积，中间帧被覆盖丢弃（拉模式哲学，见 display 篇）
+- **两把锁分工**：`mtx` 保护帧数据本身；`procMtx` 专门服务处理线程的条件等待，避免"等帧"和"读帧"互相阻塞
+- **暂停握手**：`paused/pauseMtx/pauseCv/pausedAck` 实现"切分辨率/帧率前先让采集线程确认停手"的双向握手（`main.cpp:613-620`）
+
+### 1.3.2 为什么用 `std::atomic` 而非 mutex？
+
+`running/paused/targetFps/frameReady` 都是**单标志位**，读多写少、无复合操作——`std::atomic` 提供无锁的读改写，避免每次访问都要拿 mutex 的开销。**规则**：复合读改写（如"取帧→拷贝→归还"）用 mutex；单一标志位用 atomic。
+
+### 1.3.3 RGB 显示帧池（`main.cpp:114`）
+
+```cpp
+// 容量 2：GUI 持 1 槽 + 解码写 1 槽，天然双缓冲，无需锁。
+FramePool* g_rgbPool = nullptr;
+```
+
+`FramePool` 是 header-only 的帧池（`include/common/frame_pool.h`），用**引用计数 + 原子指针**实现无锁双缓冲。main.cpp 负责创建（`new FramePool(2)`），displayTimer 做生产者（解码入槽 → publish），GUI 做消费者（share → 浅引用上屏）。
+
+## 1.4 代码结构与关系全景图
+
+> 6 张图从不同视角看 main.cpp 的内部组织与对外关系：**文件布局 → 执行流程 → 全局状态读写 → 线程数据流 → 回调注入 → 模块依赖**。面试前把这 6 张图过一遍，就能对 main.cpp 形成完整的空间认知。
+
+### 1.4.1 图 1：整体布局图（文件级结构）
+
+```
+src/main.cpp（约 1450 行）
+│
+├─ ① 头文件区 (24-51 行)         ← 引入 Qt / 各模块头 / 系统头
+│
+├─ ② 全局共享状态 (53-114 行)
+│    ├─ CaptureState g_state      ← 帧中转站（锁+条件变量）
+│    ├─ g_recording               ← 录像标志
+│    ├─ g_storage                 ← 存储管理器指针
+│    ├─ PerfStats g_perf          ← 性能插桩计数
+│    └─ FramePool* g_rgbPool      ← RGB 显示帧池
+│
+├─ ③ 工具函数区 (116-201 行)
+│    ├─ readSelfCpuJiffies()      ← 读 /proc/self/stat CPU 时间
+│    ├─ readSelfRssKB()           ← 读 /proc/self/status 内存
+│    └─ getLocalIPv4()            ← 获取本机 IP
+│
+└─ ④ main() 主体 (204-1453 行)
+     ├─ 4.1 初始化 (205-347)      ← Qt应用/命令行/配置
+     ├─ 4.2 GUI+存储 (348-409)    ← 创建 GUI、注入回调
+     ├─ 4.3 真实相机模式 (411-1347) ← 主业务路径
+     ├─ 4.4 Mock 模式 (1348-1405) ← 无硬件调试
+     ├─ 4.5 事件循环 (1416-1419)  ← app.exec()
+     └─ 4.6 清理 (1420-1453)      ← join线程/释放资源
+```
+
+**关键点**：四个"区"从上到下职责递进——**状态 → 工具 → 流程编排**，工具函数只依赖系统头，不依赖业务模块。
+
+### 1.4.2 图 2：main() 执行流程时序图（最核心）
+
+```
+main(argc, argv)
+  │
+  ├─① QApplication app(...)             ← 初始化 Qt（消费平台参数如 -platform linuxfb）
+  │
+  ├─② QCommandLineParser 解析           ← 6 个选项
+  │
+  ├─③ ConfigManager 加载三级配置         ← 命令行 > 配置 > 默认
+  │
+  ├─④ CameraGUI gui（栈对象）           ← GUI 贯穿整个生命周期
+  │    └─ setGalleryStorage / onStoragePathChanged（回调注入）
+  │
+  ├─ 判断 device 是否为空？
+  │   │
+  │   ├── 空 → ═══ Mock 模式 (4.4) ═══
+  │   │     ├─ 注入空回调（qDebug 打印）
+  │   │     ├─ ControlServer 仅心跳/状态
+  │   │     └─ Mock 驱动定时器 → requestRefresh → 彩条
+  │   │
+  │   └── 非空 → ═══ 真实相机模式 (4.3) ═══
+  │         ├─ new FramePool(2)                    ← 帧池
+  │         ├─ CameraCapture 初始化                 ← V4L2
+  │         │    ├─ enumFormats → 选格式
+  │         │    ├─ setFormat(640,480)
+  │         │    └─ queryControl（亮度/对比度/白平衡/曝光）
+  │         ├─ MJPEGStreamServer.start()           ← HTTP 8080
+  │         ├─ RTSPServer.start() → RTSP线程        ← RTSP 8554
+  │         ├─ ControlServer.start() → 控制线程     ← TCP 9000
+  │         ├─ 采集线程 start                       ← 拉帧
+  │         ├─ 处理线程 start                       ← 编码/推流/录像
+  │         ├─ displayTimer(33ms)                  ← 解码上屏
+  │         └─ perfTimer(5s)                       ← 性能插桩
+  │
+  ├─⑤ gui.show()
+  │
+  ├─⑥ app.exec()                     ← Qt 事件循环（阻塞直到退出）
+  │
+  └─⑦ 清理：running=false → notify_all → join 各线程 → 释放
+```
+
+**关键设计**：`gui` 是**栈对象**（`main.cpp:349`），生命周期 = 整个 app；而 `capture`/`mjpegServer` 等是**堆对象 + 线程**，在真实模式下创建、退出时清理——这决定了"GUI 常驻、业务资源按需"的编排哲学。
+
+### 1.4.3 图 3：全局状态关系图（谁读谁写）
+
+```
+                    ┌─────────────────────────────┐
+                    │  g_state (CaptureState)     │
+                    │  mtx / frameData / width... │
+                    └───┬──────────┬──────────┬───┘
+            写:采集线程 │          │ 读:GUI   │ 读:处理线程
+                │       │          │          │
+    采集线程: getFrame → 拷贝 → putFrame     │          │
+               └→ notify (procCv) ──────┘          │
+                                      displayTimer 读→ 解码
+                                      (g_rgbPool→setFrameShared→requestRefresh)
+                                                      │
+                                                      └→ 编码/推流/录像
+┌──────────────┐   ┌────────────────┐   ┌─────────────────┐
+│ g_recording  │   │   g_perf       │   │  g_rgbPool      │
+│ (atomic bool)│   │ (atomic计数)   │   │ (FramePool*)    │
+│ 写:GUI/TCP   │   │ 写:3线程累加   │   │ 生产:displayTimer│
+│ 读:采集/处理 │   │ 读:perfTimer   │   │ 消费:GUI(share) │
+└──────────────┘   └────────────────┘   └─────────────────┘
+```
+
+**读-写矩阵速记**：`g_state` 一写多读（采集写、GUI/处理读）；`g_perf` 多写单读（3 线程累加、perfTimer 读）；`g_rgbPool` 生产-消费（displayTimer 产、GUI 消）。
+
+### 1.4.4 图 4：线程与数据流关系图（6 线程 + 数据流向）
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
+│ 采集线程     │     │ 处理线程      │     │ displayTimer│     │  GUI线程     │
+│ (873)       │     │ (970)        │     │ (1070)      │     │ (Qt主线程)   │
+│             │     │              │     │             │     │             │
+│ getFrame    │     │ wait(procCv) │     │ acquire槽   │     │ 浅引用       │
+│   │         │     │   │          │     │   │         │     │ setPixmap    │
+│ 拷贝         │     │ 深拷贝       │     │ 解码入槽     │     │   ▲         │
+│   │         │     │   │          │     │   │         │     │   │         │
+│ putFrame    │     │ YUYV→JPEG    │     │ publish     │     │   │         │
+│   │         │     │   │          │     │   │         │     │   │         │
+│ notify ─────┼──►  │ HTTP/RTSP/   │     │ share       │     │   │         │
+│ (procCv)    │     │ 录像写盘      │     │   │         │     │   │         │
+└─────┬───────┘     └──────┬───────┘     │ setFrame    │     │   │         │
+      │                    │             │ Shared      │     │   │         │
+      │  g_state.frameData │             │   │         │     │   │         │
+      └────────────────────┴─────────────┴───┴─────► ──┴─────┘   │
+                                                                  │
+┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐
+│ RTSP线程     │  │ 控制线程      │  │ MJPEG-accept │  │ perfTimer   │
+│ (712)       │  │ (859)        │  │ (服务内部)    │  │ (1158)      │
+│ epoll+分片   │  │ epoll+CRC    │  │ 客户端线程×N  │  │ 读g_perf    │
+└─────────────┘  └──────────────┘  └──────────────┘  └─────────────┘
+```
+
+**核心关系**：
+- 采集线程是**唯一生产者**，通过 `g_state`（帧数据）+ `procCv`（通知）供给 3 路消费者
+- 处理线程吃**原始帧**做编码/推流/录像；displayTimer 吃**原始帧**做解码显示（走帧池，零拷贝）
+- RTSP/控制/HTTP 都是**网络服务线程**，只消费各自服务器的内部状态，不碰 g_state
+
+### 1.4.5 图 5：回调注入关系图（GUI 事件 → 业务动作）
+
+```
+                    CameraGUI (display模块)
+                    │
+  GUI 事件（按钮/滑块/下拉框）
+  │  拍照 / 录像 / 分辨率 / 格式 / 存储路径 / 相机控制 / 帧率
+  │
+  ▼ 调用注入的 std::function 回调
+  ┌────────────────────────────────────────────────┐
+  │ main.cpp 中注入的 lambda（捕获业务对象指针）     │
+  │                                                │
+  │ onCaptureRequest      → 存 JPEG（g_state+存储） │
+  │ onRecordToggle        → startRecord/stopRecord │
+  │ onResolutionChanged   → 暂停→停流→S_FMT→重启    │
+  │ onFormatChanged       → 暂停→停流→setFormat→重启│
+  │ onStoragePathChanged  → 更新路径+写配置         │
+  │ onCameraControlChanged→ capture->setControl(cid)│
+  │ onFramerateChanged    → S_PARM+软件节流+displayTimer│
+  └────────────────────────────────────────────────┘
+```
+
+**关系本质**：main.cpp 是**桥**——GUI 只发出"我想做什么"，main.cpp 决定"怎么做"（操作 capture/storage/rtspServer）。这样 display 模块零依赖 camera/network，可独立测试（Mock 模式注入空 lambda）。
+
+### 1.4.6 图 6：依赖关系图（模块间耦合）
+
+```
+main.cpp 依赖（编译期 include）
+│
+├── include/display/gui.h        ← GUI（注入回调接口）
+├── include/camera/capture.h     ← 采集（V4L2）
+├── include/camera/processor.h   ← 图像处理（解码/编码）
+├── include/network/mjpeg_server.h ← HTTP 流
+├── include/network/control.h    ← TCP 控制
+├── include/network/rtsp_server.h ← RTSP 流
+├── include/storage/manager.h    ← 存储
+├── include/common/*.h           ← types/config/logger/frame_pool
+│
+└── 反向依赖（谁依赖 main.cpp）：
+     ← 无。main.cpp 是最顶层，不暴露接口给任何模块
+     ← 但 GUI 通过 std::function 回调反向"调用"main 注入的逻辑
+        （依赖倒置，运行时依赖而非编译期依赖）
+```
+
+**依赖方向总结**：main.cpp 处于依赖图**最顶端**，编译期单向依赖所有模块；运行时通过回调形成"逻辑反向"（GUI 调 main 注入的逻辑），但无编译期反向依赖——这是依赖倒置的体现。
+
+### 1.4.7 一句话架构（面试速记）
+
+> main.cpp 是"**胶水 + 编排**"：用栈对象 `gui` 贯穿生命周期，用堆对象 + 线程按需创建业务资源；通过 `g_state` 共享帧数据、`std::function` 回调解耦控制、`FramePool` 实现显示零拷贝、`g_perf` 做性能插桩——五个全局状态 + 五条线程 + 一套回调，把 camera/display/network/storage 串成完整系统。
+
+## 1.5 V4L2 缓冲与 RGB 帧池的关系
+
+> 面试高频追问：**"V4L2 不是已经零拷贝了吗，为什么还要 g_state 拷贝和 FramePool？两者到底什么关系？"** 这一节把两套缓冲体系彻底讲透。
+
+### 1.5.1 核心结论：两套独立、分工明确的内存
+
+| | V4L2 内核缓冲区 | RGB 显示帧池（FramePool） |
+|---|---|---|
+| **内存归属** | **内核**（驱动侧分配） | **用户态**（应用 `std::vector`） |
+| **分配方式** | `VIDIOC_REQBUFS` → 内核 DMA 缓冲区 | `new FramePool(2)` → 预分配 2 个槽 |
+| **数据内容** | 原始帧（**JPEG/YUYV** 压缩/原始数据） | **RGB24** 解码后的显示数据 |
+| **数据来源** | 摄像头 DMA 硬件直写 | `displayTimer` 解码（libjpeg/NEON） |
+| **所有权模型** | 租借（getFrame/putFrame 成对） | 共享（acquire/share/release + 引用计数） |
+| **交互协议** | DQBUF/QBUF | publish/share/release |
+
+**它们之间不直接相连**，中间隔着 `g_state.frameData` 这个"拷贝中转站"。完整链路：
+
+```
+V4L2 mmap 缓冲 ──①拷贝──► g_state.frameData ──②解码──► FramePool 槽 ──③浅引用──► GUI 上屏
+(内核,JPEG/YUYV)      (用户态,原始帧)      (用户态,RGB24)      (QImage 零拷贝)
+```
+
+### 1.5.2 第一层：V4L2 内核缓冲区（`capture.cpp`）
+
+**申请**（`capture.cpp:581-604`）：
+
+```cpp
+req.count  = kDefaultBufferCount;        // 请求 4 个
+req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+req.memory = V4L2_MEMORY_MMAP;           // mmap 方式
+ioctl(m_fd, VIDIOC_REQBUFS, &req);       // 内核分配 DMA 缓冲
+if (req.count < 2) return -ENOMEM;       // 至少 2 个才能轮转
+m_nbuffers = req.count;                  // 回读实际分配数（双向参数）
+```
+
+`VIDIOC_REQBUFS` 让**内核驱动**分配 4 个 DMA 缓冲区（物理连续、页对齐，供 DMA 引擎直写）。`count` 是"请求/返回双向"——驱动可能只给 3 个，必须回读 `req.count`。
+
+**映射**（`capture.cpp:619-624`）：
+
+```cpp
+m_buffers[i].start = mmap(nullptr, buf.length,
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED,   // 灵魂：CPU 和 DMA 共享同一物理内存
+                           m_fd, buf.m.offset);
+```
+
+`MAP_SHARED` 是零拷贝的关键——同一块物理内存，DMA 硬件写入、CPU 应用读取。`buf.length` 是按"最坏情况帧"分配的天花板（MJPEG 640x480 可能 256KB），实际有效数据看每帧 `bytesused`。
+
+**租借协议**（getFrame/putFrame）：
+
+```cpp
+// getFrame: DQBUF 借出，data 直接指向 mmap 内存（零拷贝指针）
+buf->data   = (uint8_t*)m_buffers[vbuf.index].start;
+buf->length = vbuf.bytesused;                     // 实际帧长（每帧不同）
+
+// putFrame: 用 data 指针遍历反推槽位 → QBUF 归还
+for (int i = 0; i < m_nbuffers; ++i)
+    if (m_buffers[i].start == buf->data) { idx = i; break; }
+ioctl(m_fd, VIDIOC_QBUF, &vbuf);                  // 归还给驱动
+```
+
+**租借模型**：只有 4 个槽，必须尽快归还，否则驱动无缓冲可用、`DQBUF` 永久阻塞——这是采集线程"拷贝完立即归还"的根本原因。
+
+### 1.5.3 第二层：RGB 显示帧池（`frame_pool.h` + `main.cpp`）
+
+**创建**（`main.cpp:415`）：
+
+```cpp
+g_rgbPool = new FramePool(2);   // 容量 2：GUI 持 1 槽 + 解码写 1 槽，天然双缓冲
+```
+
+**槽结构**（`frame_pool.h:43-50`）：
+
+```cpp
+struct FrameSlot {
+    std::vector<uint8_t> data;   // RGB24 像素数据（预分配）
+    std::atomic<int>     refs;   // 引用计数：0=空闲, >0=被持有
+    uint64_t             seq;    // 帧序号
+    int width, height;
+    PixelFormat format;          // 固定 FMT_RGB24
+};
+```
+
+**核心 API**（引用计数 + 原子指针）：
+
+```cpp
+FrameSlot* acquire() {           // 借空闲槽（refs 0→1），无空闲返回 nullptr
+    for (auto& s : m_slots) {
+        int expected = 0;
+        if (s->refs.compare_exchange_strong(expected, 1)) return s.get();
+    }
+    return nullptr;              // 池满 → 丢帧，不阻塞
+}
+FrameSlot* share() {             // 取当前槽共享引用（refs+1）
+    FrameSlot* cur = m_current.load(std::memory_order_acquire);
+    if (cur) cur->refs.fetch_add(1, std::memory_order_relaxed);
+    return cur;
+}
+void release(FrameSlot* s) {     // 归还引用（refs-1）
+    if (!s) return;
+    s->refs.fetch_sub(1, std::memory_order_release);
+}
+void publish(FrameSlot* s) {     // 发布为"当前"（原子替换指针）
+    std::atomic_thread_fence(std::memory_order_release);
+    FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);
+    if (old) release(old);       // 旧 current 槽归零后可复用
+}
+```
+
+**共享模型**：不搬数据，多个消费者通过 `share()/release()` 共享同一块 RGB 内存，引用计数保证"最后用完的人释放"。核心不变量：**`acquire` 只借空闲槽（refs==0）**，天然读写分离、无锁。
+
+### 1.5.4 关键：两者如何通过 `g_state` 衔接（`main.cpp`）
+
+**环节 ①：采集线程拷贝**（`main.cpp:942-956`）：
+
+```cpp
+{
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    g_state.frameData.assign(fb.data, fb.data + fb.length);  // V4L2 mmap → g_state
+    g_state.width  = fb.width;
+    ...
+}
+capture->putFrame(&fb);   // 立即归还 V4L2 缓冲！
+```
+
+采集线程拿到 V4L2 的 mmap 指针后，**必须深拷贝**到 `g_state.frameData` 才能 `putFrame` 归还——因为 mmap 内存会被硬件覆盖。这一步是"V4L2 缓冲 → 应用自有内存"的**所有权转移**。
+
+**环节 ②：displayTimer 借槽解码**（`main.cpp:1079-1131`）：
+
+```cpp
+FrameSlot* slot = g_rgbPool->acquire();   // 借 RGB 写槽（无空闲则丢帧）
+if (!slot) return;
+
+std::vector<uint8_t> raw;
+{
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    raw = g_state.frameData;              // g_state → raw（短锁拷贝，临时）
+    ...
+}
+
+// 解码直接写入池槽！（关键：输出端就是显示端要读的缓冲）
+if (srcFmt == FMT_MJPEG)
+    VideoProcessor::decodeJPEGtoRGB(raw.data(), raw.size(), slot->data, dw, dh);
+else if (srcFmt == FMT_YUYV)
+    VideoProcessor::yuyvToRgb24(raw.data(), slot->data.data(), srcW, srcH);
+
+slot->seq++;
+g_rgbPool->publish(slot);                 // 原子发布为"当前"
+FrameSlot* displaySlot = g_rgbPool->share();
+if (displaySlot) gui.setFrameShared(displaySlot);  // GUI 接管引用
+gui.requestRefresh();                     // 立即上屏
+```
+
+**关系点**：
+- `raw` 是一次必要的原始帧拷贝（JPEG ~0.1MB）——`g_state` 会被采集线程随时覆盖，必须短锁拷出
+- `decodeJPEGtoRGB` 的 `slot->data` 是**引用参数**——解码结果**直接写进池槽**。这是帧池零拷贝的核心：**解码输出端 = 显示端读取的缓冲，中间不再有第二次拷贝**
+
+**环节 ③：GUI 浅引用上屏**（`gui.cpp` refreshFrame）：
+
+```cpp
+if (m_heldSlot) {
+    // QImage 浅引用：不 .copy()，直接指向池槽内存
+    img = QImage(m_currentFrame.data, w, h, w * 3, QImage::Format_RGB888);
+}
+if (!img.isNull()) m_videoDisplay->setPixmap(QPixmap::fromImage(img));
+```
+
+`m_heldSlot` 持有池槽引用（refs≥1），保证 `slot->data` 生命周期有效，QImage 才能安全浅引用——**数据从头到尾只在池槽里存在一份**。
+
+### 1.5.5 为什么需要"两套缓冲 + 一个中转"（对比总结）
+
+```
+        V4L2 内核缓冲（4个）            g_state（1份）           FramePool 槽（2个）
+        ┌────────────────┐            ┌──────────────┐        ┌────────────────┐
+ 硬件   │ JPEG/YUYV 帧    │  ①拷贝     │ 原始帧副本    │  ②解码  │ RGB24 像素     │ ③浅引用
+ ──DMA─►│ (驱动管理)     │ ────────►  │ (应用自有)   │ ──────► │ (应用共享)     │ ───────► GUI
+        └────────────────┘            └──────────────┘        └────────────────┘
+         getFrame/putFrame            mutex 保护              acquire/publish/share/release
+         (租借:借出归还)              (所有权转移)            (共享:引用计数)
+```
+
+| 问题 | 为什么需要 V4L2 缓冲 | 为什么需要 FramePool |
+|------|---------------------|---------------------|
+| **数据格式不同** | V4L2 存压缩帧（JPEG/YUYV），体积小 | FramePool 存解码后 RGB24（0.92MB），可显示 |
+| **所有权模型不同** | 驱动租借，必须尽快归还（4 槽） | 应用共享，多个消费者引用计数 |
+| **生命周期不同** | 硬件随时覆盖，不能长期持有 | 引用计数保证"最后用完才释放" |
+| **消费方式不同** | 一帧多路消费（推流/录像/显示）都从 `g_state` 取 | 显示链路专用，避免每路都解码 |
+
+**核心结论**：V4L2 缓冲是"**原始帧的暂存区**"（驱动管理、租借、快速周转）；FramePool 是"**显示帧的共享区**"（应用管理、引用计数、零拷贝）。`g_state` 是两者之间的**所有权过渡带**——把"驱动借给我们的内存"变成"应用自己的内存"，才能安全地分发给多路消费者。
+
+### 1.5.6 性能视角（面试加分）
+
+```
+优化前（旧 setFrame 路径）：V4L2 → g_state → setFrame.assign → QImage.copy() = RGB24 拷 2 次
+优化后（帧池路径）：       V4L2 → g_state → 解码直写池槽 → QImage 浅引用 = RGB24 拷 0 次
+实测：显示链路拷贝 10.0 → 0.5 MB/s（-95%）
+```
+
+V4L2 缓冲到 `g_state` 的**原始帧拷贝省不掉**（JPEG 小，~0.1MB，换所有权确定性）；但 **RGB24 的两次深拷贝被帧池完全消除**——这正是两套系统"分工"的意义：**V4L2 管"怎么拿帧"，FramePool 管"怎么零拷贝分发"**。
+
+### 1.5.7 面试追问与应答
+
+**Q1：V4L2 不是已经零拷贝了吗，为什么采集线程还要深拷贝？**
+**A**：V4L2 的零拷贝指的是"内核 DMA 缓冲 → 用户态"不需要 read() 那样的搬运（mmap 直接映射）。但 V4L2 缓冲池只有 4 槽、硬件会随时覆盖，且 mmap 内存不能跨线程安全共享——所以采集线程必须 `assign()` 深拷贝到 `g_state` 再归还，用一次 memcpy（几十微秒）换"所有权确定 + 无锁多路消费"。
+
+**Q2：FramePool 省掉的到底是什么拷贝？**
+**A**：省的是**显示链路的 RGB24 深拷贝**。旧路径 `setFrame` 的 `assign` + `QImage.copy()` 每帧拷 2 次 0.92MB；帧池路径解码结果直接写进池槽、GUI 浅引用上屏，RGB24 全程 0 次深拷贝。V4L2 → g_state 的**原始帧拷贝（JPEG 小）省不掉**，但它是"数据所有权过渡"的必要代价。
+
+**Q3：为什么 FramePool 容量是 2 而不是更多？**
+**A**：容量 2 正好满足"GUI 持 1 槽（正在显示）+ 解码写 1 槽（下一帧）"的双缓冲需求——天然读写分离、无需锁。更多槽位对显示链路没有收益（显示是"最新帧优先"，中间帧被覆盖丢弃），反而多占内存（每槽 0.92MB）。
+
+**Q4：两者各自解决什么问题？一句话？**
+**A**：V4L2 缓冲解决"**怎么高效地从硬件拿帧**"（mmap 零拷贝 + 租借周转）；FramePool 解决"**怎么高效地把帧分发给显示**"（引用计数共享 + 零拷贝上屏）。`g_state` 是连接两者的"所有权过渡带"。
+
+---
+
+# 第二部分 线程编排与配置解析
+
+## 2.1 六线程模型
+
+| 线程 | 创建位置 | 职责 | 生命周期 |
+|------|---------|------|---------|
+| Qt 主线程 | `main` 进程本身 | GUI + displayTimer(33ms 解码上屏) + perfTimer(5s) | 整个 app |
+| 采集线程 | `main.cpp:873` | `getFrame → 拷贝到 g_state → putFrame → notify`，O(1) 轻活 | `g_state.running=false` 退出 |
+| 处理线程 | `main.cpp:970` | 等新帧 → YUYV 编码 → HTTP/RTSP 推流 → 录像写盘 | 同上 |
+| RTSP 线程 | `main.cpp:712` | `rtspServer->start()` 阻塞事件循环（epoll） | `rtspServer->stop()` 退出 |
+| 控制线程 | `main.cpp:859` | `controlSrv->start()` 阻塞事件循环（epoll） | `controlSrv->stop()` 退出 |
+| HTTP 客户端线程 | MJPEG 服务器内部 | 每接入一个客户端 detach 一个 handler 线程 | 客户端断开 |
+
+**关键设计**：
+- **采集线程只做轻活**：取帧/拷贝/归还三个操作，把"编码、推流、写盘"等重活全部下沉到处理线程——避免慢客户端/磁盘 IO 阻塞取帧导致 4 缓冲耗尽（V4L2 缓冲池租借模型）
+- **RTSP/控制各自独立线程**：互不阻塞，都是 `epoll` 单线程事件循环
+- **退出协调**：`g_state.running=false` + `procCv.notify_all()` 唤醒处理线程 → 各线程 join → 资源清理
+
+## 2.2 配置三级优先级
+
+```
+命令行 > 配置文件 > 硬编码默认值
+```
+
+```cpp
+QString device = parser.isSet(deviceOpt)
+    ? parser.value(deviceOpt)                       // ① 命令行最高
+    : (cfgLoaded ? QString::fromStdString(cfg.getString("camera", "device")) : QString());
+                                                    // ② 配置文件
+                                                    // ③ 无配置→默认（空=Mock 模式）
+```
+
+配置文件查找路径：`--config` 显式指定 > `~/.config/smartcam/smartcam.conf` > `/etc/smartcam/smartcam.conf`。
+
+**面试点**：这种三级优先级是嵌入式系统的标配——**命令行给调试者临时覆盖能力，配置文件给运维默认值，硬编码给"没配置文件也能跑"的兜底**。
+
+## 2.3 命令行解析详解（QCommandLineParser）
+
+### 2.3.1 整体流程三步走
+
+```
+第 1 步（204-214 行）：准备
+    QApplication app(argc, argv)          ← Qt 应用初始化（消费 Qt 自带参数）
+    parser 基础设置（描述/帮助/版本）
+
+第 2 步（216-262 行）：定义选项
+    QCommandLineOption 构造 6 个自定义选项 → parser.addOption()
+
+第 3 步（264-314 行）：解析并取值
+    parser.process(app)                   ← 正式解析
+    parser.isSet() / parser.value()       ← 读取用户传入的值
+    → 与配置文件、默认值做三级合并
+```
+
+### 2.3.2 核心类与函数原型
+
+**QApplication 构造函数**：
+
+```cpp
+QApplication app(int &argc, char **argv);   // argc 必须是非 const 引用！
+```
+
+- 初始化 Qt 资源与平台插件（linuxfb / xcb 等），任何 Qt GUI 程序的第一步
+- **解析并移除 Qt 平台自身认识的参数**（如 `-platform linuxfb`、`-style`），剩余参数才交给应用
+- `argc` 非 const 引用——Qt 会从 `argc/argv` 中移除它消费掉的参数
+- `setApplicationName` / `setApplicationVersion` 供 `--version` 输出（`SmartCam 0.1.0`）
+
+**QCommandLineParser 常用方法**：
+
+```cpp
+void setApplicationDescription(const QString &description);  // 帮助里的描述
+void addHelpOption();                                         // 注册 --help / -h / -?
+void addVersionOption();                                      // 注册 --version / -v
+void addOption(const QCommandLineOption &option);
+bool process(const QStringList &arguments);   // 或 process(app) / process(*QCoreApplication::instance())
+bool isSet(const QCommandLineOption &option) const;   // 用户是否传了该选项
+QString value(const QCommandLineOption &option) const;  // 取选项值
+```
+
+**QCommandLineOption 构造函数**（本项目用的是 4 参版本）：
+
+```cpp
+QCommandLineOption(
+    const QString &name,          // 长选项名：--name
+    const QString &description,   // 帮助文本
+    const QString &valueName,     // 值名（帮助里显示，可选）
+    const QString &defaultValue   // 默认值（可选）
+);
+```
+
+> 等价写法：`QCommandLineOption({QStringList() << "d" << "device", "描述"})` 可同时给短选项（`-d`）和长选项（`--device`）。本项目**只用长选项**，没有短选项别名。
+
+### 2.3.3 六个选项逐个拆解
+
+```cpp
+QCommandLineOption configOpt(
+    QStringLiteral("config"),
+    QStringLiteral("配置文件路径 (默认 /etc/smartcam/smartcam.conf)"),
+    QStringLiteral("config"),
+    QStringLiteral("/etc/smartcam/smartcam.conf")   // ← 有实际默认值
+);
+QCommandLineOption deviceOpt(
+    QStringLiteral("device"),
+    QStringLiteral("V4L2 设备路径, 例如 /dev/video0"),
+    QStringLiteral("device"),
+    QString()                                        // ← 空 → 运行时决定 Mock
+);
+QCommandLineOption portOpt(
+    QStringLiteral("http-port"),
+    QStringLiteral("MJPEG-over-HTTP 端口 (默认 8080)"),
+    QStringLiteral("port"),
+    ""                                               // ← 空 → 从配置文件读取
+);
+// ctrlPortOpt(control-port) / rtspPortOpt(rtsp-port) / fmtOpt(fmt) 同 portOpt 模式
+```
+
+| 变量 | 选项名 | 值名 | 默认值 | 作用 |
+|------|--------|------|--------|------|
+| `configOpt` | `--config` | `config` | `/etc/smartcam/smartcam.conf` | 配置文件路径 |
+| `deviceOpt` | `--device` | `device` | **空字符串** | V4L2 设备；空=Mock 模式 |
+| `portOpt` | `--http-port` | `port` | **空字符串** | HTTP 端口（空→读配置） |
+| `ctrlPortOpt` | `--control-port` | `port` | **空字符串** | 控制端口 |
+| `rtspPortOpt` | `--rtsp-port` | `port` | **空字符串** | RTSP 端口 |
+| `fmtOpt` | `--fmt` | `fmt` | **空字符串** | 像素格式 yuyv/mjpeg |
+
+**三种默认值策略（设计亮点）**：
+
+| 策略 | 选项 | 默认值 | 意图 |
+|------|------|--------|------|
+| A：有实际默认值 | `configOpt` | `/etc/smartcam/smartcam.conf` | 路径有明确系统约定 |
+| B：空 + 运行时决定 | `deviceOpt` | 空字符串 | 无配置时进入 Mock 模式 |
+| C：空 + 交给配置文件 | 4 个端口/格式 | 空字符串 | **让配置文件能生效**（哨兵值技巧） |
+
+> **为什么端口默认值留空而不直接写 8080？** 配置优先级是"命令行 > 配置文件 > 默认值"。若构造时填 8080，`parser.value(portOpt)` 永远非空，代码无法区分"用户没传"和"用户传了 8080"——配置文件里的端口会被永久遮蔽。**留空字符串作"哨兵值"，让 `isSet()` 成为唯一判断依据**，才能干净实现三级优先级。
+
+### 2.3.4 触发解析与取值
+
+```cpp
+parser.process(app);    // 等价 process(QCoreApplication::arguments())，自动跳过 argv[0]
+```
+
+`--help` / `--version` 由内置选项处理：解析到即打印并 `exit(0)`，不走到后面。
+
+**取值三连**：
+
+```cpp
+// ① 配置文件路径（第 2 层优先级）
+QString configPath;
+if (parser.isSet(configOpt)) {
+    configPath = parser.value(configOpt);       // --config 显式指定最高
+} else {
+    const char* home = getenv("HOME");
+    if (home) {
+        std::string userCfg = std::string(home) + "/.config/smartcam/smartcam.conf";
+        if (cfg.load(userCfg)) configPath = QString::fromStdString(userCfg);  // 用户级
+    }
+    if (configPath.isEmpty())
+        configPath = QStringLiteral("/etc/smartcam/smartcam.conf");            // 系统级
+}
+```
+
+**查找顺序**：`--config` 显式指定 → `~/.config/smartcam/smartcam.conf`（存在才用）→ `/etc/smartcam/smartcam.conf`。注意这里**先 `cfg.load()` 探测用户级配置是否存在**（load 失败返回 false），存在才用，否则落到系统级。
+
+**三级合并模式（以端口为例）**：
+
+```cpp
+int httpPort = parser.isSet(portOpt)
+    ? parser.value(portOpt).toInt()               // ① 命令行
+    : cfg.getInt("network", "http_port", 8080);   // ②③ 配置 > 默认
+```
+
+`cfg.getInt(section, key, defaultValue)` 本身是"配置 > 默认"合并（无 key 时返回 8080），外层 `isSet` 判断"命令行是否覆盖"。
+
+**大小写归一化（fmt）**：
+
+```cpp
+QString fmtStr = parser.isSet(fmtOpt)
+    ? parser.value(fmtOpt).toLower()              // ← .toLower() 统一小写
+    : (cfgLoaded ? QString::fromStdString(cfg.getString("camera", "format", "mjpeg")).toLower()
+                 : QStringLiteral("mjpeg"));
+```
+
+用户传 `--fmt MJPEG` 和 `--fmt mjpeg` 效果一样，避免大小写敏感导致格式匹配失败。
+
+### 2.3.5 实际使用示例
+
+```bash
+# ① 什么都不传 → Mock 模式（device 空）+ 配置默认端口
+./smartcam
+
+# ② 真实相机，全部默认
+./smartcam --device /dev/video0
+
+# ③ 指定端口（命令行覆盖配置）
+./smartcam --device /dev/video0 --http-port 9090 --rtsp-port 9554
+
+# ④ 指定格式 + 指定配置文件
+./smartcam --config /home/root/myconfig.conf --device /dev/video0 --fmt yuyv
+
+# ⑤ 帮助 / 版本
+./smartcam --help
+./smartcam --version
+```
+
+`--help` 输出大致为：
+
+```
+Usage: ./smartcam [options]
+SmartCam Linux — 基于 iMX6ULL 的智能相机流媒体系统
+
+Options:
+  -h, --help                    Displays help on commandline options.
+  -v, --version                 Displays version information.
+  --config <config>             配置文件路径 (默认 /etc/smartcam/smartcam.conf)
+  --device <device>             V4L2 设备路径, 例如 /dev/video0
+  --http-port <port>            MJPEG-over-HTTP 端口 (默认 8080)
+  --control-port <port>         TCP 控制协议端口 (默认 9000)
+  --rtsp-port <port>            RTSP 流媒体端口 (默认 8554)
+  --fmt <fmt>                   像素格式: yuyv | mjpeg (默认 mjpeg)
+```
+
+### 2.3.6 面试可讲的点
+
+1. **`argc` 非 const 引用**：`QApplication` 会消费 Qt 平台参数（如 `-platform linuxfb`），签名是 `int &argc`——与标准 `main(int argc, char* argv[])` 的差异点。
+2. **默认值留空 = 哨兵值技巧**：端口默认值故意留 `""`，让 `isSet()` 成为"用户是否显式传入"的唯一判断依据，从而干净实现三级优先级。
+3. **`parser.process(app)` vs `process(args)`**：`process(app)` 等价于 `process(QCoreApplication::arguments())`，自动跳过 `argv[0]`。
+4. **`--help`/`--version` 由 Qt 内置**：`addHelpOption()` / `addVersionOption()` 一行注册，解析到即自动打印退出。
+5. **`toLower()` 归一化**：格式参数统一小写，避免大小写敏感 bug。
+6. **isSet + value 的配合**：`isSet` 判断"传没传"，`value` 取"传的值"——**注意即使有默认值，isSet 仍为 false**，这正是三级合并能工作的前提。
+
+## 2.4 回调注入（业务编排）
+
+main.cpp 通过 `gui.onXxxChanged(lambda)` 把 GUI 事件桥接为业务动作，lambda 捕获 `capture`/`rtspServer` 等指针：
+
+```cpp
+gui.onResolutionChanged([capture](int w, int h) {
+    g_state.paused = true;                    // ① 暂停采集线程
+    // ② 等采集线程确认暂停（getFrame 1s 超时，最多等 1.1s）
+    capture->stopCapture();                   // ③ 安全停止
+    capture->setFormat(w, h, ...);            // ④ 改格式
+    capture->startCapture();                  // ⑤ 重启
+    g_state.paused = false;                   // ⑥ 恢复
+});
+```
+
+**为什么要"暂停→停流→改→重启"**：V4L2 的 `S_FMT` 在 STREAMON 下返回 `EBUSY`，且改格式时 mmap 缓冲正在被采集线程使用——必须先让采集线程确认暂停再动。
+
+**面试点**：回调注入 = **依赖倒置**——display 模块不依赖 camera 类，只依赖 main.cpp 注入的 `std::function`。这使 GUI 可独立测试（Mock 模式），也把"业务编排"集中在 main.cpp 一处。
+
+---
+
+# 第三部分 核心函数深度解析
+
+> 这一部分是 main.cpp 里三个**容易被忽略但面试价值高**的函数/机制：两个进程资源读取器（`readSelfCpuJiffies` / `readSelfRssKB`）和一个性能插桩体系（`[PERF]`）。它们共同构成"性能排查地基"。
+
+## 3.1 readSelfCpuJiffies() —— 进程 CPU 时间读取（`main.cpp:116-152`）
+
+### 作用
+
+**一句话**：读取当前进程（smartcam 自己）从启动到此刻累计消耗的 **CPU 时间**（用户态 utime + 内核态 stime，单位 jiffies），供 `[PERF]` 插桩计算"进程整体 CPU 占用率"。
+
+**为什么需要它**：程序有 5~6 个线程，CPU 被所有线程共享消耗。如果只统计 main 线程视角，CPU% 会严重失真。`/proc/self/stat` 记录的是**整个进程所有线程**的累计 CPU 时间，差值除以时间间隔才是准的全进程 CPU%。
+
+### 完整代码
+
+```cpp
+/** @brief 读取 /proc/self/stat 的 utime+stime（第 14+15 字段，单位 jiffies） */
+static uint64_t readSelfCpuJiffies() {
+    FILE* fp = fopen("/proc/self/stat", "r");
+    if (!fp) return 0;
+    char buf[512] = {0};
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return 0; }
+    fclose(fp);
+    // 跳过 "pid (comm) state ..."：comm 可能含空格/括号，从最后一个 ')' 后解析
+    char* p = strrchr(buf, ')');
+    if (!p) return 0;
+    unsigned long long utime = 0, stime = 0;
+    // ')' 后是 " state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
+    //   utime stime ..." → utime 是第 12 个字段（从 state 算起第 3 个数值）
+    int skipped = 0; char state = 0; unsigned long long tmp = 0;
+    char* tok = p + 1;
+    while (skipped < 12 && tok) {
+        if (skipped == 0) {                    // 第 1 个 token 是 state（字符）
+            while (*tok == ' ') ++tok;
+            state = *tok;
+            tok = strchr(tok, ' ') + 1;
+            skipped = 1;
+            continue;
+        }
+        while (*tok == ' ') ++tok;
+        sscanf(tok, "%llu", &tmp);
+        tok = strchr(tok, ' ') + 1;
+        skipped++;
+    }
+    utime = tmp;                               // skipped==12 时 tmp 即 utime
+    while (*tok == ' ') ++tok;
+    sscanf(tok, "%llu", &stime);               // 再读一个为 stime
+    return utime + stime;
+}
+```
+
+### 逐段拆解
+
+**① 读文件（118-125 行）**
+`/proc/self/stat` 是 Linux 提供的进程信息文件，**一行**、空格分隔，格式：
+```
+1234 (smartcam) S 1 1234 1234 0 -1 4194560 168 ... 9 5 0 0 20 0 ...
+│    │        │
+│    └── comm（进程名，可能含空格和括号！）
+└── pid
+```
+**经典坑**：第 2 字段 `comm` 用 `(...)` 括起来且可能含右括号，所以**不能**从第 1 个 `)` 开始解析，必须用 `strrchr`（`r`=reverse）找**最后一个** `)`——最后一个 `)` 一定是 comm 的结束符。
+
+**② 字段定位（127-130 行）**
+`/proc/self/stat` 字段序号从 3 开始（`man proc`）。CPU 时间相关：
+- **第 14 字段 `utime`**：用户态 CPU 时间（jiffies）
+- **第 15 字段 `stime`**：内核态 CPU 时间（jiffies）
+
+`)` 之后紧跟 `state`（第 3 字段），所以从 state 数：`state(3) ppid(4) pgrp(5) session(6) tty(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13) utime(14) stime(15)`——**跳过 12 个 token**，第 12 个是 utime，再往后一个是 stime。
+
+**③ 逐 token 解析（131-150 行）**
+- 首 token `state` 是**字符**（如 `S`），特殊处理：`state = *tok`
+- 后续 11 个 token 都是数字，`sscanf(tok, "%llu", &tmp)` 读取，`strchr(tok,' ')+1` 跳空格
+- 循环结束时 `tmp` = utime；退出后**再读一个** = stime
+- 返回 `utime + stime`
+
+### 调用方（`main.cpp:1185-1195`）
+
+```cpp
+static uint64_t lastSelfCpu = 0;
+uint64_t selfCpu = readSelfCpuJiffies();
+if (lastSelfCpu > 0) {
+    double cpuPctAll = (selfCpu - lastSelfCpu) / dt / 100.0 * 100.0;
+    //                 Δjiffies  / 秒 / 100Hz × 100
+    LOG_INF("[PERF] ... cpu=%.0f%% ...", cpuPctAll, ...);
+}
+lastSelfCpu = selfCpu;   // 第一次 lastSelfCpu==0，只记录不输出
+```
+
+`lastSelfCpu` 是 `static`，首次调用为 0 走 else 分支只记录，避免假数据。jiffies 单位 100Hz = 1 jiffy = 10ms。
+
+### 面试追问
+
+**Q1：为什么不用 `getrusage()` 而要读 `/proc/self/stat`？**
+**A**：两者都能拿全进程 CPU 时间。选 `/proc` 是因为嵌入式 Linux 上最通用、无依赖、可读性好；且 `/proc/self/stat` 一行能同时取到 utime/stime，配合 `strrchr` 解析也顺带展示了"手写 proc 解析"的能力。`getrusage` 的 `RUSAGE_SELF` 也是选项，但 `/proc` 更直观。
+
+**Q2：为什么返回累计值而不是瞬时值？**
+**A**：配合调用方做**差值**——每 5s 取一次，`(本次 - 上次) / 间隔` 得到这 5s 的平均 CPU%，避免瞬时采样的抖动。这是"滑窗差值法"，也是性能分析看趋势不看瞬时的原则。
+
+## 3.2 readSelfRssKB() —— 进程内存占用读取（`main.cpp:154-168`）
+
+### 作用
+
+**一句话**：读取 `/proc/self/status` 文件中的 `VmRSS:` 字段（进程当前常驻物理内存，单位 KB），供 `[PERF]` 插桩展示 `rss=xxxKB`。
+
+### 完整代码
+
+```cpp
+/** @brief 读取 /proc/self/status 的 VmRSS（KB） */
+static long readSelfRssKB() {
+    FILE* fp = fopen("/proc/self/status", "r");
+    if (!fp) return 0;
+    char line[256];
+    long rss = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {  // 行首匹配 "VmRSS:"
+            sscanf(line + 6, "%ld", &rss);      // 跳过 "VmRSS:" 后解析数字
+            break;
+        }
+    }
+    fclose(fp);
+    return rss;
+}
+```
+
+### 为什么是 RSS 而非 VSZ
+
+| 指标 | 含义 | 为什么不用 |
+|------|------|-----------|
+| **RSS** | 常驻物理内存 | ✅ 最接近"这个进程吃了多少内存" |
+| VSZ | 虚拟地址空间大小 | ❌ 含 mmap 文件、未触碰的堆，虚高（可能几个 GB） |
+| PSS | 按共享比例分摊 | 更准但 `/proc/self/status` 非主字段，解释成本高 |
+
+对嵌入式（512MB 板子，可用 <200MB），**RSS 是判断"会不会 OOM"的最直接指标**。
+
+### 与 readSelfCpuJiffies() 的对比
+
+| 维度 | readSelfCpuJiffies() | readSelfRssKB() |
+|------|----------------------|-----------------|
+| 源文件 | `/proc/self/stat`（**一行**，50+ 字段） | `/proc/self/status`（**多行**，`key: value`） |
+| 解析方式 | 手写 token 遍历，跳 12 字段 | **逐行 `fgets`** + `strncmp` 前缀匹配 |
+| 坑点 | `comm` 含括号 → `strrchr` 找最后 `)` | 无格式坑 |
+
+**为什么两种解析策略？** `/proc/self/stat` 是扁平一行、全靠位置 → 只能按字段序号跳；`/proc/self/status` 是每行 `Key: Value` → 前缀匹配更直观、对字段顺序不敏感。**针对文件结构选解析策略**。
+
+### 面试追问
+
+**Q1：`strncmp(line, "VmRSS:", 6)` 为什么用 `strncmp` 不用 `strcmp`？**
+**A**：`line` 是整行 `"VmRSS:\t1234\n"`，`strcmp` 会比较到结尾必然不等；`strncmp` 只比较前 6 个字符的前缀，恰好匹配 key。这是"前缀匹配"的经典用法。
+
+**Q2：找不到 `VmRSS:` 行会怎样？**
+**A**：返回 0（`rss` 初值），perf 日志显示 0，不崩溃。理论正常系统必有此字段，属防御性兜底。
+
+## 3.3 [PERF] 性能插桩机制（`main.cpp:83-106` + `1155-1197`）
+
+### 作用
+
+**一句话**：每 5s 打印一行带 `[PERF]` 前缀的日志，量化"帧搬运字节数 / 处理帧率 / CPU 占用 / 内存占用"四个指标，用于**改造前后 A/B 对比**（尤其帧池零拷贝优化）和**瓶颈定位**。
+
+这正是支撑文档里"帧池零拷贝把拷贝降 95% 但帧率没变 → 最终定位摄像头硬件 10fps"那场排查的核心工具。
+
+### 架构：生产者-采样器模式
+
+```
+┌─ 生产端（多个线程，各自原子累加）─────────────┐
+│  采集线程  → g_perf.copyBytes += fb.length     │  [PERF] ①
+│  处理线程  → g_perf.copyBytes += localFrame    │  [PERF] ②
+│  displayTimer → g_perf.copyBytes += raw.size   │  [PERF] ③ (原始帧)
+│  displayTimer → g_perf.pixBytes += w*h*3       │  [PERF] ⑤ (上屏RGB)
+│  采集线程  → g_perf.frames++                   │  帧数入口
+└──────────────────────┬────────────────────────┘
+                       │ 每帧累加（无锁原子）
+┌──────────────────────▼────────────────────────┐
+│  采样端：perfTimer（Qt 主线程，每 5s 一次）      │
+│  读累计值 → 减上次快照 → 除以时间间隔 → 打印     │
+└───────────────────────────────────────────────┘
+```
+
+**为什么用 `std::atomic`**：采集/处理/GUI 三个线程并发累加同一计数器，原子保证无锁线程安全，不阻塞任何取帧/推流路径。
+
+### 数据结构（`PerfStats`，`main.cpp:94-106`）
+
+```cpp
+struct PerfStats {
+    // ── 累加区：多线程写，原子 ──
+    std::atomic<uint64_t> copyBytes;   // 帧数据搬运字节（①②③）
+    std::atomic<uint64_t> pixBytes;    // 上屏 RGB 拷贝（⑤，单独算）
+    std::atomic<uint64_t> frames;      // 处理帧数
+    std::atomic<uint64_t> cpuJiffies;  // CPU jiffies（后改用 /proc/self）
+    // ── 快照区：仅主线程 PERF 定时器读写（非原子，无竞争）──
+    uint64_t snapBytes, snapPix, snapFrames, snapCpu;
+    double   snapTime;
+};
+static PerfStats g_perf;
+```
+
+**设计要点**：**累加区原子、快照区非原子**——快照只在主线程采样器读写，无竞争；累加区被多线程写，必须原子。这是"按访问模式决定同步策略"的体现。
+
+### 各统计点的精确含义（理解关键）
+
+| 标记 | 位置 | 统计什么 | 目的 |
+|------|------|---------|------|
+| ① | 采集线程 `:952` | `fb.length`（原始帧） | 采集 → `g_state` 的深拷贝 |
+| ② | 处理线程 `:1009` | `localFrame.size()` | 处理线程取帧的深拷贝 |
+| ③④ | displayTimer `:1123` | `raw.size()`（原始帧） | **③④ 已消除**——帧池改造后不再有 setFrame assign + QImage.copy() |
+| ⑤ | displayTimer `:1126` | `slot->width*height*3`（RGB24） | QPixmap::fromImage 上屏必需拷贝，**单独计入 pixBytes** |
+| frames | 采集线程 `:953` | 每帧 +1 | 处理帧率入口 |
+
+**关键洞察**：`copyBytes` 和 `pixBytes` **分开统计**——帧池零拷贝的目标是消掉 ③④ 两次 RGB 深拷贝，改造后 `copyBytes` 只含原始帧（JPEG ~0.1MB），`pixBytes` 是物理上屏必需拷贝。**把"可优化的拷贝"和"物理必需的拷贝"分开，才能看到优化到底省了什么**。
+
+### 采样与计算（perfTimer，`:1160-1196`）
+
+```cpp
+double dt = now - g_perf.snapTime;                     // 距上次采样秒数
+if (dt <= 0.0) { g_perf.snapTime = now; return; }      // 防御：首次
+
+double copyMB = (bytes - g_perf.snapBytes) / dt / 1e6;    // MB/s
+double pixMB  = (pix   - g_perf.snapPix)   / dt / 1e6;
+double fps    = (frames - g_perf.snapFrames) / dt;         // 帧率
+long   rssKB  = readSelfRssKB();
+```
+
+**滑窗差值法**：每 5s 算一次"这 5 秒的平均值"，平滑抖动；代价是最多滞后 5s 反映变化。性能分析要**看趋势不看瞬时**。
+
+### CPU% 的两个口径（一个演进点）
+
+代码里其实有**两套** CPU 统计：
+1. `g_perf.cpuJiffies`（`:1164`）：有定义，但...
+2. **实际打印用 `readSelfCpuJiffies()`**（`:1185-1195`）：
+
+```cpp
+// 采集线程记录 CPU 用 main 线程视角不准，改用 /proc/self 全进程统计：
+static uint64_t lastSelfCpu = 0;
+uint64_t selfCpu = readSelfCpuJiffies();
+if (lastSelfCpu > 0) {
+    double cpuPctAll = (selfCpu - lastSelfCpu) / dt / 100.0 * 100.0;  // 全进程
+    LOG_INF("[PERF] copy=%.1fMB/s (+pix %.1f) frames=%.1ffps cpu=%.0f%% rss=%ldKB",
+            copyMB, pixMB, fps, cpuPctAll, rssKB);
+} else {
+    LOG_INF("[PERF] copy=%.1fMB/s (+pix %.1f) frames=%.1ffps cpu=%.0f%% rss=%ldKB",
+            copyMB, pixMB, fps, cpuPct, rssKB);   // 首次退化路径
+}
+lastSelfCpu = selfCpu;
+```
+
+**演进原因**（注释明示）：早期想在采集线程手动累加 jiffies，但**单线程视角不准**——CPU 被所有线程共享。改用 `/proc/self` 一次读全进程 utime+stime，差值即全进程 CPU%。`g_perf.cpuJiffies` 成遗留字段（首次采样退化路径仍用）。
+
+### 输出示例与解读
+
+```
+[PERF] copy=0.5MB/s (+pix 3.3) frames=10.0fps cpu=97% rss=8.2MB
+```
+
+| 字段 | 含义 | 排查价值 |
+|------|------|---------|
+| `copy=0.5MB/s` | 帧搬运带宽 | 帧池优化后 10.0→0.5（-95%）看这里 |
+| `(+pix 3.3)` | 上屏 RGB 拷贝带宽 | 物理必需拷贝，单独标注 |
+| `frames=10.0fps` | 处理帧率 | 与目标 30fps 对比 |
+| `cpu=97%` | 全进程 CPU 占用 | 判断瓶颈在不在 CPU |
+| `rss=8.2MB` | 常驻内存 | 内存预算验证 |
+
+### 这套机制如何支撑那场"瓶颈排查"（面试重点）
+
+文档 3.2 场景 D 的完整推理链，每一步都有 `[PERF]` 数据支撑：
+
+1. `copy=10.0MB/s` → 判断拷贝是最大优化项 → 做帧池零拷贝
+2. 帧池后 `copy=0.5MB/s`（-95%）**但 frames 仍 10fps、cpu 仍 99%** → 排除拷贝是瓶颈
+3. 插桩显示解码 15.6ms、渲染 9ms、处理线程已跳过 → 排除应用层任务
+4. **去掉渲染后 cpu=67%（有 33% 空闲）但帧率仍 10** → CPU 有空闲却提不上去 → 瓶颈在供给端
+5. `v4l2-ctl` 直测 → 摄像头硬件实际输出 10fps（能力列表声称 30fps）
+
+**核心方法论**：`[PERF]` 提供**可量化、可对照**的证据——每次优化跑同场景对比输出行，数值变没变一目了然，避免靠直觉猜瓶颈。
+
+### 面试追问
+
+**Q1：为什么 copyBytes 和 pixBytes 分开统计？**
+**A**：帧池零拷贝的目标是消掉显示链路的 RGB 深拷贝（旧 setFrame assign + QImage.copy() 两次）。分开统计后，`copyBytes` 只剩物理必需的原始帧搬运（JPEG），`pixBytes` 是上屏必需的 QPixmap 转换——改造效果直接看 copyBytes 从 10.0 掉到 0.5 就是证据。若不分开，无法区分"优化掉的"和"省不掉的"。
+
+**Q2：为什么用滑窗差值而不是每秒瞬时采样？**
+**A**：瞬时采样受两帧之间的相位影响大、抖动明显；5s 滑窗给出平滑的平均值，适合看趋势。代价是反馈滞后，对"实时调参"不够敏感——但这正是性能分析要的：稳定性优先于实时性。
+
+**Q3：CPU% 为什么不用 g_perf.cpuJiffies 而是另读 /proc/self？**
+**A**：这是代码演进留下的"历史注脚"。早期想在工作线程里手动累加 CPU 时间，但单线程视角无法代表全进程（smartcam 有 5 个线程，CPU 被共享消耗）。`/proc/self/stat` 一次读全进程所有线程的累计 CPU 时间，差值才是准的全进程 CPU%。能主动讲出这段演进，说明你真的理解为什么"线程视角的 CPU 统计会失真"。
+
+**Q4：[PERF] 对实际优化决策有什么帮助？**
+**A**：它让"优化是否有用"变成可验证的事实。帧池零拷贝做完，跑同一场景，copy 从 10.0 掉到 0.5，但 frames 纹丝不动——这个"优化了却没效果"的反直觉结果，正是靠 [PERF] 暴露出来的，从而推动继续排查（最终定位硬件 10fps）。**没有插桩，就只能靠猜**。
+
+---
+
+# 第四部分 面试速查表
+
+| 主题 | 一句话答案 |
+|------|-----------|
+| main.cpp 定位 | 胶水层：线程编排 + 全局状态 + 回调注入，不实现具体功能 |
+| 几线程 | Qt 主线程 + 采集 + 处理 + RTSP + 控制（+ HTTP 客户端动态线程） |
+| 采集线程为什么只做轻活 | 慢客户端/磁盘 IO 不阻塞取帧，防 V4L2 4 缓冲耗尽 |
+| 为什么 atomic 不用 mutex | 单标志位读多写少，atomic 无锁开销；复合读改写才用 mutex |
+| 配置三级优先级 | 命令行 > 配置文件 > 硬编码默认值 |
+| 命令行用什么解析 | QCommandLineParser + QCommandLineOption，process(app) 触发解析 |
+| 为什么端口默认值留空 | 哨兵值技巧：让 isSet() 成为唯一判断，配置文件端口才不会被遮蔽 |
+| 怎么给短选项 -d | QCommandLineOption({QStringList() << "d" << "device", ...}) 传 QStringList |
+| --help/--version 哪来的 | addHelpOption()/addVersionOption() 内置，process 时自动打印退出 |
+| 回调注入是什么 | std::function 依赖倒置，GUI 不依赖具体模块，可独立测试 |
+| 为什么切分辨率要暂停 | S_FMT 在 STREAMON 下 EBUSY + mmap 缓冲使用中，需双向握手 |
+| readSelfCpuJiffies 读什么 | /proc/self/stat 的 utime+stime（全进程 CPU，jiffies） |
+| 为什么 strrchr 找最后 `)` | comm 字段可能含括号，最后一个 `)` 才是 comm 结束符 |
+| readSelfRssKB 读什么 | /proc/self/status 的 VmRSS（进程常驻物理内存 KB） |
+| 为什么选 RSS 不选 VSZ | RSS 是真实物理内存，VSZ 虚高，嵌入式判断 OOM 看 RSS |
+| 两种 proc 解析为何不同 | stat 扁平一行按位置跳字段；status 按行前缀匹配 key:value |
+| [PERF] 是什么 | 每 5s 打印 copy/pix/frames/cpu/rss 五维，A/B 对比优化效果 |
+| 为什么 copy/pix 分开 | 区分"可优化的拷贝"与"物理必需的拷贝"，看优化到底省了什么 |
+| CPU% 为什么用 /proc/self | 单线程视角失真（多线程共享 CPU），全进程差值才准 |
+| 滑窗差值法 | 每 5s 取累计值差/时间间隔 → 平均值，看趋势不看瞬时 |
+| [PERF] 最大价值 | 让"优化是否有用"可量化对照，避免靠直觉猜瓶颈 |
+| 那场排查的结论 | 帧池降拷贝 95% 但帧率不变 → 逐步排除 → v4l2-ctl 直测确认硬件 10fps |
+
+---
+
+*本文档基于 SmartCam-Linux-on-imx6ull 项目源码（commit: main 分支），聚焦 `src/main.cpp` 的全局状态、线程编排、配置解析与三个核心函数（readSelfCpuJiffies / readSelfRssKB / [PERF] 插桩）。配合阅读：`docs/learn/面试复习-camera模块.md`（采集/处理线程下游）、`docs/learn/面试复习-display模块.md`（displayTimer 上游）、`docs/debug-summary.md` #27（瓶颈排查实录）。*
