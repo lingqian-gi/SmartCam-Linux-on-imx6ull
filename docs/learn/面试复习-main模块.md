@@ -15,11 +15,14 @@
    - 1.3 全局状态设计
    - 1.4 代码结构与关系全景图
    - 1.5 V4L2 缓冲与 RGB 帧池的关系
+   - 1.6 FramePool 四方法详解（acquire / share / release / publish）
+   - 1.7 C++ 内存序（memory_order）详解
 2. [第二部分 线程编排与配置解析](#第二部分-线程编排与配置解析)
    - 2.1 六线程模型
    - 2.2 配置三级优先级
    - 2.3 命令行解析详解（QCommandLineParser）
    - 2.4 回调注入（业务编排）
+   - 2.5 三个相机回调的区别（onCameraControlChanged / onResolutionChanged / onFormatChanged）
 3. [第三部分 核心函数深度解析](#第三部分-核心函数深度解析)
    - 3.1 readSelfCpuJiffies() —— 进程 CPU 时间读取
    - 3.2 readSelfRssKB() —— 进程内存占用读取
@@ -515,6 +518,362 @@ V4L2 缓冲到 `g_state` 的**原始帧拷贝省不掉**（JPEG 小，~0.1MB，�
 **Q4：两者各自解决什么问题？一句话？**
 **A**：V4L2 缓冲解决"**怎么高效地从硬件拿帧**"（mmap 零拷贝 + 租借周转）；FramePool 解决"**怎么高效地把帧分发给显示**"（引用计数共享 + 零拷贝上屏）。`g_state` 是连接两者的"所有权过渡带"。
 
+## 1.6 FramePool 四方法详解（acquire / share / release / publish）
+
+> 面试高频：四个方法怎么配合？为什么不用锁？核心一句话——**这是"数据共享"而非"数据搬移"**：不拷贝帧数据，而是通过引用计数让多线程共享同一块内存。四方法是这套共享机制的四把钥匙。
+
+### 1.6.1 先建立心智模型：核心不变量
+
+关键数据结构（`frame_pool.h:43-50`）：
+
+```cpp
+struct FrameSlot {
+    std::vector<uint8_t> data;      // 帧数据（RGB24）
+    std::atomic<int>     refs{0};   // ★ 引用计数：0=空闲, >0=被持有
+    uint64_t             seq{0};    // 帧序号
+    int width, height;
+    PixelFormat format;
+};
+
+class FramePool {
+    std::vector<std::unique_ptr<FrameSlot>> m_slots;   // 2 个槽
+    std::atomic<FrameSlot*> m_current{nullptr};        // ★ 当前发布槽指针
+};
+```
+
+**核心不变量**（整个设计的灵魂）：
+> **`acquire` 只借空闲槽（refs==0）** —— 由此天然实现读写分离、无锁并发。
+
+### 1.6.2 四个方法逐一拆解
+
+**① acquire() —— 生产者"借"一个空闲槽来写**（`frame_pool.h:76-83`）：
+
+```cpp
+FrameSlot* acquire() {
+    for (auto& s : m_slots) {              // 遍历所有槽
+        int expected = 0;
+        if (s->refs.compare_exchange_strong(expected, 1))  // CAS：期望 refs==0，成功则置 1
+            return s.get();                // 借到槽，返回指针
+    }
+    return nullptr;                        // 全被占用 → 池满，返回空
+}
+```
+
+- 用 **CAS（Compare-And-Swap）** 找第一个 `refs==0`（空闲）的槽
+- CAS 成功：`refs` 从 0 变成 1，返回该槽 → **该槽被本线程独占写入**
+- 全占用：返回 `nullptr`（调用方丢帧，不阻塞）
+- **作用**：生产者写入前调用，**只借 refs==0 的槽**——保证写槽时绝无消费者在读它（读写分离的根源）
+
+**② publish() —— 生产者把写好的槽"发布"为当前**（`frame_pool.h:121-127`）：
+
+```cpp
+void publish(FrameSlot* s) {
+    std::atomic_thread_fence(std::memory_order_release);  // 先确保 data 写完整
+    FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);  // 原子替换 current
+    if (old)
+        release(old);   // 释放旧 current 的"池持有引用"（refs 1→0），旧槽可复用
+}
+```
+
+- **release fence**：保证 `s->data` 的写入（解码结果）**先于** `m_current` 指针的可见——消费者看到新指针时，数据一定完整
+- **`m_current.exchange(s)`**：原子地把 `m_current` 从旧槽指向新槽，**返回旧槽指针**
+- **释放旧槽的池持有引用**：`release(old)` 使旧槽 refs 1→0，归零后可被 `acquire` 复用
+- **作用**：把"刚写好的槽"变成"消费者可见的当前帧"。**publish 不释放 s 的引用**——新槽以 refs==1 持续被池持有，保证发布期间不被生产者重写（详见 1.6.4）
+
+**③ share() —— 消费者"共享"当前槽的引用**（`frame_pool.h:92-97`）：
+
+```cpp
+FrameSlot* share() {
+    FrameSlot* cur = m_current.load(std::memory_order_acquire);  // 读当前槽指针
+    if (cur)
+        cur->refs.fetch_add(1, std::memory_order_relaxed);        // refs+1
+    return cur;
+}
+```
+
+- `m_current.load(acquire)`：取当前槽指针（acquire 与 publish 的 release fence 配对，保证能看到完整数据）
+- `refs.fetch_add(1)`：**引用计数 +1**，表示"又一个消费者持有这个槽"
+- **作用**：消费者（GUI）读帧前调用，**refs 1→2**——即使 publish 换帧释放旧槽，这个消费者的引用还在，数据不会丢
+
+**④ release() —— 消费者用完归还引用**（`frame_pool.h:102-105`）：
+
+```cpp
+void release(FrameSlot* s) {
+    if (!s) return;
+    s->refs.fetch_sub(1, std::memory_order_release);  // refs-1
+}
+```
+
+- **作用**：消费者用完归还。当**最后一个** release 使 refs 归 0 时，槽回到空闲态，重新可被 `acquire` 借出复用
+
+### 1.6.3 四方法如何配合（生命周期全景）
+
+用 RGB 显示池（容量 2）的完整一帧流程演示：
+
+```
+时间 →  生产者(displayTimer)                   消费者(GUI)
+─────────────────────────────────────────────────────────────────
+ ①    slot = acquire()          → refs: 0→1（独占写入权）
+ ②    解码 → slot->data         → 写 RGB24（refs==1，无人读它）
+ ③    publish(slot)             → m_current 指向它；refs 保持 1（池持有）
+                                  └ 旧 current 被 release → 0（可复用）
+ ④                              → displaySlot = share()
+                                     m_current.load() → refs: 1→2
+ ⑤                              → setFrameShared(displaySlot)
+                                     → 消费数据（refs==2：池1份+GUI1份）
+ ⑥   （下一帧）acquire 找 refs==0 → 旧槽已是0 → 借到写新帧
+ ⑦                              → GUI 换帧时 release(displaySlot)
+                                     → refs: 2→1（池仍持有，current 槽不被重写）
+```
+
+**引用计数状态机**：
+
+```
+refs=0 ──acquire──► refs=1（生产者独占写入）
+refs=1 ──publish──► refs=1（池持有 current，等待消费者）
+refs=1 ──share───► refs=2（池 + 1个消费者）
+refs=2 ──release──► refs=1（消费者归还）
+refs=1 ──publish换帧──► release(old) → refs=0（旧槽可复用）
+refs=0 ──acquire──► ...（循环）
+```
+
+### 1.6.4 深入：publish 的"引用转移"语义（易错点详解）
+
+> ⚠️ **上一节状态机图最容易误导的地方**：`refs=1 ──publish──► refs=1` 和 `refs=1 ──publish换帧──► refs=0` **不是同一个槽的连续状态，而是两个不同的槽**。publish 每次同时影响两个槽。
+
+**核心：refs 只计数，不区分"这 1 个引用是谁的"**。同样 `refs==1`，有三种不同含义：
+
+| refs==1 时 | 这 1 个引用是谁的 | 代码中发生的事 |
+|-----------|------------------|---------------|
+| 刚 `acquire()` 完 | **生产者**（有写入权） | `refs 0→1`，生产者独占写 |
+| 刚 `publish()` 完 | **池**（m_current 指向它） | 引用从"生产者"**转移**给"池" |
+| 消费者 `share()` 后 release 一次 | **池**（消费者已归还） | 消费者用完，池仍持有 |
+
+**关键**：publish 不改变 refs 的数值，它改变的是**这 1 个引用属于谁**——从"生产者的写入权"变成"池的 current 持有权"。这就是"refs=1 → publish → refs=1"看起来没变、但语义完全变了的原因。
+
+**逐行走代码**（关键在 `exchange` 的返回值）：
+
+```cpp
+void publish(FrameSlot* s) {
+    std::atomic_thread_fence(std::memory_order_release);   // ① 数据写完整
+    FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);  // ② ★
+    if (old)
+        release(old);                                      // ③ 释放旧槽
+}
+```
+
+`m_current.exchange(s)` 是**原子交换**：把 `m_current` 指向新槽 `s`，**同时返回交换前指向的旧槽 `old`**。这一步同时完成两件事：
+
+```
+调用前：m_current → old（旧槽，refs=1，池持有）
+        s（新槽，refs=1，生产者写入权）
+
+exchange(s) 后：m_current → s（新槽接管 current 地位）
+               返回值 = old
+
+然后：release(old) → 旧槽 refs 1→0
+```
+
+**完整两帧流程**（跟着 refs 走一遍，池容量 2，槽 A、B）：
+
+```
+步骤    代码                     槽A.refs    槽B.refs    谁持有槽A的引用
+─────────────────────────────────────────────────────────────────────
+1      slot = acquire()          0→1        0          [生产者]
+2      解码写入 slot->data       1          0          [生产者]
+3      publish(slot)            1（不变）    0          [池]  ← 引用从生产者转移给池
+       m_current: nullptr → A
+
+4      displaySlot = share()     1→2        0          [池 + 消费者]
+5      GUI 换帧后 release()      2→1        0          [池]（消费者归还）
+
+6      slot = acquire()          1          0→1        [池(A)]、[生产者(B)]
+       ★ acquire 只借 refs==0 的槽 → 借到 B（A 是 refs==1，借不到 → 不会被重写）
+7      解码写入 B                1          1          [池(A)]、[生产者(B)]
+8      publish(B)：
+       m_current.exchange(B)      → m_current: A→B，返回值 = A（旧槽）
+       release(A)                1→0        1          A 归零，B 由生产者转池
+```
+
+**第 8 步才是"refs=1 → release → refs=0"的真相**：旧槽 A 在"别人（B）发布"时被 `exchange` 的返回值带出来，然后 `release(old)` 释放**池持有 A 的那 1 个引用**，A 才从 1 变 0。
+
+**为什么要有这层"引用转移"**：
+
+| 问题 | 机制 |
+|------|------|
+| 新槽发布后，为什么不能马上被生产者重写？ | 因为它的 refs 还是 1（池持有）→ `acquire` 借不到它 |
+| 旧槽被换下后，为什么可以立刻复用？ | 因为 `release(old)` 让它 refs 归 0 → `acquire` 借得到它 |
+
+**逻辑闭环**：
+- `acquire` 只借 refs==0 → 池持有的 current 槽（refs==1）永远不会被生产者重写
+- 换帧时池"放弃"旧槽（release→0）→ 旧槽回到可复用池
+- 如果消费者 `share()` 过旧槽（refs 变 2），换帧时 release 后是 2→1，**仍 >0** → 消费者还在读，不能复用，等消费者 release 才归 0
+
+### 1.6.5 为什么不直接用锁？（无锁设计的关键）
+
+**整个池没有一把 mutex**，靠两个原子机制保证安全：
+
+| 机制 | 保证什么 |
+|------|---------|
+| **`acquire` 只借 refs==0** | 生产者写槽时，绝无消费者在读该槽（读写分离） |
+| **引用计数 `share`/`release`** | 消费者持有时数据不会丢；最后一个 release 才复用 |
+| **`m_current` 原子指针 + 内存序** | publish 的 release fence 与 share 的 acquire load 配对，保证"看到指针 = 看到完整数据" |
+| **CAS（`compare_exchange_strong`）** | 多个生产者同时 acquire 时，只有一个能成功借到同一槽 |
+
+**为什么能无锁**：因为"借槽写"和"读 current"操作的是**不同的槽**——生产者写 refs==1 的槽，消费者读 refs>0 的已发布槽，两者永不冲突。这就是 `main.cpp:114` 注释说的"容量 2：GUI 持 1 槽 + 解码写 1 槽，天然双缓冲，无需锁"。
+
+### 1.6.6 实际调用点（main.cpp + gui.cpp）
+
+```cpp
+// main.cpp displayTimer（生产者路径）
+FrameSlot* slot = g_rgbPool->acquire();     // ① 借槽
+if (!slot) return;                          //   池满丢帧，不阻塞
+decodeJPEGtoRGB(raw.data(), raw.size(), slot->data, dw, dh);  // ② 解码入槽
+slot->seq++;
+g_rgbPool->publish(slot);                   // ③ 发布
+FrameSlot* displaySlot = g_rgbPool->share();// ④ 共享引用（生产者自己 share 给 GUI）
+if (displaySlot) gui.setFrameShared(displaySlot);  // ⑤ GUI 接管
+gui.requestRefresh();
+
+// gui.cpp setFrameShared（消费者路径）
+void CameraGUI::setFrameShared(FrameSlot* slot) {
+    if (m_heldSlot) {
+        if (g_rgbPool) g_rgbPool->release(m_heldSlot);  // ⑥ 释放上一帧
+        m_heldSlot = nullptr;
+    }
+    m_heldSlot = slot;    // 持有新帧引用（refs 保持 2：池1 + GUI1）
+    m_currentFrame.data = slot->data.data();   // 零拷贝指向共享内存
+    ...
+}
+
+// gui.cpp ~CameraGUI / 换帧时
+g_rgbPool->release(m_heldSlot);   // ⑦ GUI 归还引用
+```
+
+### 1.6.7 面试速记表
+
+| 方法 | 谁调用 | refs 变化 | 作用 | 对应生活比喻 |
+|------|--------|-----------|------|-------------|
+| `acquire` | 生产者 | 0→1 | 借空闲槽独占写入 | 借空房间写文章 |
+| `publish` | 生产者 | 保持 1（换帧时旧槽 1→0） | 把写好的槽发布为当前 | 贴到公告栏 |
+| `share` | 消费者 | 1→2 | 共享当前槽引用 | 抄一份（不搬走） |
+| `release` | 消费者 | 2→1→0 | 归还引用，最后一人释放 | 用完了交还钥匙 |
+
+**面试一句话**：
+> "acquire 是生产者借空闲槽（refs 0→1，CAS 保证独占）；publish 把写好的槽发布为当前（release fence 保证数据先于指针可见，换帧时旧槽释放）；share 是消费者取当前槽的共享引用（refs+1，保证数据不丢）；release 是归还引用（refs-1，最后一个 release 使槽回到可复用）。四者通过 refs 引用计数 + m_current 原子指针 + 'acquire 只借空闲槽'的不变量，实现**无锁双缓冲**——写槽和读槽永不冲突，这是帧池零拷贝能安全运行的核心。"
+
+## 1.7 C++ 内存序（memory_order）详解
+
+> 面试深挖：帧池"无锁为什么安全"的底层根基。核心一句话——**memory_order 是告诉编译器和 CPU "内存操作可见性的顺序约束"**，release/acquire 配对是理解帧池安全性的关键。
+
+### 1.7.1 为什么需要内存序？
+
+现代 CPU 有多级缓存 + 乱序执行，**每个线程看到的"内存写入顺序"可能不一样**：
+
+```cpp
+// 线程 A（生产者）
+slot->data = 解码结果;      // ① 写数据
+m_current.store(slot);      // ② 发布指针
+
+// 线程 B（消费者）
+FrameSlot* s = m_current.load();  // ③ 读指针
+use(s->data);                     // ④ 用数据
+```
+
+**问题**：如果 ② 先于 ① 被线程 B 看到（CPU 重排/缓存延迟），B 会拿到新指针、却读到**旧数据**——数据竞争 bug。**内存序就是给编译器/CPU 的指令：怎么安排这些可见性**。
+
+### 1.7.2 三种内存序在本项目的实际代码
+
+`frame_pool.h` 三个方法各用一种，正好是经典的"release/acquire 配对"：
+
+```cpp
+// ① release：用于 publish —— "写发布"
+void publish(FrameSlot* s) {
+    std::atomic_thread_fence(std::memory_order_release);   // 数据写完整，再发布指针
+    FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);
+    if (old) release(old);
+}
+
+// ② acquire：用于 share —— "读获取"
+FrameSlot* share() {
+    FrameSlot* cur = m_current.load(std::memory_order_acquire);  // 看到指针 = 数据完整
+    if (cur) cur->refs.fetch_add(1, std::memory_order_relaxed);
+    return cur;
+}
+
+// ③ acq_rel：用于 publish 里的 exchange —— 同时读旧值 + 写新值
+FrameSlot* old = m_current.exchange(s, std::memory_order_acq_rel);
+```
+
+### 1.7.3 逐个解释
+
+**① `memory_order_release`（释放语义）—— 用于"写发布"**
+
+- 含义：在 release **之前**的所有内存写操作，都不会被重排到 release 之后；且这些写对"配对的 acquire 读者"**可见**
+- 通俗理解：release 像"关闸门"——闸门放下前所有货（数据）都**先装好、再放行**。读者拿到放行信号（acquire）时，货一定齐了
+- 类比：在黑板上写完答案（写 data），然后**拍手示意**（release）——拍手保证"答案先写完，才拍手"
+
+**② `memory_order_acquire`（获取语义）—— 用于"读获取"**
+
+- 含义：在 acquire **之后**的所有内存读操作，都不会被重排到 acquire 之前；且能看到配对的 release 之前写入的所有数据
+- 通俗理解：acquire 像"开门闸"——开门后后续读才能进行；开门时，release 方写的所有东西都**可见了**
+- 类比：别人拍手（release）后你才转身看黑板（acquire）——转身保证"看到的一定是拍手时已写好的完整答案"
+
+**③ `memory_order_acq_rel`（获取-释放语义）—— 用于"读改写"（RMW）**
+
+- 含义：**同时具备 acquire 和 release 两种语义**——既保证之前的写对别人可见（release 部分），又能看到别人的最新写（acquire 部分）。**只用于读-改-写操作**（exchange / fetch_add / compare_exchange 等）
+- 为什么 `exchange` 需要 acq_rel：
+  - **读旧值 `old`**（acquire 部分）：要看到别的线程对 `m_current` 的最新写
+  - **写新值 `s`**（release 部分）：要让自己之前的写对读者可见
+  - `exchange` 是"读旧 + 写新"组合操作，所以用 acq_rel
+
+### 1.7.4 内存序强度对照表
+
+| 内存序 | 本质 | 本项目用途 | 强度 |
+|--------|------|-----------|------|
+| `relaxed` | 无任何顺序保证，只保证原子性 | `fetch_add` 计数器（refs 增减） | 最弱 |
+| `release` | 之前的写对 acquire 读者可见 | publish 发布指针前 | 中 |
+| `acquire` | 之后能读到 release 方写的数据 | share 读指针时 | 中 |
+| `acq_rel` | 两者兼有（只用于 RMW） | exchange 交换指针时 | 强 |
+| `seq_cst` | 全局一致顺序（默认） | 未用（太贵） | 最强 |
+
+### 1.7.5 release/acquire 配对的"契约"（帧池安全的核心）
+
+**release 和 acquire 必须成对使用，才能建立"同步关系"**：
+
+```
+线程 A（publish）                          线程 B（share）
+─────────────────                        ─────────────────
+写入 data（解码结果）                       │
+     │                                    │
+     │  release fence                     │
+     ▼                                    │
+exchange(m_current, acq_rel)  ──同步──►  load(m_current, acquire)
+                                           │
+                                           保证：看到新指针时，data 一定完整
+```
+
+**同步关系**：在**同一个原子变量**（`m_current`）上，线程 A 做 release 写、线程 B 做 acquire 读（读到 A 写的值），则 A 在 release 之前的所有写（`data`），B 在 acquire 之后一定能看到。
+
+**这正是帧池零拷贝安全的核心**：消费者 `share()` 拿到 `m_current` 指针的那一刻，`acquire` 保证生产者 `publish()` 在 `release` 之前写进 `slot->data` 的解码结果**一定可见**——不会出现"拿到新指针、读到旧数据"。
+
+### 1.7.6 为什么 `refs` 用 `relaxed`，release() 里却用 release？
+
+```cpp
+cur->refs.fetch_add(1, std::memory_order_relaxed);   // share 里
+s->refs.fetch_sub(1, std::memory_order_release);     // release() 里
+```
+
+**refs 计数器本身不关心顺序**：
+- `fetch_add(1)` 只是"数加 1"，不依赖别的数据——`relaxed` 足够
+- 但 `release()` 里的 `fetch_sub(1)` 用了 `release`——因为"归还引用"意味着"我读完了 data"，要保证**读 data 的操作先于 refs 减 1**，否则别的线程可能误以为该槽没人用了而复用它，导致读一半数据
+
+**memory_order 的选择标准**：**只有跨线程传递"数据依赖"时才需要 acquire/release；纯计数器（不依赖数据内容）用 relaxed 即可**。
+
+### 1.7.7 面试一句话总结
+
+> "memory_order 是告诉编译器和 CPU '内存操作可见性的顺序约束'。release 表示'我之前的写，对配对的 acquire 读者可见'（先写数据、再发指针）；acquire 表示'我能看到配对的 release 写方的所有数据'（看到指针 = 数据完整）；acq_rel 用于 exchange 这类读改写，两者兼有。本项目帧池正是靠 'publish 的 release + share 的 acquire' 在同一个 m_current 变量上配对，保证消费者拿到指针时解码数据一定完整——这是无锁零拷贝安全的根基；而 refs 计数器只用 relaxed（不传递数据依赖），release() 里用 release 是为了防止'数据还没读完就被复用'。"
+
 ---
 
 # 第二部分 线程编排与配置解析
@@ -765,6 +1124,133 @@ gui.onResolutionChanged([capture](int w, int h) {
 **为什么要"暂停→停流→改→重启"**：V4L2 的 `S_FMT` 在 STREAMON 下返回 `EBUSY`，且改格式时 mmap 缓冲正在被采集线程使用——必须先让采集线程确认暂停再动。
 
 **面试点**：回调注入 = **依赖倒置**——display 模块不依赖 camera 类，只依赖 main.cpp 注入的 `std::function`。这使 GUI 可独立测试（Mock 模式），也把"业务编排"集中在 main.cpp 一处。
+
+## 2.5 三个相机回调的区别（onCameraControlChanged / onResolutionChanged / onFormatChanged）
+
+> 面试高频辨析题：这三个回调都跟"改相机"有关，但**底层走完全不同的 V4L2 路径**。核心一句话：`onCameraControlChanged` 是"拧旋钮"（写寄存器，不断流）；`onResolutionChanged` / `onFormatChanged` 是"换镜头配置"（重建缓冲池，必须断流）。
+
+### 2.5.1 核心区别表
+
+| 回调 | 改什么 | 底层 V4L2 操作 | 是否要重启采集流 |
+|------|--------|---------------|-----------------|
+| `onCameraControlChanged` | 传感器**图像参数**（亮度/对比度/白平衡） | `VIDIOC_S_CTRL` | **不用**，即时生效 |
+| `onResolutionChanged` | **分辨率**（宽×高） | `VIDIOC_S_FMT` | **要**，停流→改→重启 |
+| `onFormatChanged` | **像素格式**（YUYV/MJPEG） | `VIDIOC_S_FMT` | **要**，停流→改→重启 |
+
+### 2.5.2 逐个拆解（结合代码）
+
+**① onCameraControlChanged —— 调图像参数，即时生效**（`main.cpp:597-606`）：
+
+```cpp
+gui.onCameraControlChanged([capture](int cid, int value) {
+    int ret = capture->setControl(cid, value);      // 直接写寄存器
+    if (ret < 0) {
+        LOG_WRN("setControl(cid=0x%08X, val=%d) failed (ret=%d)",
+                 static_cast<uint32_t>(cid), value, ret);
+    } else {
+        LOG_INF("Camera control: cid=0x%08X → %d", ...);
+    }
+});
+```
+
+- **入参**：`(int cid, int value)` —— cid 是 V4L2 控件 ID（亮度 `0x00980900`、对比度 `0x00980901`、白平衡等）
+- **调用点**：GUI 亮度/对比度/白平衡**滑块拖动时**（`gui.cpp` 的 `onBrightnessChanged` 等）
+- **底层**：`capture->setControl(cid, value)` → `VIDIOC_S_CTRL` → 直接写传感器寄存器
+- **关键**：**不需要重启采集流**——改的是 sensor 内部增益/偏移寄存器，DMA 管线不受影响，下一帧立即生效
+
+**② onResolutionChanged —— 改分辨率，必须重建缓冲**（`main.cpp:1202-1229`）：
+
+```cpp
+gui.onResolutionChanged([capture](int w, int h) {
+    if (!capture->isStreaming()) return;
+
+    g_state.paused = true;                       // 1. 暂停采集线程
+    {   // 等采集线程确认暂停（getFrame 1s 超时，最多等 1.1s）
+        std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+        g_state.pauseCv.wait_until(lk, now+1100ms,
+            [] { return g_state.pausedAck.load(); });
+    }
+    capture->stopCapture();                      // 2. 安全停止
+    int ret = capture->setFormat(w, h, capture->getCurrentFormat());  // 只改 size
+    if (ret < 0) { capture->setFormat(640, 480, ...); }   // 失败回退
+    capture->startCapture();                     // 3. 重启
+    g_state.paused = false;                      // 4. 恢复
+    g_state.pauseCv.notify_one();
+});
+```
+
+- **入参**：`(int w, int h)` —— 目标宽高
+- **调用点**：设置面板分辨率下拉框（`onResolutionComboChanged`）
+- **底层**：`VIDIOC_S_FMT`（只改 size，格式保持当前）
+- **关键**：**必须走完整流程**——分辨率变了，mmap 缓冲池大小必须重建（`startCapture` 内部重新 REQBUFS + mmap）。不做 3 步会出问题：不暂停 → stopCapture 时采集线程还在用 mmap 缓冲 → 竞态；不重建缓冲 → 帧大小与旧缓冲不匹配 → 越界/花屏
+
+**③ onFormatChanged —— 改像素格式，同样必须重启**（`main.cpp:1231-1259`）：
+
+```cpp
+gui.onFormatChanged([capture, device](PixelFormat fmt) {
+    if (!capture->isStreaming()) return;
+
+    uint32_t v4l2fmt = (fmt == PixelFormat::FMT_YUYV)
+                           ? CameraCapture::V4L2_PIX_FMT_YUYV
+                           : CameraCapture::V4L2_PIX_FMT_MJPEG;
+
+    g_state.paused = true;                       // 暂停采集线程（同 onResolutionChanged）
+    { ... 同样的暂停握手 ... }
+    capture->stopCapture();
+    int ret = capture->setFormat(640, 480, v4l2fmt);   // 只改 pixelformat
+    if (ret < 0) { LOG_ERR_(...); }
+    capture->startCapture();
+    g_state.paused = false;
+    g_state.pauseCv.notify_one();
+});
+```
+
+- **入参**：`(PixelFormat fmt)` —— 枚举类型（`FMT_YUYV` / `FMT_MJPEG`）
+- **调用点**：设置面板格式下拉框
+- **底层**：`VIDIOC_S_FMT`（只改 pixelformat，分辨率固定 640x480）
+- **关键**：**同样必须重启**——YUYV 帧 `w*h*2` 字节、MJPEG 压缩变长，**缓冲池大小/布局完全不同**，必须 REQBUFS 重来
+
+### 2.5.3 为什么"改参数"不用重启，而"改格式/分辨率"必须重启？
+
+| 维度 | onCameraControlChanged | onResolutionChanged / onFormatChanged |
+|------|----------------------|--------------------------------------|
+| **改的是** | sensor 内部寄存器（增益/偏移） | 缓冲池的**布局参数**（大小/格式） |
+| **底层 ioctl** | `VIDIOC_S_CTRL`（写寄存器） | `VIDIOC_S_FMT`（重建格式+缓冲） |
+| **缓冲池是否受影响** | 否，DMA 管线不变 | **是**，帧大小/格式全变 |
+| **STREAMON 下能否调用** | 可以（即时生效） | **不行**，`S_FMT` 在 STREAMON 下返回 `EBUSY` |
+| **代码流程** | 一行 `setControl` | 暂停→停流→S_FMT→重启→恢复 |
+
+**两个底层原因**：
+1. **`VIDIOC_S_FMT` 在 STREAMON 状态返回 `EBUSY`**——必须 `STREAMOFF` 后才能改格式/分辨率（V4L2 规范强制）
+2. **格式/分辨率变化 → 缓冲区不匹配**——YUYV 640x480 帧 614KB、MJPEG 压缩后几十 KB，旧 mmap 缓冲装不下新格式；必须 REQBUFS 重新按新参数分配
+
+而 `VIDIOC_S_CTRL` 只是写一个寄存器值，DMA 管线不用重启，所以**可以随时调、即时生效**。
+
+### 2.5.4 共同点（为什么都叫"回调"）
+
+三者都是 main.cpp **注入到 GUI 的 `std::function` lambda**（依赖倒置）：
+- GUI 侧只"发事件"（滑块动了、下拉框变了）
+- main.cpp 的 lambda 决定"怎么做"（操作 capture 对象）
+- 好处：display 模块零依赖 camera 类，Mock 模式可注入空 lambda
+
+```cpp
+// Mock 模式（main.cpp:1359-1364）——三个都注入空实现
+gui.onResolutionChanged([](int w, int h) { qDebug() << "分辨率变更"; });
+gui.onFormatChanged([](PixelFormat fmt) { qDebug() << "格式变更"; });
+```
+
+### 2.5.5 面试速记表
+
+| | onCameraControlChanged | onResolutionChanged | onFormatChanged |
+|---|---|---|---|
+| 参数类型 | `(int cid, int value)` | `(int w, int h)` | `(PixelFormat fmt)` |
+| 改什么 | 亮度/对比度/白平衡 | 宽×高 | YUYV/MJPEG |
+| 底层 | `VIDIOC_S_CTRL` | `VIDIOC_S_FMT` | `VIDIOC_S_FMT` |
+| 重启流 | ❌ 即时生效 | ✅ 必须 | ✅ 必须 |
+| 失败回退 | 无 | 640x480 | 无（保持原格式） |
+| 触发控件 | 滑块 | 分辨率下拉框 | 格式下拉框 |
+
+**面试一句话**：三者都是 main.cpp 注入给 GUI 的回调，区别在**改的对象**：`onCameraControlChanged` 调 sensor 图像参数（`VIDIOC_S_CTRL` 写寄存器），**即时生效、无需断流**；`onResolutionChanged` 和 `onFormatChanged` 都改**缓冲池布局**（`VIDIOC_S_FMT`），因为 S_FMT 在 STREAMON 下返回 EBUSY、且帧大小变了缓冲必须重建，所以**都要走"暂停→停流→改→重启→恢复"完整流程**，区别只是前者只改 size、后者只改 pixelformat。
 
 ---
 
