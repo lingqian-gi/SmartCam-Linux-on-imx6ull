@@ -654,6 +654,344 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 ---
 
+## 7. 专题：拷贝 vs 共享——数据必须拷进线程内吗？
+
+> 用户问：数据必须拷进线程内才能使用吗？能不能用一个全局变量减少拷贝？——这正好戳中项目"拷贝 vs 共享"的核心权衡。直接答案：**不一定要拷数据，但要拷的是"安全的访问权"；裸全局变量能减少拷贝，但代价是更贵的并发问题——项目正是从"全局变量 + 锁"起步，演进到"帧池共享 + 引用计数"**。
+
+### 7.1 为什么会有拷贝？拷的是什么？
+
+拷贝的本质是**所有权隔离**：每个线程拿到自己的一份，就不用担心别的线程改它、释放它。所以拷贝省掉的不是字节搬运，而是**同步协调**。
+
+### 7.2 裸全局变量的问题（项目的第一版就是它）
+
+项目里**已经有全局变量**——`g_state.frameData` + `mutex`（采集线程写、处理线程/GUI 读）。它的代价：
+
+1. **生命周期没人管**：生产者写完这帧，消费者还在读，生产者又写下一帧覆盖 → 撕裂帧；
+2. **读写必须互斥**：用 `mutex` 保护。但"锁内读整帧"会让临界区变大——`main.cpp:1092` 注释就是明证：
+   ```cpp
+   raw = g_state.frameData;   // 原始帧拷贝（短锁拷贝出共享区）
+   ```
+   GUI 线程**宁可在锁内拷贝一帧出来**，也不在锁内解码——因为锁内解码 ~25ms，会把采集线程（要拿同一把锁写）**堵死丢帧**。
+3. **全局变量 + 裸指针**在"生产者不断覆盖"的语义下无解：要么拷、要么用版本号/双缓冲。
+
+### 7.3 项目实际的"零拷贝"答案：帧池（`frame_pool.h`）
+
+`FramePool` 就是"共享 + 引用计数"取代"全局 + 锁"的实践：
+
+```cpp
+acquire()  // 借空闲槽（refs 0→1）：生产者写
+share()    // 共享当前发布槽（refs+1）：消费者读
+publish()  // 原子替换 current 指针（release 语义）
+release()  // 归还（refs-1），归 0 回池
+SlotGuard  // RAII 句柄，任何返回路径自动 release
+```
+
+核心不变量一句话：**"acquire 只借空闲槽（refs==0）"**。由此天然实现：
+- **读写分离（双缓冲）**：生产者写的槽 refs==1，没人同时读；消费者读的槽被 share 持有，生产者借不到——**不需要互斥锁**；
+- **生命周期有托管**：引用计数决定槽何时回池，`SlotGuard` 保证不漏 release；
+- **内存序正确**：`publish` 用 release、`share` 用 acquire——"看到指针就一定看到完整数据"。
+
+`g_rgbPool`（容量 2）就是这条路径：GUI 持 1 槽 + 解码写 1 槽，**天然双缓冲无锁**。
+
+### 7.4 那为什么还有拷贝？哪些省不掉？
+
+帧池解决的是"**多个消费者读同一帧**"的共享；但有些拷贝是结构性的：
+
+| 拷贝位置 | 为什么省不掉 |
+|---------|-------------|
+| 采集线程 → `g_state` | V4L2 mmap 缓冲必须**尽快归还**（否则 dqbuf 队列饿死丢帧），深拷贝脱离 mmap 生命周期 |
+| GUI 线程锁内 `raw = ...` | `g_state` 仍是"全局+锁"模型，锁内操作必须短；若解码也锁内，采集线程被堵死 |
+| 客户端线程 `frame.assign` | 每个客户端要**独立副本**以便锁外 `write()`，否则慢客户端会拖着共享帧不放 |
+
+**最该省的是"每客户端每帧拷贝"**（N+1 次放大）：正确姿势是把网络服务内部也换成帧池——`updateFrame` 存槽指针，客户端线程 `share()` 共享，不拷贝。**但代价随之而来**：慢客户端会一直持有槽 → 槽被占满 → `acquire` 失败 → **丢帧（反压）**。这是"内存占用 vs memcpy 带宽"的工程权衡——慢就丢帧，总比慢吞吞排队强（实时视频的正确语义）。
+
+### 7.5 减少拷贝的通用手段清单（面试直接可用）
+
+1. **共享所有权 + 引用计数**：`shared_ptr` / 本项目 `FramePool` + `SlotGuard`——管生命周期，无锁共享；
+2. **双缓冲 / 环形缓冲**：写 A 读 B 交替，消除互斥（`g_rgbPool` 容量 2 即此）；
+3. **移动语义**：`std::move(vector)` 转移所有权**不拷贝数据**（只是交换指针）；
+4. **无锁 SPSC 队列**：单写单读环形队列，生产者-消费者零拷贝零锁；
+5. **mmap / DMA-BUF**：跨进程、跨硬件（GPU/VPU）零拷贝，嵌入式视频的终极方案；
+6. **"拷贝锁内、处理锁外"**：无法共享时，把拷贝做成最廉价的"锁内小操作"。
+
+### 7.6 一句话总结
+
+> **"能不能不拷" → 能，但要把"拷数据"换成"管访问权"**：裸全局变量省了拷贝却引入互斥和生命周期问题；正确路径是**预分配内存 + 引用计数 + 双缓冲（帧池）**——共享的是同一块内存，管理的是"谁在用、何时回池"。项目从 `g_state`（全局+锁+拷）演进到 `g_rgbPool`（帧池+引用计数+零拷贝）正是这个思路的落地。
+
+【面试官追问】"帧池的 share/release 为什么不需要互斥锁？两个线程同时 share 同一槽呢？"
+
+> 【理想应答】引用计数是 `std::atomic`，`fetch_add`/`fetch_sub` 原子自增自减，不需要锁；`m_current` 用 `atomic<FrameSlot*>` + acquire/release 内存序。两个消费者同时 `share` 同一槽：各自 `fetch_add(1)`，refs 从 1→3，都合法持有，各自 release 后回到 1——**多消费者共享天然支持**。生产者的安全来自不变量：`acquire` 只借 refs==0 的槽，被 share 的槽 refs>0 借不出去。
+
+【面试官追问】"慢客户端一直持帧，帧池槽满了会怎样？"
+
+> 【理想应答】`acquire()` 返回 `nullptr` → 调用方丢帧（不阻塞）。这正是帧池的**反压语义**：宁可丢帧也不让生产者阻塞在消费者后面。对实时视频，丢帧优于排队（延迟堆积）。若想避免"慢客户端饿死别人"，可加"超时强制回收"或"每客户端共享引用带版本号"。当前 `g_rgbPool` 容量 2 的设计就是"GUI 持 1 + 解码写 1"，天然不冲突。
+
+---
+
+## 8. 专题：HTTP 每客户端拷贝一份不浪费吗？是因为丢帧吗？
+
+> 用户问：HTTP 的每个客户端线程都拷贝一份不会太浪费了吗？是因为考虑到丢帧吗？——**每客户端拷贝确实有浪费，但它不是"为了丢帧"而设计的——真正直接原因是"锁内拷、锁外发"；丢帧是"允许这个设计成立"的前提，而不是设计动机。**
+
+### 8.1 为什么必须拷：不能持锁发送
+
+看 `clientHandler` 的流循环（`mjpeg_server.cpp:453-469`）：
+
+```cpp
+{
+    std::unique_lock<std::mutex> lock(m_frameMtx);
+    if (!m_frameCV.wait_for(lock, ...)) continue;
+    frame.assign(m_currentFrame.begin(), m_currentFrame.end());  // ← 锁内拷贝
+    currentIndex = m_frameIndex.load();
+}
+// 锁外 write() 发送
+```
+
+关键链条：
+- `m_currentFrame` 是**共享帧**，`updateFrame`（处理线程）写它、N 个客户端线程读它，靠 `m_frameMtx` 保护；
+- **socket `write()` 可能慢/阻塞**（慢客户端、发送缓冲满），**绝不能在锁内做**——否则一个慢客户端持锁，处理线程的 `updateFrame` 和所有其他客户端线程全部被堵死；
+- 所以客户端线程必须**先在锁内把帧拷成自己的副本，再在锁外慢慢发**。
+
+这就是拷贝的直接原因：**"锁内拷贝（快、临界区短）→ 锁外发送（慢、可阻塞）"**。拷的是"脱离共享锁的独立数据"。
+
+### 8.2 丢帧在其中扮演的角色
+
+丢帧不是"为什么拷"的原因，而是**"为什么这个设计可以这么写"的背景**：
+
+- 实时视频**允许丢帧**——客户端来不及消费时直接跳过旧帧取最新帧（`m_frameCV.wait_for` 谓词就是"有比我上次发的新帧才醒"），**不需要发送队列、不需要重传**；
+- 正因为"慢就丢、不排队"，客户端线程才**不需要长时间占用任何共享资源**——拷一份立即发、发完等下一帧，简单直接；
+- 如果换成"可靠协议 + 发送队列"，客户端就必须持有"待发送的帧引用"，那时才需要引用计数管理共享，复杂度立刻上升。
+
+**一句话**：拷贝解决"锁外发送"；丢帧保证"不需要为发送而持有共享资源"。两者是**配合关系**，不是因果关系。
+
+### 8.3 这个浪费到底多大？真正放大的是什么？
+
+要分清两笔账：
+
+| 开销 | 量级 | 说明 |
+|------|------|------|
+| 每客户端每帧 memcpy（~50KB） | 几十 µs/帧 | 792MHz 单核上 memcpy 很快，相对帧间隔（33ms）占比极小 |
+| 每客户端每帧 socket write | ms 级 | **网络发送才是大头**，受客户端带宽/接收窗口限制 |
+
+所以**真正浪费的不是拷贝，是"同一份帧要往 N 条 TCP 流各发一遍"——带宽放大 N 倍**。拷贝只是这条路上的一个附带成本。10 客户端 = 每帧 500KB 出站，带宽先触顶，memcpy 远没到瓶颈。
+
+### 8.4 真想省，怎么省？（各方案的代价）
+
+1. **帧池共享（省 memcpy）**：`updateFrame` 只存槽指针，客户端线程 `share()` 引用计数共享同一块内存，锁外直接 `write` 槽内数据。**代价**：慢客户端持有槽 → 槽被占满 → `acquire` 失败丢帧（反压）。"省拷贝"换来了"丢帧更激进"——这正是专题 7 的权衡。
+2. **UDP 多播（省带宽）**：一份数据发到组播组，内核负责分发到所有订阅者，**带宽不随客户端数线性放大**。**代价**：UDP 不可靠 + 需局域网支持多播 + 播放器兼容性。这是"一台相机喂 N 个观众"场景的正解（见专题 9 语境澄清）。
+3. **发送队列 + EPOLLOUT**：每客户端一个队列，写满时等可写事件。**代价**：慢客户端队列堆积 → 内存无限增长，最终仍要"丢旧帧"兜底——绕回原点。
+
+### 8.5 一句话总结
+
+> **每客户端拷贝不是为丢帧设计的，而是"锁内拷、锁外发"的必然产物**（共享帧受锁保护，发送不能持锁）。丢帧是让这个设计成立的前提（不用排队、不用持共享资源）。而真正随客户端数放大的开销是**发送带宽**不是 memcpy——所以优化方向要么是"帧池省拷贝"（代价是反压丢帧），要么是"多播省带宽"（代价是 UDP 不可靠）。
+
+---
+
+## 9. 专题：三个服务的传输层协议（HTTP 是 TCP 不是 UDP）
+
+> 用户问：现在的 HTTP 不是使用 UDP 吗？——**不是，项目里的 HTTP（MJPEG 服务）是 TCP**。UDP 只在 RTSP 的数据面（RTP/RTCP）。
+
+### 9.1 代码证据：HTTP 用的是 TCP
+
+`mjpeg_server.cpp:157` 建 socket 明确是流式 TCP：
+
+```cpp
+m_server_fd = socket(AF_INET, SOCK_STREAM, 0);   // SOCK_STREAM = TCP
+```
+
+且后续 `listen()` + `accept()` + `read()`/`write()` 全是 TCP 编程模型，浏览器拉流走的标准 TCP 连接。
+
+### 9.2 项目里 UDP 在哪：RTSP 的数据面
+
+真正用 UDP 的是 **RTSP 服务的 RTP/RTCP 数据面**（`rtsp_server.cpp:475`）：
+
+```cpp
+int rtp_sock = socket(AF_INET, SOCK_DGRAM, 0);    // SOCK_DGRAM = UDP
+```
+
+### 9.3 三个服务的传输层一览
+
+| 服务 | 端口 | 传输层 | 为什么 |
+|------|------|--------|--------|
+| MJPEG-over-HTTP | 8080 | **TCP** | HTTP 规范基于 TCP；multipart 长连接流需要**有序、可靠**（浏览器/`<img>` 严格按标准解析） |
+| RTSP 信令 | 8554 | **TCP** | 控制命令需可靠（DESCRIBE/SETUP/PLAY 一个都不能丢） |
+| RTP/RTCP 数据 | 随机 UDP 端口 | **UDP** | 视频数据实时优先，丢帧可接受 |
+| TCP 控制协议 | 9000 | **TCP** | 命令必须可靠到达 |
+
+### 9.4 为什么 HTTP 不用 UDP？
+
+1. **标准约束**：HTTP/1.0/1.1/2.0 全部基于 TCP（RFC 7230）；只有 **HTTP/3** 才改用 QUIC（基于 UDP）——本项目是 HTTP/1.0；
+2. **可靠性**：multipart 流的每帧有 `Content-Length` + boundary，如果 UDP 丢包，浏览器解析 multipart 会错位（帧拼接错乱），而 TCP 保证字节有序到达；
+3. **长连接**：一个 TCP 连接持续推流，UDP 无连接语义反而复杂。
+
+### 9.5 "UDP 多播"的语境澄清
+
+专题 8.4 讲的"UDP 多播省带宽"是**针对 RTSP 数据面（RTP）的优化方向**——把视频数据改成 UDP 组播，一份数据由内核自动分发给多个订阅者。**HTTP 没有多播概念**，该方向与 HTTP 无关。避免面试时把两个服务混为一谈。
+
+### 9.6 一句话总结
+
+> **HTTP 必须 TCP；本项目 UDP 只在 RTSP 的视频数据面（RTP/RTCP）**。三个服务四种通道（HTTP-TCP / RTSP 信令-TCP / RTP-RTCP-UDP / 控制-TCP），面试能脱口而出"哪个端口走 TCP、哪个走 UDP、为什么"是很扎实的加分点。
+
+---
+
+## 10. 专题：线程之间的数据传递是怎么实现的？
+
+> 用户问：线程之间的数据传递是怎样实现的？——项目共 **6 种机制** 配合使用，覆盖两类传递：**帧数据**（大块、高频）走"锁内短拷 + 锁外处理"或"帧池共享"，**控制信号**（小块、低频）走"atomic + 条件变量"或"回调注入"。
+
+### 10.1 全局共享状态 + 双锁条件变量（采集 → 处理）—— 最核心的一条
+
+数据结构里有两组**独立**的锁（`main.cpp:56-75`）：
+
+```cpp
+struct CaptureState {
+    std::mutex              mtx;          // ★ 数据锁：保护 frameData
+    std::vector<uint8_t>    frameData;    //   帧数据
+    int width, height; PixelFormat format; double fps;
+
+    std::mutex              procMtx;      // ★ 通知锁：保护 frameReady
+    std::condition_variable procCv;       //   新帧通知
+    std::atomic<bool>       frameReady;   //   有帧待处理
+};
+```
+
+**生产者（采集线程）**——写完数据、发通知（`main.cpp:942-963`）：
+
+```cpp
+{   // ① 数据锁内：深拷贝进共享区（V4L2 mmap 内存不能长期持有）
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    g_state.frameData.assign(fb.data, fb.data + fb.length);
+    g_state.width = fb.width; ...
+}
+capture->putFrame(&fb);       // 立即归还 V4L2 缓冲
+{   // ② 通知锁内：置标志 + 唤醒
+    std::lock_guard<std::mutex> lock(g_state.procMtx);
+    g_state.frameReady = true;
+}
+g_state.procCv.notify_one();
+```
+
+**消费者（处理线程）**（`main.cpp:974-1007`）：
+
+```cpp
+std::unique_lock<std::mutex> lk(g_state.procMtx);
+g_state.procCv.wait(lk, [] {   // 等待新帧
+    return g_state.frameReady.load() || !g_state.running.load();
+});
+g_state.frameReady = false;
+...
+{   // 数据锁内：拷贝出来，快速释放锁
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    localFrame = g_state.frameData;
+    localW = g_state.width; ...
+}
+```
+
+两个值得讲的细节：
+- **数据锁与通知锁分离**：写帧用 `mtx`、发通知用 `procMtx`——通知不占用数据锁，避免"发通知时把整帧锁死"；
+- **条件变量 + 谓词**：`wait(lk, 谓词)` 先检查谓词再睡，**防止通知丢失**（若 notify 发生在 wait 之前，谓词已为 true，直接返回不睡）。
+
+### 10.2 条件变量广播 + 原子序号（处理 → MJPEG 客户端线程，1→N）
+
+`updateFrame`（处理线程调用）写共享帧后广播（`mjpeg_server.cpp:250-302`）：
+
+```cpp
+{
+    std::lock_guard<std::mutex> lock(m_frameMtx);
+    m_currentFrame.assign(data, data + len);   // 存最新帧
+    m_frameIndex++;                             // atomic 序号
+}
+m_frameCV.notify_all();                          // 广播唤醒所有客户端线程
+```
+
+N 个客户端线程各自 `wait_for`（`mjpeg_server.cpp:453-469`）：
+
+```cpp
+m_frameCV.wait_for(lock, 1s, [this, &lastIndex]() {
+    return !m_running || m_frameIndex.load() != lastIndex;  // 有新帧才醒
+});
+frame.assign(m_currentFrame...);   // 锁内拷出各自副本 → 锁外 write
+```
+
+**1 写者 N 读者**靠"条件变量 + 原子序号"实现：`m_frameIndex` 让每个客户端只在自己"上次已发序号"变化时才醒，**按需取最新帧**（慢客户端自然跳帧）。
+
+### 10.3 帧池 + 原子引用计数（显示链路，无锁）
+
+GUI 显示是**无锁共享**（见专题 7）：`g_rgbPool` 容量 2。
+
+```cpp
+// main.cpp:1079-1118（displayTimer 回调，GUI 线程内）
+FrameSlot* slot = g_rgbPool->acquire();        // 借空闲槽（refs 0→1）
+...  // 解码写入 slot->data
+g_rgbPool->publish(slot);                       // 原子替换 current 指针
+
+// refreshFrame 里上屏
+SlotGuard g(g_rgbPool, g_rgbPool->share());    // share（refs+1）→ QImage 浅引用
+setPixmap(...);                                 // → release 自动归还
+```
+
+传递的是**同一块内存的共享引用**，靠 `atomic` 引用计数管生命周期——这是项目里真正"零拷贝"的线程间传递。
+
+### 10.4 atomic 标志 + 条件变量握手（控制方向：GUI/控制线程 → 采集线程）
+
+典型是**暂停/恢复握手**（`main.cpp:885-892`），分辨率切换时用：
+
+```cpp
+if (g_state.paused) {                    // GUI 线程设了 paused=true
+    g_state.pausedAck = true;            // ① 采集线程确认已暂停
+    g_state.pauseCv.notify_one();        // ② 通知设置方
+    std::unique_lock<std::mutex> lk(g_state.pauseMtx);
+    g_state.pauseCv.wait(lk, [] {        // ③ 等到恢复
+        return !g_state.paused.load();
+    });
+    continue;
+}
+```
+
+**"设置标志 → 确认 → 等待"三段式握手**：确保采集线程真的停下（不再碰 mmap）后，主线程才敢 `stopCapture()`。退出同理（`g_state.running` + 循环条件）。
+
+### 10.5 std::function 回调注入（网络服务线程 → main 业务）
+
+控制/信令方向**不共享数据，靠回调反向拉取**：
+
+```cpp
+// main.cpp:725-726  注册状态查询回调
+controlSrv->setStatusProvider([capture, mjpegServer](StatusPayload& sp) {
+    sp.streaming    = capture->isStreaming() ? 1 : 0;   // 控制线程里执行
+    sp.client_count = mjpegServer->clientCount();
+    ...
+});
+```
+
+`ControlServer` 完全不认识业务对象，收到 `CMD_GET_STATUS` 时调用这个 `std::function`——"数据请求"通过回调注入解决，服务与业务解耦。
+
+### 10.6 直接方法调用 + 服务内部锁（处理线程 → 网络服务内部）
+
+```cpp
+// main.cpp:1026-1034
+if (hasHttpViewer)
+    mjpegServer->updateFrame(localFrame.data(), len);   // 服务内部自己加锁
+```
+
+处理线程"直接调服务的方法"，数据穿越线程边界的安全由**服务内部锁**保证（`m_frameMtx`/`m_clientsMtx`），处理线程不持有任何服务内部状态。
+
+### 10.7 全景总结表
+
+| 传递方式 | 方向 | 同步原语 | 数据形态 |
+|---------|------|---------|---------|
+| `g_state` + 双锁 + 条件变量 | 采集→处理 | mutex×2 + CV + atomic | 深拷贝（每帧） |
+| 条件变量广播 + 原子序号 | 处理→MJPEG 客户端(1→N) | mutex + CV + atomic | 深拷贝（每客户端） |
+| 帧池 + 引用计数 | 解码→绘制（GUI 内） | 纯 atomic（无锁） | **共享引用（零拷贝）** |
+| atomic + 条件变量握手 | GUI/控制→采集 | atomic + CV | 控制信号（无数据） |
+| std::function 回调 | 网络线程→main | 无（调用方自带锁） | 请求-响应 |
+| 直接方法调用 + 内部锁 | 处理→网络服务 | 服务内部锁 | 深拷贝入内 |
+
+**设计主线**：帧数据（大块、高频）用"**锁内短拷 + 锁外处理**"或"**帧池共享**"；控制信号（小块、低频）用"**atomic + 条件变量**"或"**回调**"。每个机制都对应"数据大小 × 频率 × 方向"的匹配。
+
+【面试官追问】"为什么 `g_state` 要两把锁？只用一把锁不行吗？"
+
+> 【理想应答】可以只用一把，但两把锁有实际收益：数据锁 `mtx` 保护帧内容（拷贝 ~50KB 临界区较大），通知锁 `procMtx` 只保护标志位。若共用一把：① 发通知也要持数据锁，`notify_one` 的唤醒延迟被数据拷贝拖长；② 处理线程唤醒后马上要拿数据锁取帧，通知持锁会增加竞争。分离后"写帧"与"发通知"互不阻塞。**代价**：多一把锁多一份复杂度，且 `frameReady` 是 atomic，理论上可不用通知锁——代码保留 `procMtx` 是偏保守的写法，面试能指出"这里其实可以省一把锁"是加分项。
+
+---
+
 # 一句话总结
 
 > "网络模块用**三种不同模型**支撑三种业务：MJPEG 用**每客户端一线程 + 条件变量广播**伺候持续推送型流媒体，RTSP 用 **epoll 单线程事件循环**处理请求-响应型信令、UDP sendto 低延迟发 RTP，控制协议用 **epoll ET + 每客户端接收缓冲 + CRC + 函数表**实现可靠可控的二进制命令通道。三者共享处理线程的同一份帧、互不抢锁，靠**'无人观看零开销'**优化与**'一次编码多方复用'**把 792MHz 单核的预算花在刀刃上。核心设计哲学是**'按业务形态选模型、按量级选技术'**——推送型不硬套 epoll，可靠控制不迷信 TCP 重传（UDP 够实时），安全防护按嵌入式现实选防火墙+token 而非 TLS。面试要敢说：每客户端一线程的上限在哪、UAF 风险在哪、怎么演进到 epoll/线程池/H.264。"
