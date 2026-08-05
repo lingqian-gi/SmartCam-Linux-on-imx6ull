@@ -1060,4 +1060,469 @@ struct RTPHeader {          // RFC 3550 §5.1，必须恰好 12 字节
 
 ---
 
+## 6. 专题：ftell 与回填（backfill）是什么？
+
+> 用户问：文档里 `ftell` 是什么？为什么要回填？——**这两问是手写 AVI 容器"边写边回填"策略的核心**：`ftell` 是"记账工具"，回填是"事后补数"，二者配套出现（2.4/2.5/2.6 节的 `writeRecordFrame`/`finalizeAvi`/`writeAviHeader` 都用到了）。
+
+### 6.1 ftell 是什么？
+
+`ftell` 是 **C 标准库 `<stdio.h>` 里的文件定位函数**，原型：
+
+```c
+long ftell(FILE *stream);
+```
+
+**作用**：返回 `stream` 指向的文件流**当前读写位置**——即从文件开头到当前指针的**字节偏移量**。成功返回非负偏移，失败返回 `-1L` 并置 `errno`。
+
+它和 `fseek` 是一对**"定位 ↔ 记录"**的组合：`fseek(fp, offset, SEEK_SET)` 把指针移到指定位置，`ftell(fp)` 把当前位置读出来。
+
+**本项目三处用途**（都是"记偏移"）：
+
+| 位置 | 代码 | 记什么偏移 |
+|------|------|-----------|
+| `writeRecordFrame`（`manager.cpp:181-225`） | `long currentPos = ftell(m_recordFile);` | 每帧 `00dc` 数据块的起始位置 → 存进 `m_frameIndexList` → 供 `finalizeAvi` 写 idx1 |
+| `finalizeAvi`（`manager.cpp:391-446`） | `long moviEnd = ftell(fp);` / `long riffEnd = ftell(fp);` | movi 区结束位置 → 算 movi size；写完 idx1 后的文件总长 → 算 RIFF size |
+| `writeAviHeader`（`manager.cpp:267-389`） | `m_avihFramesOffset = ftell(fp) - ...` | avih/strh 中 `dwTotalFrames`、`dwLength` 字段的绝对偏移 → 供结束时回填 |
+
+**一句话**：`ftell` = "当前文件指针离文件头多远"。它是回填的"记账本"——没有它，结束时就不知道要 `fseek` 回哪里去补数。
+
+### 6.2 回填是什么？
+
+**背景**：AVI 文件头里有一批"只有录完才知道"的数字：
+
+```
+RIFF size="??" "AVI "
+  LIST size="??" "hdrl"          ← 元数据头
+    "avih"  { ..., dwTotalFrames=? , ... }   ← 总帧数
+    LIST size="??" "strl"
+      "strh"  { ..., dwLength=?, ... }       ← 流长度（帧数）
+  LIST size="??" "movi"          ← 真正的帧数据，逐帧追加
+    "00dc" (len) JPEG帧
+    "00dc" (len) JPEG帧
+    ...
+  "idx1" { 每帧的偏移+长度 ... } ← 索引
+```
+
+关键矛盾：**`dwTotalFrames`（总帧数）、`movi` 区大小、RIFF 总大小，这些值只有在录制结束时才知道**——开始录时根本不知道用户会录几帧、录多久。
+
+**回填（backfill）定义**：
+
+> 先把这些"未知数"写一个**占位值（0）**放在文件头里，同时用 `ftell` 记住这些占位符在文件里的**绝对位置**（记账）；等录制结束、所有数据都写完、数字终于确定时，再用 `fseek` 跳回那些位置，把真实数值**覆盖写进去**。
+
+```
+录制中:  [ dwTotalFrames = 0 ]  [ movi size = 0 ]  [ 帧数据... ]
+                ↑ ftell 记下这三个位置
+结束时:   fseek 跳回 → 覆写成真实值
+          [ dwTotalFrames = 123 ]  [ movi size = 4567 ]  [ 帧数据... ]  [ idx1 ]
+```
+
+### 6.3 为什么要回填？（为什么不能最后一次性写头）
+
+因为录制是**流式的**：必须先写头、再边录边往 `movi` 区追加帧。所以只有两个方案：
+
+| 方案 | 做法 | 后果 |
+|------|------|------|
+| **A（本项目）** | 先写占位头 → 记偏移 → 录完回填 | 录制中随时崩溃，文件里已有全部帧数据，有经验的播放器能容错播放 |
+| B | 录完再一次性写整个头 | 录制中一旦崩溃/掉电，**连头都没有，文件完全不可读** |
+
+文档 2.5 节原话就是这个意思：**方案 A 的收益是"流式写 + 文件头信息完整 + VLC 兼容"，代价是掉电时头字段未回填（值为 0），但帧数据已顺序写盘，可容错播放。**
+
+### 6.4 项目代码里的完整链路（记账 → 边录边写 → 回填）
+
+**记账**（`writeAviHeader`，写头时用 `ftell` + `offsetof` 精确算出各字段绝对偏移并保存）：
+
+```cpp
+m_avihFramesOffset = ftell(fp) - sizeof(AviMainHeader)
+                     + offsetof(AviMainHeader, dwTotalFrames);
+m_strhLengthOffset = ftell(fp) - sizeof(AviStreamHeader)
+                     + offsetof(AviStreamHeader, dwLength);
+m_rifSizeOffset    = ...;   // RIFF size 字段位置
+m_moviDataOffset   = ...;   // 第一帧数据起始位置
+```
+
+**边录边记**（`writeRecordFrame`，每帧写前 `ftell` 记下起始偏移）：
+
+```cpp
+long currentPos = ftell(m_recordFile);   // 这一帧 00dc 块的起始位置
+long frameDataOffset = currentPos;
+...  // 写 "00dc" + len + JPEG 数据
+FrameIndex idx;
+idx.offset = static_cast<uint32_t>(frameDataOffset - m_moviDataOffset);
+m_frameIndexList.push_back(idx);         // 内存索引，供 finalizeAvi 回填 idx1
+```
+
+**回填**（`finalizeAvi`，结束时 `fseek` 跳回占位符位置覆写真实值）：
+
+```cpp
+// ① 回填 movi LIST size
+long moviEnd = ftell(fp);
+long moviSize = moviEnd - m_moviDataOffset + 4;
+fseek(fp, m_moviDataOffset - 8, SEEK_SET);   // 跳回占位符位置
+writeU32(fp, moviSize);                      // ← 覆盖回填
+
+// ② 回填 avih.dwTotalFrames 和 strh.dwLength
+fseek(fp, m_avihFramesOffset, SEEK_SET);
+writeU32(fp, m_frameIndexList.size());       // ← 覆盖成真实帧数
+
+// ④ 回填 RIFF 总大小
+fseek(fp, m_rifSizeOffset, SEEK_SET);
+writeU32(fp, riffSize);                      // ← 覆盖
+```
+
+### 6.5 一句话总结
+
+> **`ftell` = "当前文件指针离文件头多远"**，它是回填的记账工具；**回填 = 把录制开始时"留的坑"（值为 0 的占位字段）在结束时用真实数据填上**。二者配套出现：`ftell` 记账 → 边录边写数据 → `fseek` 跳回 → 覆写占位符（回填）。之所以必须这样，是因为 AVI 头的总帧数/大小只有录完才知道，而录制又是流式边写边录的——用"先占位、记偏移、最后回填"换来"随时崩溃文件都不至于完全废掉"的健壮性。
+
+【面试官追问】"`ftell` 返回的类型是什么？文件超过 2GB 会怎样？"
+
+> 【理想应答】`ftell` 返回 `long`，在 32 位系统（iMX6ULL 是 32 位 ARM）上 `long` 只有 4 字节，文件超过 2GB 会溢出。本项目 MJPEG ~2MB/s，录满 2GB 需 ~17 分钟，若支持 30fps 硬件 + 高码率长时间录制是有可能超的（配合 FAT32 单文件 4GB 上限，见 3.4）。**演进方案**：换 `fseeko`/`ftello`（`off_t` 64 位），或直接 `lseek`/`lstat` 用 64 位偏移。当前用 `long` 是"量级够用"的取舍。
+
+---
+
+## 7. 专题：录像文件（AVI）的完整数据布局
+
+> 用户问：给出录像文件的数据布局和详细解释。——这是 AVI 自封装的全貌，与专题 6（ftell/回填）、专题 8（关键偏移）配套。依据 `manager.h:45-124` 的结构体定义与 `manager.cpp` 的 `writeAviHeader`/`writeRecordFrame`/`finalizeAvi` 实现。
+
+### 7.1 整体结构一览
+
+本项目生成的 AVI 是**标准 RIFF 容器**，共 4 层：
+
+```
+RIFF 根块
+├── hdrl LIST        ← 元数据头（avih + strl）
+│   ├── avih         AVI 主文件头（帧率/分辨率/总帧数…）
+│   └── strl LIST
+│       ├── strh     视频流头（编码器 MJPG、帧率、帧数…）
+│       └── strf     位图信息（宽/高/位深/压缩格式）
+├── movi LIST        ← 帧数据区（每帧一个 "00dc" 块）
+│   └── "00dc" × N
+└── idx1             ← 索引块（每帧的偏移+长度，O(1) seek 用）
+```
+
+### 7.2 逐字节布局图
+
+以 640×480 录制 N 帧为例，**右侧标注了每个字段由谁写入、哪些是"占位→回填"**：
+
+```
+偏移      长度   内容                                 说明 / 回填点
+─────────────────────────────────────────────────────────────────────────────
+0         4     "RIFF"                              RIFF 块标识
+4         4     riff size                           = 文件总长 - 8   ← ①回填 (m_rifSizeOffset)
+8         4     "AVI "                              RIFF 形式类型（AVI 固定）
+─────────────────────────── hdrl LIST ─────────────────────────────
+12        4     "LIST"                              LIST 块标识
+16        4     hdrl size                           = hdrl 内容长度   ← ②写头时当场回填
+20        4     "hdrl"                              块类型
+24        4     "avih"                              块标识
+28        4     40                                  avih 数据大小
+32        40    AviMainHeader{...}                  ↓ 见 7.3-2
+                      dwTotalFrames                 avih 内偏移 16 → 文件偏移 48 ← ③回填 (m_avihFramesOffset)
+72        4     "LIST"
+76        4     strl size                            = strl 内容长度   ← ④写头时当场回填
+80        4     "strl"
+84        4     "strh"
+88        4     56                                  strh 数据大小
+92        56    AviStreamHeader{...}                ↓ 见 7.3-3
+                      dwLength                      strh 内偏移 32 → 文件偏移 124 ← ⑤回填 (m_strhLengthOffset)
+148       4     "strf"
+152       4     40                                  strf 数据大小
+156       40    BitmapInfoHeader{...}               ↓ 见 7.3-4
+─────────────────────────── movi LIST ─────────────────────────────
+196       4     "LIST"                              LIST 块标识
+200       4     movi size                           = "movi" + 全部帧块长度 ← ⑥回填 (m_moviDataOffset-8)
+204       4     "movi"                              块类型
+208       4     "00dc"                              ← m_moviDataOffset 指向这里（第1帧）
+212       4     len(帧1)                            第1帧 JPEG 字节数
+216       len1  JPEG 帧1 数据
+216+len1  0/1   [奇数时补 1 字节 0x00]              RIFF WORD 对齐
+         ...    "00dc" + len + JPEG 帧2 ...
+         ...    "00dc" + len + JPEG 帧3 ...
+─────────────────────────── idx1 ───────────────────────────────────
+末尾      4     "idx1"                              索引块标识
+末尾+4   4     idx1 size                            = N × 16（每条目 16 字节）
+末尾+8   16×N  AviIndexEntry × N                    ↓ 见 7.3-6
+```
+
+### 7.3 各结构体字段详解
+
+**① RIFF 根块（偏移 0-11）**
+- `"RIFF"`（4B）：RIFF 容器标志。
+- `riff size`（4B）：**= 文件总大小 − 8**（减去 `"RIFF"` + `size` 自身 8 字节），播放器靠它知道文件边界。
+- `"AVI "`（4B）：形式类型（注意最后有一个空格，是格式要求）。
+
+**② avih — AVI 主文件头（偏移 32，40 字节）**
+
+| 字段 | 值（本项目） | 含义 |
+|------|------------|------|
+| `dwMicroSecPerFrame` | 1000000/fps | 每帧间隔微秒（30fps → 33333） |
+| `dwMaxBytesPerSec` | 0 | 最大码率（未知留 0） |
+| `dwPaddingGranularity` | 0 | 对齐粒度 |
+| `dwFlags` | 0x10 | **0x10 = 文件含 idx1 索引** |
+| `dwTotalFrames` | 0 → **N** | **总帧数（结束回填）** |
+| `dwStreams` | 1 | 只有 1 条视频流 |
+| `dwSuggestedBufferSize` | w×h×3 | 建议缓冲 |
+| `dwWidth` / `dwHeight` | 640 / 480 | 视频分辨率 |
+
+**③ strh — 视频流头（偏移 92，56 字节）**
+
+| 字段 | 值（本项目） | 含义 |
+|------|------------|------|
+| `fccType` | `"vids"` | 流类型 = 视频流 |
+| `fccHandler` | `"MJPG"` | 编码器 = MJPEG |
+| `dwScale` / `dwRate` | 1 / fps | 帧率 = dwRate/dwScale |
+| `dwLength` | 0 → **N** | **总帧数（结束回填）** |
+| `dwSampleSize` | 0 | 0 = 帧长可变（MJPEG 每帧 JPEG 大小不一） |
+| `rcFrame` | (0,0,w,h) | 目标帧矩形 |
+
+**④ strf — BITMAPINFOHEADER（偏移 156，40 字节）**
+`biWidth`/`biHeight` = 640/480；`biBitCount` = 24；`biCompression` = `"MJPG"`；`biSizeImage` = 0（变长帧）。播放器靠它知道画面尺寸和压缩格式。
+
+**⑤ movi LIST — 帧数据区（偏移 196 起）**
+
+每一帧是一个 `"00dc"` 块，**8 字节块头 + 变长 JPEG**：
+
+```
+[ "00dc"(4B) | len(4B) | JPEG 数据 len 字节 | 奇数帧补 1B 0x00 ]
+└── chunk 头 ──┘  └──────── 帧数据 ────────┘
+```
+
+- **块头**：`"00dc"`（视频帧标识）+ `len`（小端，JPEG 字节数）。
+- **WORD 对齐**：RIFF 规范要求每个 chunk 数据区从偶数偏移开始，奇数长帧补 1 字节 0x00，否则后续帧解析错位（VLC 花屏/进度错乱）。
+- **`m_moviDataOffset`** = 第一个 `"00dc"` 的偏移（208），是 idx1 的偏移基准（详见专题 8）。
+
+**⑥ idx1 — 索引块（文件末尾）**
+
+每条目 16 字节（`AviIndexEntry`，对应 `finalizeAvi` 里 `m_frameIndexList` 的每一项）：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| `ckid` | `"00dc"` | 指向的块类型 |
+| `dwFlags` | 0x10 | 关键帧 |
+| `dwChunkOffset` | 相对 movi 数据区的偏移 | `= frameDataOffset − m_moviDataOffset` |
+| `dwChunkLength` | 帧数据字节数 | **不含 8 字节块头**（此处曾踩坑，见 `debug-summary.md`） |
+
+有了 idx1，播放器可 **O(1) 跳帧**（`video_player.cpp` 的 seek 就是 `fseek(movi 数据区绝对起点 + dwChunkOffset)`）。
+
+### 7.4 六个回填点汇总
+
+| 标记 | 字段 | 位置依据 | 填什么值 |
+|------|------|---------|---------|
+| ① | RIFF size | `m_rifSizeOffset`（偏移 4） | `riffEnd − 8` |
+| ② | hdrl size | `m_hdrlListOffset`（偏移 16） | 写头时当场算好 |
+| ③ | avih.dwTotalFrames | `m_avihFramesOffset`（偏移 48） | 帧数 N |
+| ④ | strl size | 局部 `strlSizePos`（偏移 76） | 写头时当场算好 |
+| ⑤ | strh.dwLength | `m_strhLengthOffset`（偏移 124） | 帧数 N |
+| ⑥ | movi size | `m_moviDataOffset − 8`（偏移 200） | `moviEnd − m_moviDataOffset + 4` |
+
+②④ 在 `writeAviHeader` 里**当场回填**（内容已确定）；①③⑤⑥ 在 `finalizeAvi` 里**结束时回填**（取决于总帧数）——"写占位 → `ftell` 记偏移 → `fseek` 回填"的完整落地。
+
+---
+
+## 8. 专题：m_moviDataOffset / m_avihFramesOffset / movi size / RIFF size 是什么？
+
+> 用户问：`m_moviDataOffset` 和 `m_avihFramesOffset` 是什么？movi size 和 RIFF size 又是什么？——这四个概念都出自 AVI 的"边写边回填"策略，**前两个是"位置"（文件偏移量，记录坑在哪），后两个是"数值"（长度，结束时要填进去的值）**。
+
+### 8.1 一句话区分
+
+- **`m_moviDataOffset` / `m_avihFramesOffset`**：`long` 型成员变量，存的是**文件字节偏移**（`ftell` 记下来的"坑位/基准"）。
+- **movi size / RIFF size**：**长度数值**（不是成员变量，是 `finalizeAvi` 里算出来的局部量），结束时回填进占位符。
+
+### 8.2 m_moviDataOffset —— 第一个 `00dc` 帧块的绝对文件偏移
+
+```cpp
+// manager.cpp:212-213，写第一帧时记录
+if (m_recordFrameCount == 0) {
+    m_moviDataOffset = frameDataOffset;   // frameDataOffset 就是 ftell() 的结果
+}
+```
+
+它是**基准点**，有两个用途：
+- **算 idx1 索引里的每帧偏移**（相对 movi 数据区起点）：`idx.offset = frameDataOffset - m_moviDataOffset`（第 1 帧 = 0）。
+- **定位 movi LIST 的 size 坑位**：布局是 `[LIST(4)][size(4)][movi(4)][00dc...]`，size 字段在 `m_moviDataOffset - 8` 处。
+
+### 8.3 m_avihFramesOffset —— avih 里 `dwTotalFrames` 字段的绝对偏移
+
+```cpp
+// manager.cpp:305-306，写完 avih 后立即记账
+m_avihFramesOffset = ftell(fp) - sizeof(AviMainHeader)
+                     + offsetof(AviMainHeader, dwTotalFrames);
+```
+
+写头时 `ftell` 已越过 avih 结尾，`ftell - sizeof(AviMainHeader)` 反推出 avih 数据起始，再用 `offsetof` 定位到 `dwTotalFrames` 字段（avih 内偏移 16）。它就是"总帧数占位 0"的坑位，结束时 `fseek` 跳过去回填真实帧数。`m_strhLengthOffset` 同理（strh 里的 `dwLength`）。
+
+### 8.4 movi size —— movi LIST 内容的字节数
+
+movi size 是**坑位 `m_moviDataOffset - 8` 里要回填的数值**，含义是：**从 "movi" FOURCC 之后开始、到最后一个 `00dc` 帧块结束为止的总长度**（即"movi 区装了多少数据"）。
+
+```cpp
+// manager.cpp:401-405
+long moviEnd = ftell(fp);                        // 所有帧写完后的当前位置
+long moviSize = moviEnd - m_moviDataOffset + 4;  // +4 补上 "movi" 自己的4字节
+fseek(fp, m_moviDataOffset - 8, SEEK_SET);
+writeU32(fp, moviSize);                          // 回填
+```
+
+为什么 `+4`？RIFF 规范规定 LIST 的 size 值 = **LIST 内容**（含 "movi" 四个字符，不含 "LIST"+"size" 这 8 字节头）的大小。`moviEnd - m_moviDataOffset` 只是所有 `00dc` 块的长度，漏了 "movi" 本身，所以要补 4。
+
+### 8.5 RIFF size —— 整个文件内容的字节数
+
+RIFF size 是**坑位 `m_rifSizeOffset`（偏移 4）里要回填的数值**，含义是：**从 "AVI " 开始到文件末尾的总长度**，即"这个 RIFF 文件装了多少数据"。
+
+```cpp
+// manager.cpp:434-438
+long riffEnd = ftell(fp);      // 写完 idx1 后文件末尾
+long riffSize = riffEnd - 8;   // 减去 "RIFF"(4) + size(4) 这 8 字节头
+fseek(fp, m_rifSizeOffset, SEEK_SET);
+writeU32(fp, riffSize);        // 回填
+```
+
+播放器/解析器靠这个值知道"文件到哪结束"，写错或不写会导致解析错位。
+
+### 8.6 归纳表
+
+| 概念 | 类型 | 是什么 | 何时知道 |
+|------|------|--------|---------|
+| `m_moviDataOffset` | 位置 | 第一个 `00dc` 的绝对文件偏移（基准点） | 写第一帧时（`ftell`） |
+| `m_avihFramesOffset` | 位置 | `dwTotalFrames` 字段的绝对偏移（坑位） | 写头时（`ftell`+`offsetof`） |
+| movi size | 数值 | movi 内容总字节数 | 所有帧写完时（`moviEnd - m_moviDataOffset + 4`） |
+| RIFF size | 数值 | 整个文件内容总字节数 | 写完 idx1 时（`riffEnd - 8`） |
+
+位置型的是"**记账**"（`ftell` 记下坑位），数值型的是"**回填**"（`fseek` 跳回坑位覆写）——合起来就是完整的"先占位、记偏移、最后回填"策略。
+
+【面试官追问】"idx1 的 `dwChunkOffset` 为什么是相对 movi 数据区而不是文件开头？"
+
+> 【理想应答】RIFF 规范规定 idx1 的 `dwChunkOffset` 是相对 movi LIST 内容起始（即 "movi" FOURCC 之后）的偏移，不是文件绝对偏移。本项目 `m_moviDataOffset` 指向第一个 `"00dc"`（恰好是 "movi" 后的第一字节），所以 `frameDataOffset - m_moviDataOffset` 就是规范要求的相对偏移（第 1 帧 = 0）。好处：即使 movi 在文件里的绝对位置变化（如头扩展），idx1 索引依然有效；播放器只需在跳转时把相对偏移换算回文件绝对偏移（`video_player.cpp` 的 seek：`movi 数据区绝对起点 + dwChunkOffset`）。
+
+---
+
+## 9. 专题：POSIX 是什么？
+
+> 用户问：POSIX 是什么？——这是贯穿全项目的"类 UNIX API 契约"。理解它才能说清存储模块 `statvfs`、网络模块 socket、采集模块 `mmap` 等接口的**标准属性**，以及哪些接口是 **Linux 扩展**（面试高频区分点）。
+
+### 9.1 定义
+
+**POSIX**（Portable Operating System Interface，可移植操作系统接口）是 **IEEE 制定的一组标准**（IEEE Std 1003），定义了类 UNIX 操作系统应该提供的**编程接口（API）**和工具规范。目标是让源码可移植——"**写一次，随处编译**"。
+
+它**不是软件，而是一份规范文档**；glibc、musl 等库是它在 Linux 上的**实现**。
+
+### 9.2 它规定了什么
+
+| 范畴 | 内容 |
+|------|------|
+| 系统接口 | 系统调用封装：进程、线程（pthread）、信号、文件 I/O、目录操作、socket 网络 |
+| C 库函数 | 在 ISO C 标准之上扩展：`statvfs`、`fork`、`mmap`、`pthread_create`… |
+| Shell 与工具 | `/bin/sh` 语法、`grep`、`sed`、`ls` 等命令行工具行为 |
+| 环境约定 | 路径（`/tmp`、`/dev`）、环境变量、退出码等 |
+
+### 9.3 三个关键区分（面试常考）
+
+1. **ISO C vs POSIX**：ISO C 是纯语言标准（`fopen/fprintf` 那套）；POSIX 是**操作系统接口**（`open/read/write`、pthread、socket），是 ISO C 的超集。本项目存储模块用 `fopen/fwrite/fseek/ftell`（ISO C），但 `statvfs`（2.7 节查剩余空间）、`unlink`、`mkdir`、`opendir` 都是 **POSIX 接口**。
+
+2. **POSIX vs Linux**：POSIX 是**标准**（可以写在纸上），Linux 是**具体操作系统**。Linux 绝大部分兼容 POSIX，但反过来：**epoll、O_DIRECT、ioctl** 等都是 Linux 专有扩展，**不在 POSIX 里**。本项目网络模块 `socket/bind/accept` 是 POSIX，`epoll`（控制线程用的边缘触发）就是 Linux 特有。
+
+3. **POSIX vs glibc**：glibc 是 GNU 对 ISO C + POSIX 的具体实现库；嵌入式交叉编译常提到的 `arm-linux-gnueabihf` 里的 "gnueabihf" 就是指 glibc + 硬浮点 ABI。
+
+### 9.4 在本项目里的体现
+
+| 位置 | 接口 | 标准归属 |
+|------|------|---------|
+| `manager.cpp` `getFreeSpaceMB` | `statvfs` | POSIX |
+| 存储/相册 | `unlink` / `mkdir` / `opendir` / `readdir` | POSIX |
+| 采集线程 | `mmap`（V4L2 零拷贝） | POSIX |
+| 6 线程架构 | `std::thread` → `pthread_create` | POSIX |
+| HTTP/RTSP/TCP | `socket` / `bind` / `accept` / `send` | POSIX |
+| 控制线程 | `epoll`（边缘触发） | **Linux 扩展**，非 POSIX |
+| 摄像头 | `ioctl`（V4L2 驱动框架） | **Linux 扩展** |
+| 性能插桩（main.cpp） | `/proc/self/stat` 读 CPU | **Linux procfs**，非 POSIX |
+| 专题 6 提到的 2GB 演进 | `fseeko` / `ftello` | POSIX（`off_t` 64 位） |
+
+### 9.5 一句话总结
+
+> **POSIX = "类 UNIX 系统的通用 API 契约"**。它保证"代码在 A 系统上能编译，在 B 系统上换个编译器也能编译运行"。面试时能说清"**哪些接口是标准、哪些是 Linux 扩展**"（如 epoll 不是 POSIX），比背定义更能体现功底。
+
+【面试官追问】"你怎么判断一个接口是不是 POSIX 标准？项目里哪些不是？"
+
+> 【理想应答】判断方法：查 IEEE 1003.1 规范（或 glibc 文档中标注 `POSIX` 字样的函数说明）。本项目三个明显非 POSIX 的：① `epoll`（控制线程边缘触发，Linux 2.6+ 特有，BSD/macOS 用 kqueue）；② V4L2 的 `ioctl`（摄像头驱动框架，Linux 媒体子系统专属）；③ `/proc/self/stat`（`main.cpp` 性能插桩读 CPU jiffies）是 Linux procfs 专有。能脱口而出"标准内/标准外"的边界，是嵌入式 Linux 开发的基本功。
+
+---
+
+## 10. 专题：readJpegSize 为什么要 for 循环扫描，不能直接跳到固定偏移？
+
+> 用户问：`readJpegSize`（`manager.cpp:586-624`）"只读头，不解码"，为什么读宽高还要 for 循环，不能直接跳到对应位置读？——核心答案：**JPEG 的宽高字段没有固定偏移**，它只存在于 SOF 段里，而 SOF 前面的可选标记段都是变长的，所以必须"顺序扫描 + 按段长度跳过"，for 循环干的就是这件事。
+
+### 10.1 JPEG 文件结构：为什么 SOF 位置不固定
+
+JPEG 由一串"标记段"（marker segment）组成，基本骨架：
+
+```
+SOI (FF D8)                     ← 文件头
+  APP0 (FF E0)  JFIF 头（可选）   ← 变长
+  APP1 (FF E1)  EXIF 信息（可选） ← 变长，可能很大
+  COM  (FF FE)  注释（可选）       ← 变长
+  DQT  (FF DB)  量化表（可选）     ← 变长，且彩色图 3 张、灰度 1 张
+  ...
+SOF0 (FF C0)   ← 宽高在这里！
+  DHT / SOS / 图像数据 ...
+```
+
+**关键点**：
+- 每个标记段结构：`FF + marker(1B) + 段长度(2B, 大端) + 段数据`
+- 段与段之间**可省略、可交换顺序、长度任意**——APP0（JFIF）、APP1（EXIF）、DQT 等都不是必须的
+- 所以 **SOF 之前有多少字节完全不确定**：可能是几百字节（只有 JFIF），也可能几 KB（带 EXIF + 大缩略图）
+
+结论：**宽高没有"固定偏移"可跳**，必须从 SOI 开始逐段扫描，遇到变长段就按它的长度字段跳过，直到撞上 SOF。
+
+### 10.2 类比
+
+就像一本书想查"总页数"，但**版权页不一定在第 2 页**——前面可能夹了序言、再版说明、目录，页数都不固定。只能一页页翻，每页看看是不是版权页（SOF），不是就按页码跳（按段长度跳）。
+
+### 10.3 for 循环到底在干什么
+
+```cpp
+for (size_t i = 2; i < n - 8; i++) {
+    if (buf[i] == 0xFF) {
+        uint8_t marker = buf[i + 1];
+        if (marker == 0xFF) continue;                    // ① 填充字节
+        if (marker >= 0xD0 && marker <= 0xD7) continue;  // ② RST 无数据标记
+        if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+            h = (buf[i+5] << 8) | buf[i+6];              // ③ 找到 SOF，读宽高
+            w = (buf[i+7] << 8) | buf[i+8];
+            return (w > 0 && h > 0);
+        }
+        uint16_t segLen = (buf[i+2] << 8) | buf[i+3];
+        if (segLen >= 2) i += segLen + 1;                // ④ 变长段：按长度"跳"过
+    }
+}
+```
+
+它不是傻乎乎逐字节找——**④ 处遇到变长段会直接 `i += segLen + 1` 跳过整个段**（`segLen+1` 是因为段长度字段从 marker 后算起，i 当前在 FF 处）。所以这个循环本质是"**扫描 + 跳变长段**"，代价与"SOF 前的总字节数"成正比，通常远小于整个文件。
+
+SOF 段布局（`i` 指向 `FF C0`）：
+```
+FF C0 | segLen(2B) | precision(1B) | height(2B) | width(2B) | ...
+0  1    2        3     4             5  6         7  8
+```
+所以 `h = buf[i+5..i+6]`、`w = buf[i+7..i+8]`。
+
+### 10.4 为什么只读前 4KB 就够了
+
+SOF 在几乎所有实际 JPEG 里都出现在**前几百字节**（APP0/APP1/DQT 加起来通常 <1KB），读 4KB 已覆盖绝大多数情况。这样既**不解码整张图**（不解压像素、不建解压状态），又能拿到宽高——这就是"读元数据的最小代价"。
+
+### 10.5 有没有"直接定位"的替代方案？
+
+有，但都不如扫描：
+- **用 libjpeg `jpeg_read_header()`**：要初始化解压对象、读更多数据，比自扫描重，且项目想保持"零依赖轻量读取"
+- **写入时在固定位置记录**：比如在 EXIF 里存宽高，但 EXIF 段本身也是变长定位，绕回原点
+- JPEG 规范**没有**为"快速读宽高"提供固定偏移字段——所以扫描是行业标准做法，ffmpeg、各种图片库解析宽高也都是这么干的
+
+### 10.6 一句话总结
+
+> **for 循环 = "顺着标记段链表往前走，变长段按长度跳，专找 SOF 读宽高"**。因为 JPEG 把"宽高"放在一个位置不固定的段里，只能顺序扫描，无法"直接跳到"。
+
+【面试官追问】"如果 JPEG 前面夹了很大的 EXIF（>4KB），SOF 超出缓冲区，这个函数会怎样？"
+
+> 【理想应答】会返回 `false`（循环在 `n` 内找不到 SOF，走到底），相册侧 `createThumbnail` 解码失败显示占位符，不崩溃——功能降级而非崩溃是设计底线。**改进方案**：读满 4KB 仍未找到时继续扩读（按需翻倍到 16KB/64KB，`fseek`+`fread` 分块），或先读 4KB 未命中再 `fseek` 到段末尾继续；更彻底的是直接上 libjpeg 的 `jpeg_read_header`。当前固定 4KB 是"99% 场景覆盖 + 一次小读"的取舍，面试要诚实指出这个上限和扩读路径。
+
+---
+
 *本文档基于 SmartCam-Linux-on-imx6ull 项目源码，聚焦 `src/storage/`。配合阅读：`docs/learn/04-storage-module-implementation.md`（模块实现）、`docs/debug-summary.md`（AVI 容器排障）、`docs/interview/面试复习-display模块.md`（相册/VideoPlayer 上游）、`docs/interview/面试复习-camera模块.md`（采集/处理线程下游）、`docs/interview/面试复习-main模块.md`（线程编排与回调）。*
