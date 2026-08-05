@@ -344,7 +344,7 @@ SmartCam-Linux-on-imx6ull/
 
 ## 系统架构
 
-共 **6 个线程**：Qt 主线程（GUI）+ 采集线程 + 处理线程 + **解码线程** + RTSP 线程 + 控制线程。
+共 **5 个固定线程**：Qt 主线程（GUI）+ 采集线程 + 处理线程 + RTSP 线程 + 控制线程，外加 MJPEG 服务的动态线程（1 个 accept 线程 + N 个客户端线程）。解码在 GUI 线程的 `displayTimer` 回调内完成（曾设计独立解码线程，但单核板上无并行收益，见下方线程同步说明）。
 
 ```
 采集线程 (captureThread)              处理线程 (processThread)            网络线程
@@ -354,24 +354,24 @@ V4L2 dqbuf → mmap 帧                等 procCv 通知                      ep
   │    (mutex + frameSeq 序号)       ├─ YUYV: encodeYUYVtoJPEG           ├─ RTSP: RTP 分片
   └─► putFrame 归还 mmap             └─ 录像: 写 AVI（仅 MJPEG）          └─ TCP: 命令分发
 
-解码线程 (decodeThread)              GUI 线程 (Qt 主线程)
-=====================              ====================
-  ├─ share() 最新原始帧              ├─ displayTimer(33ms)
-  ├─ MJPEG 解码 / YUYV→RGB24         │    └─ 拉 g_display → 解码/转换入槽 → setFrameShared
-  └─ publish → g_display (RGB)       └─ requestRefresh（发布后立即上屏，全局唯一驱动入口）
-                                        └─ QImage 浅引用 → setPixmap → 上屏
-                                        （完全单驱动：真实模式=displayTimer，Mock=main 定时器）
+GUI 线程 (Qt 主线程)
+====================
+  ├─ displayTimer(33ms)：借 g_rgbPool 写槽 → 短锁取 g_state 原始帧
+  │    └─ MJPEG 解码 / YUYV→RGB24 → 直接写入池槽 → publish
+  ├─ requestRefresh（发布后立即上屏，全局唯一驱动入口）
+  │    └─ g_rgbPool->share() → QImage 浅引用槽内 RGB → setPixmap → release
+  └─ （完全单驱动：真实模式=displayTimer，Mock=main 定时器）
 ```
 
 **线程同步**：
 - 采集线程把帧深拷贝进 `g_state.frameData`（`std::mutex` 保护），写完递增 `frameSeq` 序号后立即归还 V4L2 mmap 缓冲；
-- 处理线程与解码线程各自从 `g_state` 取最新帧（互不阻塞），处理线程推流/录像，解码线程负责显示转换；
-- **解码线程是独立 `std::thread`**（MJPEG ~25ms 解码不再占用 GUI 线程），解码结果发布到 `g_display`（RGB24 + mutex）；
-- GUI 线程从 `g_display` 取 RGB24 帧，`setFrame()` 内深拷贝一次（`m_frameBuffer`），`refreshFrame()` 里 `QImage` 构造后 `.copy()` 深拷贝，**双重深拷贝避免悬垂指针**。
+- 处理线程从 `g_state` 取最新帧推流/录像；GUI 线程的 `displayTimer` 回调从 `g_state` 短锁取帧并负责显示转换（两者互不阻塞）；
+- **解码在 GUI 线程的 `displayTimer` 回调内完成**（`VideoProcessor::decodeJPEGtoRGB`）——曾设计独立解码线程，但 i.MX6ULL 单核无并行收益，回退到 GUI 线程内解码（见 `docs/learn/` 实施指南 §2.3）；解码结果写入 `g_rgbPool` 帧池槽（双缓冲 + 原子引用计数）；
+- GUI 线程 `requestRefresh()` 里 `g_rgbPool->share()` 取得发布槽，`QImage` 浅引用槽内 RGB24 数据 → `setPixmap` → `release()`，帧池保证数据生命周期安全（无深拷贝悬垂问题）。
 
 **零拷贝路径**：
-- MJPEG 模式推流/录像：摄像头硬件直接输出 JPEG，处理线程**原样转发**到 HTTP/RTSP、直写 AVI——完全零编码零解码（仅本地显示需解一次码，在解码线程进行）。
-- YUYV 模式：处理线程每帧调用一次 `encodeYUYVtoJPEG()`，编码结果供 HTTP 和 RTSP 共用；显示路径由解码线程做 YUYV→RGB24。
+- MJPEG 模式推流/录像：摄像头硬件直接输出 JPEG，处理线程**原样转发**到 HTTP/RTSP、直写 AVI——完全零编码零解码（仅本地显示需解一次码，在 GUI 线程 `displayTimer` 回调中进行）。
+- YUYV 模式：处理线程每帧调用一次 `encodeYUYVtoJPEG()`，编码结果供 HTTP 和 RTSP 共用；显示路径由 GUI 线程的 `displayTimer` 回调做 YUYV→RGB24。
 
 ---
 
@@ -425,7 +425,7 @@ use_syslog = true
 | MJPEG 流 | HTTP multipart/x-mixed-replace、条件变量广播、`/snapshot` 和 `/status` 端点 |
 | RTSP 流 | 自实现 RFC 2326 协议栈（DESCRIBE/SETUP/PLAY/TEARDOWN）、RTP RFC 2435 JPEG 载荷、epoll 边缘触发 |
 | 图像处理 | YUYV 转 RGB24（定点运算 BT.601）、libjpeg-turbo 编解码（NEON 加速）、JPEG 解码（自定义静默错误处理器） |
-| **显示解码线程** | MJPEG/YUYV → RGB24 在独立 `std::thread` 完成（`VideoProcessor::decodeJPEGtoRGB`），GUI 线程只做拷贝 + `setPixmap`，事件循环不被解码阻塞 |
+| **显示解码** | MJPEG/YUYV → RGB24 在 GUI 线程 `displayTimer` 回调内完成（`VideoProcessor::decodeJPEGtoRGB`）并直接写入帧池槽，`requestRefresh` 上屏（QImage 浅引用）；单核板上独立解码线程无并行收益，故解码未移出 GUI 线程 |
 | 存储管理 | AVI RIFF 容器格式（含 idx1 索引块）、按修改时间自动清理、按日期分目录存储 |
 | 配置解析 | Header-only INI 解析器，支持分段、注释、bool/int/string 类型 |
 | systemd 服务 | Type=simple、崩溃自动重启、安全加固（ProtectSystem、RestrictAddressFamilies 等） |
@@ -441,12 +441,12 @@ use_syslog = true
 | MJPEG 硬件输出 | < 1ms | USB UVC 摄像头直出 |
 | YUYV 转 RGB24 | ~5ms | 定点运算，无查表法 |
 | libjpeg-turbo 编码 | ~25ms | NEON 加速 |
-| JPEG 显示解码 | ~25ms | 在**独立解码线程**执行，不阻塞 GUI |
+| JPEG 显示解码 | ~25ms | 在 GUI 线程 `displayTimer` 回调内执行，受 33ms 节拍约束 |
 | JPEG 缩略图解码 | ~15ms | Scale 1/2 缩小到 170px |
 | 运行内存（推流） | ~8 MB | 帧缓冲 + JPEG 拷贝 |
 | 相册峰值内存 | ~2.5 MB | 6 张可见缩略图 + 1 张全尺寸 |
 
-> **显示帧率上限**：本地预览受 `displayTimer` 固定 33ms 节拍限制，最多 30fps（匹配 MJPEG 解码能力）；**推流/录像帧率不受此限制**，跟随采集目标帧率（最高 60fps）。升 720p 需先"解码移出 GUI 线程"（已完成）并评估 CPU。显示采用完全单驱动：`requestRefresh()` 是唯一上屏入口（真实模式发布后立即上屏，Mock 模式由 main 定时器驱动彩条），无双定时器相位延迟。
+> **显示帧率上限**：本地预览受 `displayTimer` 固定 33ms 节拍限制，最多 30fps（匹配 MJPEG 解码能力）；**推流/录像帧率不受此限制**，跟随采集目标帧率（最高 60fps）。升 720p 需先"解码移出 GUI 线程"（尚未完成：单核板上独立解码线程无并行收益，解码仍在 GUI 线程）并评估 CPU。显示采用完全单驱动：`requestRefresh()` 是唯一上屏入口（真实模式发布后立即上屏，Mock 模式由 main 定时器驱动彩条），无双定时器相位延迟。
 
 ---
 

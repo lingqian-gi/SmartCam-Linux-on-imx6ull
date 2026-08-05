@@ -57,7 +57,9 @@ controlThread = new std::thread([controlSrv, ctrlPort]() {
 });
 ```
 
-**线程总数**：Qt GUI 主线程 + 采集线程 + 处理线程 + 解码线程 + RTSP 线程 + 控制线程 = 6 个固定线程，**外加 MJPEG 的动态线程**（1 个 accept 线程 + N 个客户端线程）。
+**线程总数**：真实相机模式下实际创建 4 个 `std::thread`（`main.cpp:873/970/712/859` 的 `captureThread` / `processThread` / `rtspThread` / `controlThread`）+ Qt GUI 主线程 = **5 个固定线程**，**外加 MJPEG 的动态线程**（1 个 accept 线程 + N 个客户端线程）。
+
+> **注意（易错点）**：**解码不是独立线程**。README 旧架构图写"共 6 个线程含解码线程"，但当前代码 `main.cpp:1065` 注释明确："解码仍在 GUI 线程（单核板上线程无并行收益，见 docs 实施指南 §2.3）"——解码（`VideoProcessor::decodeJPEGtoRGB`）实际发生在 **GUI 线程的 `displayTimer`（QTimer）回调内**（`main.cpp:1105`），即"借 RGB 写槽 → 短锁取帧 → 解码入槽 → publish"整个流程都在 Qt 主线程事件循环里执行。README 的"6 线程"是**过时描述**：曾设计独立解码线程，但因 i.MX6ULL 单核无并行收益而回退到 GUI 线程内解码。**面试以代码为准讲 5 固定线程**，能主动指出"README 与代码不一致"反而是加分点。
 
 ## 1.2 线程模型对比
 
